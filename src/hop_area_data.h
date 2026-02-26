@@ -1,0 +1,47 @@
+#pragma once
+
+#include <godot_cpp/classes/physics_server3d.hpp>
+#include <godot_cpp/variant/transform3d.hpp>
+#include <godot_cpp/variant/callable.hpp>
+#include <godot_cpp/variant/rid.hpp>
+
+#include <vector>
+
+using namespace godot;
+
+struct HopAreaShapeEntry {
+	RID shape_rid;
+	Transform3D local_xform;
+	bool disabled = false;
+};
+
+struct HopAreaData {
+	RID self_rid;
+	RID space_rid;
+	uint64_t object_instance_id = 0;
+
+	Transform3D transform;
+
+	uint32_t collision_layer = 1;
+	uint32_t collision_mask = 1;
+
+	bool monitorable = false;
+	bool ray_pickable = false;
+
+	// Gravity / damp overrides
+	float gravity = 9.8f;
+	Vector3 gravity_direction = Vector3(0, -1, 0);
+	bool gravity_is_point = false;
+	float gravity_point_distance = 0.0f;
+	PhysicsServer3D::AreaSpaceOverrideMode space_override_mode = PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED;
+	float linear_damp = 0.1f;
+	float angular_damp = 0.1f;
+	PhysicsServer3D::AreaSpaceOverrideMode linear_damp_override_mode = PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED;
+	PhysicsServer3D::AreaSpaceOverrideMode angular_damp_override_mode = PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED;
+	int priority = 0;
+
+	Callable monitor_callback;
+	Callable area_monitor_callback;
+
+	std::vector<HopAreaShapeEntry> shapes;
+};

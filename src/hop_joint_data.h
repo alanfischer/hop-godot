@@ -1,0 +1,30 @@
+#pragma once
+
+#include <godot_cpp/classes/physics_server3d.hpp>
+#include <godot_cpp/variant/vector3.hpp>
+#include <godot_cpp/variant/transform3d.hpp>
+#include <godot_cpp/variant/rid.hpp>
+
+#include <hop/hop.h>
+#include <memory>
+
+using namespace godot;
+
+struct HopJointData {
+	RID self_rid;
+	PhysicsServer3D::JointType type = PhysicsServer3D::JOINT_TYPE_MAX;
+	int solver_priority = 1;
+	bool disable_collisions = false;
+
+	// Pin joint data
+	RID body_a;
+	RID body_b;
+	Vector3 local_a;
+	Vector3 local_b;
+	float pin_bias = 0.3f;
+	float pin_damping = 1.0f;
+	float pin_impulse_clamp = 0.0f;
+
+	// hop backing
+	std::shared_ptr<hop::constraint<float>> hop_constraint;
+};

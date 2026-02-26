@@ -14,7 +14,11 @@ void HopBodyData::create_hop_solid() {
 	hop_solid->set_coefficient_of_restitution(bounce);
 	hop_solid->set_coefficient_of_static_friction(friction);
 	hop_solid->set_coefficient_of_dynamic_friction(friction);
-	hop_solid->set_coefficient_of_gravity(gravity_scale);
+	if (is_static_or_kinematic()) {
+		hop_solid->set_coefficient_of_gravity(0.0f);
+	} else {
+		hop_solid->set_coefficient_of_gravity(gravity_scale);
+	}
 	hop_solid->set_coefficient_of_effective_drag(linear_damp);
 
 	hop_solid->set_collision_scope(collision_layer);
@@ -22,13 +26,6 @@ void HopBodyData::create_hop_solid() {
 
 	hop_solid->set_position(to_hop(transform.origin));
 	hop_solid->set_velocity(to_hop(linear_velocity));
-
-	if (is_static_or_kinematic()) {
-		hop_solid->set_stay_active(false);
-		if (mode == PhysicsServer3D::BODY_MODE_STATIC) {
-			hop_solid->deactivate();
-		}
-	}
 }
 
 void HopBodyData::sync_to_hop() {
@@ -47,7 +44,11 @@ void HopBodyData::sync_to_hop() {
 	hop_solid->set_coefficient_of_restitution(bounce);
 	hop_solid->set_coefficient_of_static_friction(friction);
 	hop_solid->set_coefficient_of_dynamic_friction(friction);
-	hop_solid->set_coefficient_of_gravity(gravity_scale);
+	if (is_static_or_kinematic()) {
+		hop_solid->set_coefficient_of_gravity(0.0f);
+	} else {
+		hop_solid->set_coefficient_of_gravity(gravity_scale);
+	}
 	hop_solid->set_coefficient_of_effective_drag(linear_damp);
 
 	hop_solid->set_collision_scope(collision_layer);

@@ -3,7 +3,6 @@
 #include "hop_space_state.h"
 #include "hop_conversions.h"
 
-#include <godot_cpp/variant/utility_functions.hpp>
 #include <algorithm>
 
 // ============================================================
@@ -337,6 +336,11 @@ void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 			body->hop_solid->add_shape(hs);
 		}
 	}
+
+	// add_shape calls activate() — re-deactivate static bodies
+	if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
+		body->hop_solid->deactivate();
+	}
 }
 
 void HopPhysicsServer::add_body_to_space(HopBodyData *body, HopSpaceData *space) {
@@ -346,6 +350,12 @@ void HopPhysicsServer::add_body_to_space(HopBodyData *body, HopSpaceData *space)
 	body->sync_to_hop();
 	rebuild_body_shapes(body);
 	space->simulator->add_solid(body->hop_solid);
+
+	// Deactivate static bodies AFTER shapes/position are set
+	// (add_shape and set_position both call activate())
+	if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
+		body->hop_solid->deactivate();
+	}
 }
 
 void HopPhysicsServer::remove_body_from_space(HopBodyData *body) {
@@ -389,11 +399,12 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 	if (body->hop_solid) {
 		if (body->is_static_or_kinematic()) {
 			body->hop_solid->set_infinite_mass();
-			if (p_mode == PhysicsServer3D::BODY_MODE_STATIC) {
-				body->hop_solid->deactivate();
-			}
+			body->hop_solid->set_coefficient_of_gravity(0.0f);
+			body->hop_solid->set_velocity(hop::vec3<float>(0, 0, 0));
+			body->hop_solid->deactivate();
 		} else {
 			body->hop_solid->set_mass(body->mass);
+			body->hop_solid->set_coefficient_of_gravity(body->gravity_scale);
 			body->hop_solid->activate();
 		}
 	}
@@ -592,6 +603,10 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 			body->transform = p_value;
 			if (body->hop_solid) {
 				body->hop_solid->set_position(to_hop(body->transform.origin));
+				// set_position calls activate() — re-deactivate static bodies
+				if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
+					body->hop_solid->deactivate();
+				}
 			}
 		} break;
 		case PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY: {

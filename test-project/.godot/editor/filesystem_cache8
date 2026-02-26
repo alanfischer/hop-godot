@@ -1,0 +1,9 @@
+ea4bc82a6ad023ab7ee23ee620429895
+::res://::1772110169
+bounce_room.tscn::PackedScene::-1::1772081415::0::1::::<><>::res://orbit_camera.gd
+orbit_camera.gd::GDScript::-1::1772081359::0::1::::<>Camera3D<>::
+test_scene.tscn::PackedScene::8889180908684649619::1772110165::0::1::::<><>::
+::res://addons/::1772077924
+::res://addons/hop-physics/::1772078029
+hop-physics.gdextension::GDExtension::-1::1772078029::0::1::::<><>::
+::res://addons/hop-physics/bin/::1772081469

@@ -10,6 +10,8 @@
 
 using namespace godot;
 
+class HopDirectSpaceState;
+
 struct HopSpaceData {
 	RID self_rid;
 	bool active = false;
@@ -29,6 +31,9 @@ struct HopSpaceData {
 	// Debug contacts
 	int max_debug_contacts = 0;
 	PackedVector3Array debug_contacts;
+
+	// Cached direct state (created lazily, owned by this space)
+	HopDirectSpaceState *direct_state = nullptr;
 
 	HopSpaceData() {
 		simulator = std::make_unique<hop::simulator<float>>();

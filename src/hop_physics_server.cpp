@@ -118,10 +118,12 @@ float HopPhysicsServer::_space_get_param(const RID &p_space, PhysicsServer3D::Sp
 PhysicsDirectSpaceState3D *HopPhysicsServer::_space_get_direct_state(const RID &p_space) {
 	HopSpaceData *space = space_owner.get_or_null(p_space);
 	if (!space) return nullptr;
-	auto *state = memnew(HopDirectSpaceState);
-	state->space = space;
-	state->server = this;
-	return state;
+	if (!space->direct_state) {
+		space->direct_state = memnew(HopDirectSpaceState);
+		space->direct_state->space = space;
+		space->direct_state->server = this;
+	}
+	return space->direct_state;
 }
 
 void HopPhysicsServer::_space_set_debug_contacts(const RID &p_space, int32_t p_max_contacts) {
@@ -863,10 +865,12 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 PhysicsDirectBodyState3D *HopPhysicsServer::_body_get_direct_state(const RID &p_body) {
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body) return nullptr;
-	auto *state = memnew(HopDirectBodyState);
-	state->body = body;
-	state->server = this;
-	return state;
+	if (!body->direct_state) {
+		body->direct_state = memnew(HopDirectBodyState);
+		body->direct_state->body = body;
+		body->direct_state->server = this;
+	}
+	return body->direct_state;
 }
 
 // ============================================================
@@ -1011,11 +1015,79 @@ float HopPhysicsServer::_slider_joint_get_param(const RID &p_joint, PhysicsServe
 void HopPhysicsServer::_joint_make_cone_twist(const RID &p_joint, const RID &p_body_A, const Transform3D &p_local_ref_A, const RID &p_body_B, const Transform3D &p_local_ref_B) {}
 void HopPhysicsServer::_cone_twist_joint_set_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param, float p_value) {}
 float HopPhysicsServer::_cone_twist_joint_get_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param) const { return 0.0f; }
-void HopPhysicsServer::_joint_make_generic_6dof(const RID &p_joint, const RID &p_body_A, const Transform3D &p_local_ref_A, const RID &p_body_B, const Transform3D &p_local_ref_B) {}
-void HopPhysicsServer::_generic_6dof_joint_set_param(const RID &p_joint, Vector3::Axis p_axis, PhysicsServer3D::G6DOFJointAxisParam p_param, float p_value) {}
-float HopPhysicsServer::_generic_6dof_joint_get_param(const RID &p_joint, Vector3::Axis p_axis, PhysicsServer3D::G6DOFJointAxisParam p_param) const { return 0.0f; }
-void HopPhysicsServer::_generic_6dof_joint_set_flag(const RID &p_joint, Vector3::Axis p_axis, PhysicsServer3D::G6DOFJointAxisFlag p_flag, bool p_enable) {}
-bool HopPhysicsServer::_generic_6dof_joint_get_flag(const RID &p_joint, Vector3::Axis p_axis, PhysicsServer3D::G6DOFJointAxisFlag p_flag) const { return false; }
+void HopPhysicsServer::_joint_make_generic_6dof(const RID &p_joint, const RID &p_body_A, const Transform3D &p_local_ref_A, const RID &p_body_B, const Transform3D &p_local_ref_B) {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return;
+
+	_joint_clear(p_joint);
+
+	j->type = PhysicsServer3D::JOINT_TYPE_6DOF;
+	j->body_a = p_body_A;
+	j->body_b = p_body_B;
+
+	HopBodyData *ba = body_owner.get_or_null(p_body_A);
+	HopBodyData *bb = body_owner.get_or_null(p_body_B);
+	if (!ba || !bb || !ba->hop_solid || !bb->hop_solid) return;
+
+	j->hop_constraint = std::make_shared<hop::constraint<float>>(ba->hop_solid, bb->hop_solid);
+	j->hop_constraint->set_spring_constant(j->linear_spring_stiffness);
+	j->hop_constraint->set_damping_constant(j->linear_spring_damping);
+	j->hop_constraint->set_distance_threshold(j->linear_spring_equilibrium);
+
+	HopSpaceData *space = space_owner.get_or_null(ba->space_rid);
+	if (space) {
+		space->simulator->add_constraint(j->hop_constraint);
+	}
+}
+
+void HopPhysicsServer::_generic_6dof_joint_set_param(const RID &p_joint, Vector3::Axis p_axis, PhysicsServer3D::G6DOFJointAxisParam p_param, float p_value) {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return;
+
+	// Map linear spring params (any axis) to hop constraint
+	switch (p_param) {
+		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_STIFFNESS:
+			j->linear_spring_stiffness = p_value;
+			if (j->hop_constraint) j->hop_constraint->set_spring_constant(p_value);
+			break;
+		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_DAMPING:
+			j->linear_spring_damping = p_value;
+			if (j->hop_constraint) j->hop_constraint->set_damping_constant(p_value);
+			break;
+		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_EQUILIBRIUM_POINT:
+			j->linear_spring_equilibrium = p_value;
+			if (j->hop_constraint) j->hop_constraint->set_distance_threshold(p_value);
+			break;
+		default:
+			break;
+	}
+}
+
+float HopPhysicsServer::_generic_6dof_joint_get_param(const RID &p_joint, Vector3::Axis p_axis, PhysicsServer3D::G6DOFJointAxisParam p_param) const {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return 0.0f;
+	switch (p_param) {
+		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_STIFFNESS: return j->linear_spring_stiffness;
+		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_DAMPING: return j->linear_spring_damping;
+		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_EQUILIBRIUM_POINT: return j->linear_spring_equilibrium;
+		default: return 0.0f;
+	}
+}
+
+void HopPhysicsServer::_generic_6dof_joint_set_flag(const RID &p_joint, Vector3::Axis p_axis, PhysicsServer3D::G6DOFJointAxisFlag p_flag, bool p_enable) {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return;
+	if (p_flag == PhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING) {
+		j->linear_spring_enabled = p_enable;
+	}
+}
+
+bool HopPhysicsServer::_generic_6dof_joint_get_flag(const RID &p_joint, Vector3::Axis p_axis, PhysicsServer3D::G6DOFJointAxisFlag p_flag) const {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return false;
+	if (p_flag == PhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING) return j->linear_spring_enabled;
+	return false;
+}
 
 PhysicsServer3D::JointType HopPhysicsServer::_joint_get_type(const RID &p_joint) const {
 	HopJointData *j = joint_owner.get_or_null(p_joint);
@@ -1054,6 +1126,12 @@ void HopPhysicsServer::_free_rid(const RID &p_rid) {
 	} else if (body_owner.owns(p_rid)) {
 		HopBodyData *body = body_owner.get_or_null(p_rid);
 		remove_body_from_space(body);
+		if (body->direct_state) {
+			body->direct_state->body = nullptr;
+			body->direct_state->server = nullptr;
+			memdelete(body->direct_state);
+			body->direct_state = nullptr;
+		}
 		body_owner.free(p_rid);
 		delete body;
 	} else if (area_owner.owns(p_rid)) {
@@ -1062,6 +1140,12 @@ void HopPhysicsServer::_free_rid(const RID &p_rid) {
 		delete area;
 	} else if (space_owner.owns(p_rid)) {
 		HopSpaceData *space = space_owner.get_or_null(p_rid);
+		if (space->direct_state) {
+			space->direct_state->space = nullptr;
+			space->direct_state->server = nullptr;
+			memdelete(space->direct_state);
+			space->direct_state = nullptr;
+		}
 		space_owner.free(p_rid);
 		delete space;
 	} else if (joint_owner.owns(p_rid)) {
@@ -1086,6 +1170,11 @@ void HopPhysicsServer::_step(float p_step) {
 	int dt_ms = (int)(p_step * 1000.0f);
 	if (dt_ms < 1) dt_ms = 1;
 
+	// Clear contacts from previous step
+	body_owner.for_each([](HopBodyData *body) {
+		body->contacts.clear();
+	});
+
 	// Apply constant forces to all dynamic bodies before stepping
 	body_owner.for_each([&](HopBodyData *body) {
 		if (!body->hop_solid || body->is_static_or_kinematic()) return;
@@ -1095,17 +1184,19 @@ void HopPhysicsServer::_step(float p_step) {
 
 		// Call force integration callback if set
 		if (body->force_integration_callback.is_valid() && !body->omit_force_integration) {
-			auto *state = memnew(HopDirectBodyState);
-			state->body = body;
-			state->server = this;
-			body->force_integration_callback.call(state, body->force_integration_userdata);
+			if (!body->direct_state) {
+				body->direct_state = memnew(HopDirectBodyState);
+				body->direct_state->body = body;
+				body->direct_state->server = this;
+			}
+			body->force_integration_callback.call(body->direct_state, body->force_integration_userdata);
 		}
 	});
 
 	// Step all active spaces
 	space_owner.for_each([&](HopSpaceData *space) {
 		if (!space->active) return;
-		space->simulator->update(dt_ms);
+		space->simulator->update(dt_ms, 0x3FFFFFFF | hop::simulator<float>::scope_report_collisions);
 	});
 
 	// Sync positions from hop to Godot
@@ -1125,10 +1216,12 @@ void HopPhysicsServer::_flush_queries() {
 		if (!body->state_sync_callback.is_valid()) return;
 		if (body->is_static_or_kinematic() && body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
 
-		auto *state = memnew(HopDirectBodyState);
-		state->body = body;
-		state->server = this;
-		body->state_sync_callback.call(state);
+		if (!body->direct_state) {
+			body->direct_state = memnew(HopDirectBodyState);
+			body->direct_state->body = body;
+			body->direct_state->server = this;
+		}
+		body->state_sync_callback.call(body->direct_state);
 	});
 
 	flushing_queries = false;
@@ -1138,6 +1231,20 @@ void HopPhysicsServer::_end_sync() {
 }
 
 void HopPhysicsServer::_finish() {
+	// Null out back-pointers on any remaining direct_state objects so
+	// they are safe if Godot's ObjectDB cleans them up after us.
+	body_owner.for_each([](HopBodyData *body) {
+		if (body->direct_state) {
+			body->direct_state->body = nullptr;
+			body->direct_state->server = nullptr;
+		}
+	});
+	space_owner.for_each([](HopSpaceData *space) {
+		if (space->direct_state) {
+			space->direct_state->space = nullptr;
+			space->direct_state->server = nullptr;
+		}
+	});
 }
 
 bool HopPhysicsServer::_is_flushing_queries() const {

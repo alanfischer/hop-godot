@@ -219,6 +219,13 @@ void HopDirectBodyState::_integrate_forces() {
 }
 
 PhysicsDirectSpaceState3D *HopDirectBodyState::_get_space_state() {
-	if (!body || !server) return nullptr;
-	return server->_space_get_direct_state(body->space_rid);
+	if (!body || !server || !body->space_rid.is_valid()) return nullptr;
+	HopSpaceData *space = server->space_owner.get_or_null(body->space_rid);
+	if (!space) return nullptr;
+	if (!space->direct_state) {
+		space->direct_state = memnew(HopDirectSpaceState);
+		space->direct_state->space = space;
+		space->direct_state->server = server;
+	}
+	return space->direct_state;
 }

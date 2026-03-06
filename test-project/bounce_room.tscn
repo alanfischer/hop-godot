@@ -1,21 +1,21 @@
-[gd_scene load_steps=23 format=3]
+[gd_scene load_steps=25 format=3]
 
 [ext_resource type="Script" path="res://orbit_camera.gd" id="orbit_cam"]
+[ext_resource type="Script" path="res://bounce_room.gd" id="bounce_room"]
 
 [sub_resource type="PhysicsMaterial" id="phys_bouncy"]
-bounce = 0.8
+bounce = 1.0
 friction = 0.0
 
 [sub_resource type="PhysicsMaterial" id="phys_wall"]
-bounce = 0.9
+bounce = 1.0
 friction = 0.0
-
-[sub_resource type="StandardMaterial3D" id="mat_wall"]
-transparency = 1
-albedo_color = Color(0.24, 0.24, 0.31, 0.25)
 
 [sub_resource type="StandardMaterial3D" id="mat_floor"]
 albedo_color = Color(0.24, 0.24, 0.31, 1)
+
+[sub_resource type="BoxShape3D" id="shape_anchor"]
+size = Vector3(0.1, 0.1, 0.1)
 
 [sub_resource type="StandardMaterial3D" id="mat_red"]
 albedo_color = Color(0.9, 0.15, 0.15, 1)
@@ -52,7 +52,7 @@ radius = 0.3
 height = 2.6
 
 [sub_resource type="BoxMesh" id="mesh_floor"]
-size = Vector3(6, 1, 6)
+size = Vector3(6, 0.1, 6)
 material = SubResource("mat_floor")
 
 [sub_resource type="BoxMesh" id="mesh_dynbox"]
@@ -72,9 +72,21 @@ radius = 0.3
 height = 2.6
 material = SubResource("mat_orange")
 
+[sub_resource type="Environment" id="env"]
+background_mode = 1
+background_color = Color(0.118, 0.118, 0.157, 1)
+ambient_light_source = 1
+ambient_light_color = Color(0.3, 0.3, 0.35, 1)
+ambient_light_energy = 0.5
+
 [node name="BounceRoom" type="Node3D"]
+script = ExtResource("bounce_room")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("env")
 
 [node name="Camera3D" type="Camera3D" parent="."]
+fov = 50.0
 script = ExtResource("orbit_cam")
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
@@ -131,8 +143,11 @@ physics_material_override = SubResource("phys_wall")
 shape = SubResource("shape_wall_z")
 
 [node name="Box" type="RigidBody3D" parent="."]
+unique_name_in_owner = true
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 4, 0)
 linear_velocity = Vector3(3, 0, -2)
+contact_monitor = true
+max_contacts_reported = 4
 physics_material_override = SubResource("phys_bouncy")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="Box"]
@@ -142,8 +157,11 @@ shape = SubResource("shape_dynbox")
 mesh = SubResource("mesh_dynbox")
 
 [node name="Sphere" type="RigidBody3D" parent="."]
+unique_name_in_owner = true
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1, 5, 1)
 linear_velocity = Vector3(-1, 2, 3)
+contact_monitor = true
+max_contacts_reported = 4
 physics_material_override = SubResource("phys_bouncy")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="Sphere"]
@@ -153,8 +171,11 @@ shape = SubResource("shape_sphere")
 mesh = SubResource("mesh_sphere")
 
 [node name="Capsule1" type="RigidBody3D" parent="."]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 3, -1)
-linear_velocity = Vector3(2, -3, 1)
+unique_name_in_owner = true
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2, 4, 0)
+linear_velocity = Vector3(-3, 0, 2)
+contact_monitor = true
+max_contacts_reported = 4
 physics_material_override = SubResource("phys_bouncy")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="Capsule1"]
@@ -164,8 +185,11 @@ shape = SubResource("shape_cap1")
 mesh = SubResource("mesh_cap1")
 
 [node name="Capsule2" type="RigidBody3D" parent="."]
+unique_name_in_owner = true
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 2, 1)
 linear_velocity = Vector3(-1, 3, 2)
+contact_monitor = true
+max_contacts_reported = 4
 physics_material_override = SubResource("phys_bouncy")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="Capsule2"]
@@ -173,3 +197,31 @@ shape = SubResource("shape_cap2")
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="Capsule2"]
 mesh = SubResource("mesh_cap2")
+
+[node name="RopeAnchor" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 6, 0)
+collision_layer = 0
+collision_mask = 0
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="RopeAnchor"]
+shape = SubResource("shape_anchor")
+
+[node name="RopeJoint" type="Generic6DOFJoint3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 6, 0)
+node_a = NodePath("../RopeAnchor")
+node_b = NodePath("../Capsule1")
+linear_limit_x/enabled = false
+linear_limit_y/enabled = false
+linear_limit_z/enabled = false
+linear_spring_x/enabled = true
+linear_spring_x/stiffness = 5.0
+linear_spring_x/damping = 0.5
+linear_spring_x/equilibrium_point = 2.0
+linear_spring_y/enabled = true
+linear_spring_y/stiffness = 5.0
+linear_spring_y/damping = 0.5
+linear_spring_y/equilibrium_point = 2.0
+linear_spring_z/enabled = true
+linear_spring_z/stiffness = 5.0
+linear_spring_z/damping = 0.5
+linear_spring_z/equilibrium_point = 2.0

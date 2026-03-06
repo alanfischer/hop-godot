@@ -25,6 +25,12 @@ struct HopJointData {
 	float pin_damping = 1.0f;
 	float pin_impulse_clamp = 0.0f;
 
+	// 6DOF spring data
+	bool linear_spring_enabled = false;
+	float linear_spring_stiffness = 0.0f;
+	float linear_spring_damping = 0.0f;
+	float linear_spring_equilibrium = 0.0f;
+
 	// hop backing
 	std::shared_ptr<hop::constraint<float>> hop_constraint;
 };

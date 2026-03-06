@@ -12,6 +12,8 @@
 
 using namespace godot;
 
+class HopDirectBodyState;
+
 struct HopBodyShapeEntry {
 	RID shape_rid;
 	Transform3D local_xform;
@@ -19,7 +21,7 @@ struct HopBodyShapeEntry {
 	std::shared_ptr<hop::shape<float>> hop_shape;
 };
 
-struct HopBodyData {
+struct HopBodyData : public hop::collision_listener<float> {
 	RID self_rid;
 	RID space_rid;
 	PhysicsServer3D::BodyMode mode = PhysicsServer3D::BODY_MODE_RIGID;
@@ -78,10 +80,14 @@ struct HopBodyData {
 	};
 	std::vector<ContactInfo> contacts;
 
+	// Cached direct state (created lazily, owned by this body)
+	HopDirectBodyState *direct_state = nullptr;
+
 	void create_hop_solid();
 	void sync_to_hop();
 	void sync_from_hop();
 	void rebuild_hop_shapes();
+	void on_collision(const hop::collision<float> &c) override;
 	bool is_static_or_kinematic() const {
 		return mode == PhysicsServer3D::BODY_MODE_STATIC ||
 			   mode == PhysicsServer3D::BODY_MODE_KINEMATIC;

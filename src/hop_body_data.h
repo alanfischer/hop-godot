@@ -86,7 +86,6 @@ struct HopBodyData : public hop::collision_listener<float> {
 	void create_hop_solid();
 	void sync_to_hop();
 	void sync_from_hop();
-	void rebuild_hop_shapes();
 	void on_collision(const hop::collision<float> &c) override;
 	bool is_static_or_kinematic() const {
 		return mode == PhysicsServer3D::BODY_MODE_STATIC ||

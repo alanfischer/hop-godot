@@ -6,6 +6,7 @@
 #include <godot_cpp/variant/rid.hpp>
 
 #include <vector>
+#include <map>
 
 using namespace godot;
 
@@ -44,4 +45,8 @@ struct HopAreaData {
 	Callable area_monitor_callback;
 
 	std::vector<HopAreaShapeEntry> shapes;
+
+	// Overlap tracking for monitor callbacks
+	// Maps object_instance_id -> body RID for currently overlapping bodies
+	std::map<uint64_t, RID> overlapping_bodies;
 };

@@ -1224,6 +1224,86 @@ void HopPhysicsServer::_flush_queries() {
 		body->state_sync_callback.call(body->direct_state);
 	});
 
+	// Area monitoring: detect body enter/exit for areas with monitor callbacks
+	area_owner.for_each([&](HopAreaData *area) {
+		if (!area->monitor_callback.is_valid()) return;
+		if (!area->space_rid.is_valid()) return;
+		HopSpaceData *space = space_owner.get_or_null(area->space_rid);
+		if (!space) return;
+
+		// Compute the area's world AABB from its shapes
+		bool has_aabb = false;
+		hop::aa_box<float> area_aabb;
+
+		for (int si = 0; si < (int)area->shapes.size(); si++) {
+			auto &entry = area->shapes[si];
+			if (entry.disabled) continue;
+
+			HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
+			if (!sd) continue;
+
+			// Build shape AABB at local transform
+			auto hs = sd->make_hop_shape(entry.local_xform);
+			if (!hs) continue;
+
+			hop::aa_box<float> shape_box;
+			hs->get_bound(shape_box);
+
+			// Offset by area's world position
+			hop::vec3<float> area_pos = to_hop(area->transform.origin);
+			add(shape_box.mins, area_pos);
+			add(shape_box.maxs, area_pos);
+
+			if (!has_aabb) {
+				area_aabb = shape_box;
+				has_aabb = true;
+			} else {
+				area_aabb.merge(shape_box.mins);
+				area_aabb.merge(shape_box.maxs);
+			}
+		}
+
+		if (!has_aabb) return;
+
+		// Find bodies overlapping the area's AABB
+		hop::solid<float> *found[64];
+		int count = space->simulator->find_solids_in_aa_box(area_aabb, found, 64);
+
+		std::map<uint64_t, RID> current_overlaps;
+		for (int i = 0; i < count; i++) {
+			hop::solid<float> *s = found[i];
+			if (!s) continue;
+
+			// Check collision mask: area's mask vs body's layer
+			if (!(area->collision_mask & s->get_collision_scope())) continue;
+
+			HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
+			if (!body) continue;
+
+			current_overlaps[body->object_instance_id] = body->self_rid;
+		}
+
+		// Fire ADDED callbacks for newly overlapping bodies
+		for (auto &[id, rid] : current_overlaps) {
+			if (area->overlapping_bodies.find(id) == area->overlapping_bodies.end()) {
+				area->monitor_callback.call(
+					PhysicsServer3D::AREA_BODY_ADDED,
+					rid, ObjectID(id), 0, 0);
+			}
+		}
+
+		// Fire REMOVED callbacks for bodies that left
+		for (auto &[id, rid] : area->overlapping_bodies) {
+			if (current_overlaps.find(id) == current_overlaps.end()) {
+				area->monitor_callback.call(
+					PhysicsServer3D::AREA_BODY_REMOVED,
+					rid, ObjectID(id), 0, 0);
+			}
+		}
+
+		area->overlapping_bodies = current_overlaps;
+	});
+
 	flushing_queries = false;
 }
 

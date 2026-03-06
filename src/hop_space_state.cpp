@@ -37,16 +37,77 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, PhysicsServer3DExtensionShapeResult *p_results, int32_t p_max_results) {
 	if (!space || !p_collide_with_bodies || p_max_results <= 0) return 0;
 
-	// Use find_solids_in_aa_box with a tiny box around the point
-	float eps = 0.001f;
+	// Broad phase: find AABB candidates around the point
 	hop::vec3<float> hp = to_hop(p_position);
+	float eps = 0.001f;
 	hop::aa_box<float> box(
 		hop::vec3<float>(hp.x - eps, hp.y - eps, hp.z - eps),
 		hop::vec3<float>(hp.x + eps, hp.y + eps, hp.z + eps)
 	);
 
-	std::vector<hop::solid<float> *> found(p_max_results);
-	int count = space->simulator->find_solids_in_aa_box(box, found.data(), p_max_results);
+	std::vector<hop::solid<float> *> found(p_max_results * 2);
+	int count = space->simulator->find_solids_in_aa_box(box, found.data(), (int)found.size());
+
+	// Narrow phase: trace a zero-length segment to test actual shape containment.
+	// trace_segment is global and only returns the best hit, so we trace once
+	// per candidate using that solid's scope, skipping all others via the
+	// ignore parameter.
+	hop::segment<float> seg;
+	seg.set_start_end(hp, hp);
+
+	int result_count = 0;
+	for (int i = 0; i < count && result_count < p_max_results; i++) {
+		hop::solid<float> *s = found[i];
+		if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
+
+		HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
+		if (!body) continue;
+
+		// Trace with this solid's scope; if point is inside, time == 0
+		hop::collision<float> col;
+		space->simulator->trace_segment(col, seg, s->get_collision_scope());
+		if (col.time >= 1.0f) continue;
+
+		if (p_results) {
+			p_results[result_count].rid = body->self_rid;
+			p_results[result_count].collider_id = ObjectID(body->object_instance_id);
+			p_results[result_count].collider = ObjectDB::get_instance(ObjectID(body->object_instance_id));
+			p_results[result_count].shape = 0;
+		}
+		result_count++;
+	}
+	return result_count;
+}
+
+int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, PhysicsServer3DExtensionShapeResult *p_results, int32_t p_max_results) {
+	if (!space || !server || !p_collide_with_bodies || p_max_results <= 0) return 0;
+
+	HopShapeData *sd = server->shape_owner.get_or_null(p_shape_rid);
+	if (!sd) return 0;
+
+	auto hs = sd->make_hop_shape(Transform3D());
+	if (!hs) return 0;
+
+	// Compute the query shape's AABB at the transform position
+	hop::aa_box<float> shape_box;
+	hs->get_bound(shape_box);
+	hop::vec3<float> pos = to_hop(p_transform.origin);
+	add(shape_box.mins, pos);
+	add(shape_box.maxs, pos);
+
+	// Include motion in the AABB
+	if (p_motion.length_squared() > 0) {
+		hop::aa_box<float> end_box = shape_box;
+		hop::vec3<float> motion = to_hop(p_motion);
+		add(end_box.mins, motion);
+		add(end_box.maxs, motion);
+		shape_box.merge(end_box.mins);
+		shape_box.merge(end_box.maxs);
+	}
+
+	// Broad phase: find candidates overlapping the query AABB
+	std::vector<hop::solid<float> *> found(p_max_results * 2);
+	int count = space->simulator->find_solids_in_aa_box(shape_box, found.data(), (int)found.size());
 
 	int result_count = 0;
 	for (int i = 0; i < count && result_count < p_max_results; i++) {
@@ -65,11 +126,6 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 		result_count++;
 	}
 	return result_count;
-}
-
-int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, PhysicsServer3DExtensionShapeResult *p_result_count, int32_t p_max_results) {
-	// TODO: implement shape intersection using trace_solid
-	return 0;
 }
 
 bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, float *p_closest_safe, float *p_closest_unsafe, PhysicsServer3DExtensionShapeRestInfo *p_info) {

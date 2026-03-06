@@ -89,14 +89,3 @@ void HopBodyData::on_collision(const hop::collision<float> &c) {
 	contacts.push_back(ci);
 }
 
-void HopBodyData::rebuild_hop_shapes() {
-	if (!hop_solid) return;
-
-	hop_solid->remove_all_shapes();
-
-	for (auto &entry : shapes) {
-		if (entry.disabled) continue;
-		entry.hop_shape = nullptr;
-		// Need shape data to build - caller must provide via HopShapeData lookup
-	}
-}

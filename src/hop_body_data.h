@@ -21,7 +21,7 @@ struct HopBodyShapeEntry {
 	std::shared_ptr<hop::shape<float>> hop_shape;
 };
 
-struct HopBodyData : public hop::collision_listener<float> {
+struct HopBodyData {
 	RID self_rid;
 	RID space_rid;
 	PhysicsServer3D::BodyMode mode = PhysicsServer3D::BODY_MODE_RIGID;
@@ -86,7 +86,7 @@ struct HopBodyData : public hop::collision_listener<float> {
 	void create_hop_solid();
 	void sync_to_hop();
 	void sync_from_hop();
-	void on_collision(const hop::collision<float> &c) override;
+	void on_collision(const hop::collision<float> &c);
 	bool is_static_or_kinematic() const {
 		return mode == PhysicsServer3D::BODY_MODE_STATIC ||
 			   mode == PhysicsServer3D::BODY_MODE_KINEMATIC;

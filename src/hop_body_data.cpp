@@ -26,7 +26,7 @@ void HopBodyData::create_hop_solid() {
 
 	hop_solid->set_position(to_hop(transform.origin));
 	hop_solid->set_velocity(to_hop(linear_velocity));
-	hop_solid->set_collision_listener(this);
+	hop_solid->set_collision_callback([this](const hop::collision<float> &c) { on_collision(c); });
 }
 
 void HopBodyData::sync_to_hop() {

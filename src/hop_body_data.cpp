@@ -2,31 +2,31 @@
 #include "hop_conversions.h"
 
 void HopBodyData::create_hop_solid() {
-	hop_solid = std::make_shared<hop::solid<float>>();
+	hop_solid = std::make_shared<hop::solid<hop_scalar>>();
 	hop_solid->set_user_data(this);
 
 	if (is_static_or_kinematic()) {
 		hop_solid->set_infinite_mass();
 	} else {
-		hop_solid->set_mass(mass);
+		hop_solid->set_mass(to_hop_scalar(mass));
 	}
 
-	hop_solid->set_coefficient_of_restitution(bounce);
-	hop_solid->set_coefficient_of_static_friction(friction);
-	hop_solid->set_coefficient_of_dynamic_friction(friction);
+	hop_solid->set_coefficient_of_restitution(to_hop_scalar(bounce));
+	hop_solid->set_coefficient_of_static_friction(to_hop_scalar(friction));
+	hop_solid->set_coefficient_of_dynamic_friction(to_hop_scalar(friction));
 	if (is_static_or_kinematic()) {
-		hop_solid->set_coefficient_of_gravity(0.0f);
+		hop_solid->set_coefficient_of_gravity(scalar_from_int<hop_scalar>(0));
 	} else {
-		hop_solid->set_coefficient_of_gravity(gravity_scale);
+		hop_solid->set_coefficient_of_gravity(to_hop_scalar(gravity_scale));
 	}
-	hop_solid->set_coefficient_of_effective_drag(linear_damp);
+	hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(linear_damp));
 
 	hop_solid->set_collision_scope(collision_layer);
 	hop_solid->set_collide_with_scope(collision_mask);
 
 	hop_solid->set_position(to_hop(transform.origin));
 	hop_solid->set_velocity(to_hop(linear_velocity));
-	hop_solid->set_collision_callback([this](const hop::collision<float> &c) { on_collision(c); });
+	hop_solid->set_collision_callback([this](const hop::collision<hop_scalar> &c) { on_collision(c); });
 }
 
 void HopBodyData::sync_to_hop() {
@@ -38,19 +38,19 @@ void HopBodyData::sync_to_hop() {
 		hop_solid->set_infinite_mass();
 		hop_solid->set_velocity(to_hop(linear_velocity));
 	} else {
-		hop_solid->set_mass(mass);
+		hop_solid->set_mass(to_hop_scalar(mass));
 		hop_solid->set_velocity(to_hop(linear_velocity));
 	}
 
-	hop_solid->set_coefficient_of_restitution(bounce);
-	hop_solid->set_coefficient_of_static_friction(friction);
-	hop_solid->set_coefficient_of_dynamic_friction(friction);
+	hop_solid->set_coefficient_of_restitution(to_hop_scalar(bounce));
+	hop_solid->set_coefficient_of_static_friction(to_hop_scalar(friction));
+	hop_solid->set_coefficient_of_dynamic_friction(to_hop_scalar(friction));
 	if (is_static_or_kinematic()) {
-		hop_solid->set_coefficient_of_gravity(0.0f);
+		hop_solid->set_coefficient_of_gravity(scalar_from_int<hop_scalar>(0));
 	} else {
-		hop_solid->set_coefficient_of_gravity(gravity_scale);
+		hop_solid->set_coefficient_of_gravity(to_hop_scalar(gravity_scale));
 	}
-	hop_solid->set_coefficient_of_effective_drag(linear_damp);
+	hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(linear_damp));
 
 	hop_solid->set_collision_scope(collision_layer);
 	hop_solid->set_collide_with_scope(collision_mask);
@@ -65,7 +65,7 @@ void HopBodyData::sync_from_hop() {
 	sleeping = !hop_solid->active();
 }
 
-void HopBodyData::on_collision(const hop::collision<float> &c) {
+void HopBodyData::on_collision(const hop::collision<hop_scalar> &c) {
 	if (max_contacts_reported <= 0) return;
 	if ((int)contacts.size() >= max_contacts_reported) return;
 
@@ -88,4 +88,3 @@ void HopBodyData::on_collision(const hop::collision<float> &c) {
 
 	contacts.push_back(ci);
 }
-

@@ -8,13 +8,13 @@
 bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p_to, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, bool p_hit_from_inside, bool p_hit_back_faces, bool p_pick_ray, PhysicsServer3DExtensionRayResult *p_result) {
 	if (!space || !p_collide_with_bodies) return false;
 
-	hop::segment<float> seg;
+	hop::segment<hop_scalar> seg;
 	seg.set_start_end(to_hop(p_from), to_hop(p_to));
 
-	hop::collision<float> result;
+	hop::collision<hop_scalar> result;
 	space->simulator->trace_segment(result, seg, p_collision_mask);
 
-	if (result.time >= 1.0f) return false;
+	if (to_godot_float(result.time) >= 1.0f) return false;
 
 	if (p_result) {
 		p_result->position = to_godot(result.point);
@@ -37,36 +37,30 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, PhysicsServer3DExtensionShapeResult *p_results, int32_t p_max_results) {
 	if (!space || !p_collide_with_bodies || p_max_results <= 0) return 0;
 
-	// Broad phase: find AABB candidates around the point
-	hop::vec3<float> hp = to_hop(p_position);
-	float eps = 0.001f;
-	hop::aa_box<float> box(
-		hop::vec3<float>(hp.x - eps, hp.y - eps, hp.z - eps),
-		hop::vec3<float>(hp.x + eps, hp.y + eps, hp.z + eps)
+	auto hp = to_hop(p_position);
+	auto eps = to_hop_scalar(0.001f);
+	hop::aa_box<hop_scalar> box(
+		hop::vec3<hop_scalar>(hp.x - eps, hp.y - eps, hp.z - eps),
+		hop::vec3<hop_scalar>(hp.x + eps, hp.y + eps, hp.z + eps)
 	);
 
-	std::vector<hop::solid<float> *> found(p_max_results * 2);
+	std::vector<hop::solid<hop_scalar> *> found(p_max_results * 2);
 	int count = space->simulator->find_solids_in_aa_box(box, found.data(), (int)found.size());
 
-	// Narrow phase: trace a zero-length segment to test actual shape containment.
-	// trace_segment is global and only returns the best hit, so we trace once
-	// per candidate using that solid's scope, skipping all others via the
-	// ignore parameter.
-	hop::segment<float> seg;
+	hop::segment<hop_scalar> seg;
 	seg.set_start_end(hp, hp);
 
 	int result_count = 0;
 	for (int i = 0; i < count && result_count < p_max_results; i++) {
-		hop::solid<float> *s = found[i];
+		hop::solid<hop_scalar> *s = found[i];
 		if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
 
 		HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
 		if (!body) continue;
 
-		// Trace with this solid's scope; if point is inside, time == 0
-		hop::collision<float> col;
+		hop::collision<hop_scalar> col;
 		space->simulator->trace_segment(col, seg, s->get_collision_scope());
-		if (col.time >= 1.0f) continue;
+		if (to_godot_float(col.time) >= 1.0f) continue;
 
 		if (p_results) {
 			p_results[result_count].rid = body->self_rid;
@@ -88,30 +82,27 @@ int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Tran
 	auto hs = sd->make_hop_shape(Transform3D());
 	if (!hs) return 0;
 
-	// Compute the query shape's AABB at the transform position
-	hop::aa_box<float> shape_box;
+	hop::aa_box<hop_scalar> shape_box;
 	hs->get_bound(shape_box);
-	hop::vec3<float> pos = to_hop(p_transform.origin);
+	auto pos = to_hop(p_transform.origin);
 	add(shape_box.mins, pos);
 	add(shape_box.maxs, pos);
 
-	// Include motion in the AABB
 	if (p_motion.length_squared() > 0) {
-		hop::aa_box<float> end_box = shape_box;
-		hop::vec3<float> motion = to_hop(p_motion);
+		hop::aa_box<hop_scalar> end_box = shape_box;
+		auto motion = to_hop(p_motion);
 		add(end_box.mins, motion);
 		add(end_box.maxs, motion);
 		shape_box.merge(end_box.mins);
 		shape_box.merge(end_box.maxs);
 	}
 
-	// Broad phase: find candidates overlapping the query AABB
-	std::vector<hop::solid<float> *> found(p_max_results * 2);
+	std::vector<hop::solid<hop_scalar> *> found(p_max_results * 2);
 	int count = space->simulator->find_solids_in_aa_box(shape_box, found.data(), (int)found.size());
 
 	int result_count = 0;
 	for (int i = 0; i < count && result_count < p_max_results; i++) {
-		hop::solid<float> *s = found[i];
+		hop::solid<hop_scalar> *s = found[i];
 		if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
 
 		HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
@@ -134,8 +125,7 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 	HopShapeData *sd = server->shape_owner.get_or_null(p_shape_rid);
 	if (!sd) return false;
 
-	// Create a temporary solid for the cast
-	auto temp_solid = std::make_shared<hop::solid<float>>();
+	auto temp_solid = std::make_shared<hop::solid<hop_scalar>>();
 	temp_solid->set_infinite_mass();
 	temp_solid->set_position(to_hop(p_transform.origin));
 	temp_solid->set_collision_scope(0);
@@ -147,18 +137,19 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 
 	space->simulator->add_solid(temp_solid);
 
-	hop::segment<float> seg;
+	hop::segment<hop_scalar> seg;
 	seg.set_start_end(to_hop(p_transform.origin), to_hop(p_transform.origin + p_motion));
 
-	hop::collision<float> result;
+	hop::collision<hop_scalar> result;
 	space->simulator->trace_solid(result, temp_solid.get(), seg, p_collision_mask);
 
 	space->simulator->remove_solid(temp_solid);
 
-	if (p_closest_safe) *p_closest_safe = result.time;
-	if (p_closest_unsafe) *p_closest_unsafe = result.time;
+	float time_f = to_godot_float(result.time);
+	if (p_closest_safe) *p_closest_safe = time_f;
+	if (p_closest_unsafe) *p_closest_unsafe = time_f;
 
-	if (result.time < 1.0f && p_info) {
+	if (time_f < 1.0f && p_info) {
 		p_info->point = to_godot(result.point);
 		p_info->normal = to_godot(result.normal);
 		p_info->shape = 0;

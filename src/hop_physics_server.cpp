@@ -401,12 +401,12 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 	if (body->hop_solid) {
 		if (body->is_static_or_kinematic()) {
 			body->hop_solid->set_infinite_mass();
-			body->hop_solid->set_coefficient_of_gravity(0.0f);
-			body->hop_solid->set_velocity(hop::vec3<float>(0, 0, 0));
+			body->hop_solid->set_coefficient_of_gravity(scalar_from_int<hop_scalar>(0));
+			body->hop_solid->set_velocity(hop::vec3<hop_scalar>(scalar_from_int<hop_scalar>(0), scalar_from_int<hop_scalar>(0), scalar_from_int<hop_scalar>(0)));
 			body->hop_solid->deactivate();
 		} else {
-			body->hop_solid->set_mass(body->mass);
-			body->hop_solid->set_coefficient_of_gravity(body->gravity_scale);
+			body->hop_solid->set_mass(to_hop_scalar(body->mass));
+			body->hop_solid->set_coefficient_of_gravity(to_hop_scalar(body->gravity_scale));
 			body->hop_solid->activate();
 		}
 	}
@@ -548,30 +548,30 @@ void HopPhysicsServer::_body_set_param(const RID &p_body, PhysicsServer3D::BodyP
 	switch (p_param) {
 		case PhysicsServer3D::BODY_PARAM_BOUNCE: {
 			body->bounce = p_value;
-			if (body->hop_solid) body->hop_solid->set_coefficient_of_restitution(body->bounce);
+			if (body->hop_solid) body->hop_solid->set_coefficient_of_restitution(to_hop_scalar(body->bounce));
 		} break;
 		case PhysicsServer3D::BODY_PARAM_FRICTION: {
 			body->friction = p_value;
 			if (body->hop_solid) {
-				body->hop_solid->set_coefficient_of_static_friction(body->friction);
-				body->hop_solid->set_coefficient_of_dynamic_friction(body->friction);
+				body->hop_solid->set_coefficient_of_static_friction(to_hop_scalar(body->friction));
+				body->hop_solid->set_coefficient_of_dynamic_friction(to_hop_scalar(body->friction));
 			}
 		} break;
 		case PhysicsServer3D::BODY_PARAM_MASS: {
 			body->mass = p_value;
 			if (body->hop_solid && !body->is_static_or_kinematic()) {
-				body->hop_solid->set_mass(body->mass);
+				body->hop_solid->set_mass(to_hop_scalar(body->mass));
 			}
 		} break;
 		case PhysicsServer3D::BODY_PARAM_GRAVITY_SCALE: {
 			body->gravity_scale = p_value;
-			if (body->hop_solid) body->hop_solid->set_coefficient_of_gravity(body->gravity_scale);
+			if (body->hop_solid) body->hop_solid->set_coefficient_of_gravity(to_hop_scalar(body->gravity_scale));
 		} break;
 		case PhysicsServer3D::BODY_PARAM_LINEAR_DAMP_MODE: break; // stored but not used differently
 		case PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP_MODE: break;
 		case PhysicsServer3D::BODY_PARAM_LINEAR_DAMP: {
 			body->linear_damp = p_value;
-			if (body->hop_solid) body->hop_solid->set_coefficient_of_effective_drag(body->linear_damp);
+			if (body->hop_solid) body->hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(body->linear_damp));
 		} break;
 		case PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP: body->angular_damp = p_value; break;
 		default: break;
@@ -809,19 +809,20 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	if (!space) return false;
 
 	// Save and set position for the test
-	hop::vec3<float> orig_pos = body->hop_solid->get_position();
+	hop::vec3<hop_scalar> orig_pos = body->hop_solid->get_position();
 	body->hop_solid->set_position_direct(to_hop(p_from.origin));
 
-	hop::segment<float> seg;
+	hop::segment<hop_scalar> seg;
 	seg.set_start_end(to_hop(p_from.origin), to_hop(p_from.origin + p_motion));
 
-	hop::collision<float> result;
+	hop::collision<hop_scalar> result;
 	space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask);
 
 	// Restore position
 	body->hop_solid->set_position_direct(orig_pos);
 
-	if (result.time >= 1.0f) {
+	float result_time = to_godot_float(result.time);
+	if (result_time >= 1.0f) {
 		// No collision
 		if (p_result) {
 			p_result->travel = p_motion;
@@ -836,10 +837,10 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 
 	// Collision occurred
 	if (p_result) {
-		p_result->travel = p_motion * result.time;
-		p_result->remainder = p_motion * (1.0f - result.time);
-		p_result->collision_safe_fraction = result.time;
-		p_result->collision_unsafe_fraction = result.time;
+		p_result->travel = p_motion * result_time;
+		p_result->remainder = p_motion * (1.0f - result_time);
+		p_result->collision_safe_fraction = result_time;
+		p_result->collision_unsafe_fraction = result_time;
 		p_result->collision_depth = 0.0f;
 		p_result->collision_count = 1;
 
@@ -949,10 +950,10 @@ void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, 
 	HopBodyData *bb = body_owner.get_or_null(p_body_B);
 	if (!ba || !bb || !ba->hop_solid || !bb->hop_solid) return;
 
-	j->hop_constraint = std::make_shared<hop::constraint<float>>(ba->hop_solid, bb->hop_solid);
-	j->hop_constraint->set_spring_constant(100.0f);
-	j->hop_constraint->set_damping_constant(10.0f);
-	j->hop_constraint->set_distance_threshold(0.0f);
+	j->hop_constraint = std::make_shared<hop::constraint<hop_scalar>>(ba->hop_solid, bb->hop_solid);
+	j->hop_constraint->set_spring_constant(to_hop_scalar(100.0f));
+	j->hop_constraint->set_damping_constant(to_hop_scalar(10.0f));
+	j->hop_constraint->set_distance_threshold(to_hop_scalar(0.0f));
 
 	HopSpaceData *space = space_owner.get_or_null(ba->space_rid);
 	if (space) {
@@ -1029,10 +1030,10 @@ void HopPhysicsServer::_joint_make_generic_6dof(const RID &p_joint, const RID &p
 	HopBodyData *bb = body_owner.get_or_null(p_body_B);
 	if (!ba || !bb || !ba->hop_solid || !bb->hop_solid) return;
 
-	j->hop_constraint = std::make_shared<hop::constraint<float>>(ba->hop_solid, bb->hop_solid);
-	j->hop_constraint->set_spring_constant(j->linear_spring_stiffness);
-	j->hop_constraint->set_damping_constant(j->linear_spring_damping);
-	j->hop_constraint->set_distance_threshold(j->linear_spring_equilibrium);
+	j->hop_constraint = std::make_shared<hop::constraint<hop_scalar>>(ba->hop_solid, bb->hop_solid);
+	j->hop_constraint->set_spring_constant(to_hop_scalar(j->linear_spring_stiffness));
+	j->hop_constraint->set_damping_constant(to_hop_scalar(j->linear_spring_damping));
+	j->hop_constraint->set_distance_threshold(to_hop_scalar(j->linear_spring_equilibrium));
 
 	HopSpaceData *space = space_owner.get_or_null(ba->space_rid);
 	if (space) {
@@ -1048,15 +1049,15 @@ void HopPhysicsServer::_generic_6dof_joint_set_param(const RID &p_joint, Vector3
 	switch (p_param) {
 		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_STIFFNESS:
 			j->linear_spring_stiffness = p_value;
-			if (j->hop_constraint) j->hop_constraint->set_spring_constant(p_value);
+			if (j->hop_constraint) j->hop_constraint->set_spring_constant(to_hop_scalar(p_value));
 			break;
 		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_DAMPING:
 			j->linear_spring_damping = p_value;
-			if (j->hop_constraint) j->hop_constraint->set_damping_constant(p_value);
+			if (j->hop_constraint) j->hop_constraint->set_damping_constant(to_hop_scalar(p_value));
 			break;
 		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_EQUILIBRIUM_POINT:
 			j->linear_spring_equilibrium = p_value;
-			if (j->hop_constraint) j->hop_constraint->set_distance_threshold(p_value);
+			if (j->hop_constraint) j->hop_constraint->set_distance_threshold(to_hop_scalar(p_value));
 			break;
 		default:
 			break;
@@ -1196,13 +1197,14 @@ void HopPhysicsServer::_step(float p_step) {
 	// Step all active spaces
 	space_owner.for_each([&](HopSpaceData *space) {
 		if (!space->active) return;
-		space->simulator->update(dt_ms, 0x3FFFFFFF | hop::simulator<float>::scope_report_collisions);
+		space->simulator->update(dt_ms, 0x3FFFFFFF | hop::simulator<hop_scalar>::scope_report_collisions);
 	});
 
 	// Sync positions from hop to Godot
 	body_owner.for_each([&](HopBodyData *body) {
 		body->sync_from_hop();
 	});
+
 }
 
 void HopPhysicsServer::_sync() {
@@ -1233,7 +1235,7 @@ void HopPhysicsServer::_flush_queries() {
 
 		// Compute the area's world AABB from its shapes
 		bool has_aabb = false;
-		hop::aa_box<float> area_aabb;
+		hop::aa_box<hop_scalar> area_aabb;
 
 		for (int si = 0; si < (int)area->shapes.size(); si++) {
 			auto &entry = area->shapes[si];
@@ -1246,11 +1248,11 @@ void HopPhysicsServer::_flush_queries() {
 			auto hs = sd->make_hop_shape(entry.local_xform);
 			if (!hs) continue;
 
-			hop::aa_box<float> shape_box;
+			hop::aa_box<hop_scalar> shape_box;
 			hs->get_bound(shape_box);
 
 			// Offset by area's world position
-			hop::vec3<float> area_pos = to_hop(area->transform.origin);
+			hop::vec3<hop_scalar> area_pos = to_hop(area->transform.origin);
 			add(shape_box.mins, area_pos);
 			add(shape_box.maxs, area_pos);
 
@@ -1266,12 +1268,12 @@ void HopPhysicsServer::_flush_queries() {
 		if (!has_aabb) return;
 
 		// Find bodies overlapping the area's AABB
-		hop::solid<float> *found[64];
+		hop::solid<hop_scalar> *found[64];
 		int count = space->simulator->find_solids_in_aa_box(area_aabb, found, 64);
 
 		std::map<uint64_t, RID> current_overlaps;
 		for (int i = 0; i < count; i++) {
-			hop::solid<float> *s = found[i];
+			hop::solid<hop_scalar> *s = found[i];
 			if (!s) continue;
 
 			// Check collision mask: area's mask vs body's layer

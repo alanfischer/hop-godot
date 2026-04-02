@@ -7,6 +7,7 @@
 
 #include <hop/hop.h>
 #include <memory>
+#include "hop_conversions.h"
 
 using namespace godot;
 
@@ -32,5 +33,5 @@ struct HopJointData {
 	float linear_spring_equilibrium = 0.0f;
 
 	// hop backing
-	std::shared_ptr<hop::constraint<float>> hop_constraint;
+	std::shared_ptr<hop::constraint<hop_scalar>> hop_constraint;
 };

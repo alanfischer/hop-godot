@@ -7,6 +7,7 @@
 #include <hop/hop.h>
 #include <memory>
 #include <vector>
+#include "hop_conversions.h"
 
 using namespace godot;
 
@@ -16,7 +17,7 @@ struct HopSpaceData {
 	RID self_rid;
 	bool active = false;
 
-	std::unique_ptr<hop::simulator<float>> simulator;
+	std::unique_ptr<hop::simulator<hop_scalar>> simulator;
 
 	// Space params (Godot defaults)
 	float contact_recycle_radius = 0.01f;
@@ -36,8 +37,11 @@ struct HopSpaceData {
 	HopDirectSpaceState *direct_state = nullptr;
 
 	HopSpaceData() {
-		simulator = std::make_unique<hop::simulator<float>>();
-		simulator->set_gravity(hop::vec3<float>(0.0f, -9.8f, 0.0f));
+		simulator = std::make_unique<hop::simulator<hop_scalar>>();
+		simulator->set_gravity(hop::vec3<hop_scalar>(
+			scalar_from_int<hop_scalar>(0),
+			scalar_from_milli<hop_scalar>(-9810),
+			scalar_from_int<hop_scalar>(0)));
 		simulator->set_integrator(hop::integrator_type::improved);
 	}
 };

@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 #include <set>
+#include "hop_conversions.h"
 
 using namespace godot;
 
@@ -18,7 +19,7 @@ struct HopBodyShapeEntry {
 	RID shape_rid;
 	Transform3D local_xform;
 	bool disabled = false;
-	std::shared_ptr<hop::shape<float>> hop_shape;
+	std::shared_ptr<hop::shape<hop_scalar>> hop_shape;
 };
 
 struct HopBodyData {
@@ -63,7 +64,7 @@ struct HopBodyData {
 	std::vector<RID> collision_exceptions;
 
 	// hop backing
-	std::shared_ptr<hop::solid<float>> hop_solid;
+	std::shared_ptr<hop::solid<hop_scalar>> hop_solid;
 
 	// Contact info from last step
 	struct ContactInfo {
@@ -86,7 +87,7 @@ struct HopBodyData {
 	void create_hop_solid();
 	void sync_to_hop();
 	void sync_from_hop();
-	void on_collision(const hop::collision<float> &c);
+	void on_collision(const hop::collision<hop_scalar> &c);
 	bool is_static_or_kinematic() const {
 		return mode == PhysicsServer3D::BODY_MODE_STATIC ||
 			   mode == PhysicsServer3D::BODY_MODE_KINEMATIC;

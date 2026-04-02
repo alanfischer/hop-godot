@@ -7,6 +7,7 @@
 
 #include <hop/hop.h>
 #include <memory>
+#include "hop_conversions.h"
 
 using namespace godot;
 
@@ -17,8 +18,8 @@ struct HopShapeData {
 	float custom_solver_bias = 0.0f;
 
 	// Cached hop shape — rebuilt when data changes
-	std::shared_ptr<hop::shape<float>> hop_shape;
+	std::shared_ptr<hop::shape<hop_scalar>> hop_shape;
 
 	void set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_data);
-	std::shared_ptr<hop::shape<float>> make_hop_shape(const Transform3D &p_local_xform) const;
+	std::shared_ptr<hop::shape<hop_scalar>> make_hop_shape(const Transform3D &p_local_xform) const;
 };

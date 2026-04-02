@@ -1,3 +1,6 @@
 [submodule "extern/godot-cpp"]
 	path = extern/godot-cpp
-	url = /Users/afischer/personal/wizardwars/extern/goldsrc-godot/extern/godot-cpp
+	url = https://github.com/godotengine/godot-cpp.git
+[submodule "extern/hop"]
+	path = extern/hop
+	url = https://github.com/alanfischer/hop

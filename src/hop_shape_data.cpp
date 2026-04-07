@@ -2,6 +2,7 @@
 
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_vector3_array.hpp>
+#include <godot_cpp/variant/plane.hpp>
 #include <godot_cpp/variant/array.hpp>
 
 #include "hop_conversions.h"
@@ -188,6 +189,13 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 					to_hop(Vector3(nx, 0, nz)), to_hop_scalar(d_val)));
 			}
 			return std::make_shared<hop::shape<hop_scalar>>(cs);
+		}
+
+		case PhysicsServer3D::SHAPE_WORLD_BOUNDARY: {
+			Plane p = data;
+			plane_traceable = std::make_shared<HopPlaneTraceable<hop_scalar>>();
+			plane_traceable->set_plane(to_hop(p.normal), to_hop_scalar(p.d));
+			return std::make_shared<hop::shape<hop_scalar>>(plane_traceable.get());
 		}
 
 		case PhysicsServer3D::SHAPE_CONCAVE_POLYGON: {

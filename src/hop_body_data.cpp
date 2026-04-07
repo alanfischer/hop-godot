@@ -78,6 +78,11 @@ void HopBodyData::on_collision(const hop::collision<hop_scalar> &c) {
 	if (c.collidee) {
 		HopBodyData *other = static_cast<HopBodyData *>(c.collidee->get_user_data());
 		if (other) {
+			// Check collision exceptions
+			for (const RID &exc : collision_exceptions) {
+				if (exc == other->self_rid) return;
+			}
+
 			ci.collider_rid = other->self_rid;
 			ci.collider_id = other->object_instance_id;
 			ci.collider_pos = to_godot(c.impact);

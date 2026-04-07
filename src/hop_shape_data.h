@@ -8,6 +8,7 @@
 #include <hop/hop.h>
 #include <memory>
 #include "hop_conversions.h"
+#include "hop_trimesh_traceable.h"
 
 using namespace godot;
 
@@ -20,6 +21,9 @@ struct HopShapeData {
 	// Cached hop shape — rebuilt when data changes
 	std::shared_ptr<hop::shape<hop_scalar>> hop_shape;
 
+	// Owned traceable for concave polygon shapes (raw ptr passed to hop)
+	std::shared_ptr<HopTrimeshTraceable<hop_scalar>> trimesh_traceable;
+
 	void set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_data);
-	std::shared_ptr<hop::shape<hop_scalar>> make_hop_shape(const Transform3D &p_local_xform) const;
+	std::shared_ptr<hop::shape<hop_scalar>> make_hop_shape(const Transform3D &p_local_xform);
 };

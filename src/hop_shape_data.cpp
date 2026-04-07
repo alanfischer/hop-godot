@@ -109,7 +109,7 @@ void HopShapeData::set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_
 	hop_shape.reset();
 }
 
-std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Transform3D &p_local_xform) const {
+std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Transform3D &p_local_xform) {
 	Vector3 origin = p_local_xform.origin;
 
 	switch (type) {
@@ -188,6 +188,53 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 					to_hop(Vector3(nx, 0, nz)), to_hop_scalar(d_val)));
 			}
 			return std::make_shared<hop::shape<hop_scalar>>(cs);
+		}
+
+		case PhysicsServer3D::SHAPE_CONCAVE_POLYGON: {
+			PackedVector3Array faces = data;
+			int face_count = faces.size();
+			// Godot passes concave polygon data as a flat array of face vertices
+			// (3 vertices per triangle)
+			if (face_count < 3 || (face_count % 3) != 0)
+				return nullptr;
+
+			int tri_count = face_count / 3;
+			const Vector3 *pts = faces.ptr();
+
+			// Deduplicate vertices and build index list
+			std::vector<hop::vec3<hop_scalar>> verts;
+			std::vector<HopTrimeshTraceable<hop_scalar>::triangle> tris;
+			verts.reserve(face_count);
+			tris.reserve(tri_count);
+
+			auto find_or_add = [&](const Vector3 &p) -> int {
+				hop::vec3<hop_scalar> hp = to_hop(p + origin);
+				for (int i = 0; i < (int)verts.size(); ++i) {
+					hop::vec3<hop_scalar> diff;
+					hop::sub(diff, verts[i], hp);
+					if (hop::length_squared(diff) < to_hop_scalar(1e-8f))
+						return i;
+				}
+				verts.push_back(hp);
+				return (int)verts.size() - 1;
+			};
+
+			for (int i = 0; i < tri_count; ++i) {
+				int i0 = find_or_add(pts[i * 3 + 0]);
+				int i1 = find_or_add(pts[i * 3 + 1]);
+				int i2 = find_or_add(pts[i * 3 + 2]);
+				if (i0 == i1 || i1 == i2 || i0 == i2)
+					continue; // degenerate
+				tris.push_back({ i0, i1, i2 });
+			}
+
+			if (tris.empty())
+				return nullptr;
+
+			trimesh_traceable = std::make_shared<HopTrimeshTraceable<hop_scalar>>();
+			trimesh_traceable->build(verts.data(), (int)verts.size(),
+			                         tris.data(), (int)tris.size());
+			return std::make_shared<hop::shape<hop_scalar>>(trimesh_traceable.get());
 		}
 
 		default:

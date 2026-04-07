@@ -27,6 +27,15 @@ void HopBodyData::create_hop_solid() {
 	hop_solid->set_position(to_hop(transform.origin));
 	hop_solid->set_velocity(to_hop(linear_velocity));
 	hop_solid->set_collision_callback([this](const hop::collision<hop_scalar> &c) { on_collision(c); });
+	hop_solid->set_collision_filter([this](hop::solid<hop_scalar> *other) -> bool {
+		if (collision_exceptions.empty()) return true;
+		auto *other_body = static_cast<HopBodyData *>(other->get_user_data());
+		if (!other_body) return true;
+		for (const RID &exc : collision_exceptions) {
+			if (exc == other_body->self_rid) return false;
+		}
+		return true;
+	});
 }
 
 void HopBodyData::sync_to_hop() {
@@ -78,11 +87,6 @@ void HopBodyData::on_collision(const hop::collision<hop_scalar> &c) {
 	if (c.collidee) {
 		HopBodyData *other = static_cast<HopBodyData *>(c.collidee->get_user_data());
 		if (other) {
-			// Check collision exceptions
-			for (const RID &exc : collision_exceptions) {
-				if (exc == other->self_rid) return;
-			}
-
 			ci.collider_rid = other->self_rid;
 			ci.collider_id = other->object_instance_id;
 			ci.collider_pos = to_godot(c.impact);

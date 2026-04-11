@@ -4,6 +4,8 @@
 #include "hop_conversions.h"
 
 #include <godot_cpp/classes/object.hpp>
+#include <godot_cpp/godot.hpp>
+
 
 bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p_to, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, bool p_hit_from_inside, bool p_hit_back_faces, bool p_pick_ray, PhysicsServer3DExtensionRayResult *p_result) {
 	if (!space || !p_collide_with_bodies) return false;
@@ -27,7 +29,7 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 			if (hit_body) {
 				p_result->rid = hit_body->self_rid;
 				p_result->collider_id = ObjectID(hit_body->object_instance_id);
-				p_result->collider = ObjectDB::get_instance(ObjectID(hit_body->object_instance_id));
+				p_result->collider = get_collider_safe(hit_body->object_instance_id);
 			}
 		}
 	}
@@ -65,7 +67,7 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 		if (p_results) {
 			p_results[result_count].rid = body->self_rid;
 			p_results[result_count].collider_id = ObjectID(body->object_instance_id);
-			p_results[result_count].collider = ObjectDB::get_instance(ObjectID(body->object_instance_id));
+			p_results[result_count].collider = get_collider_safe(body->object_instance_id);
 			p_results[result_count].shape = 0;
 		}
 		result_count++;
@@ -111,7 +113,7 @@ int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Tran
 		if (p_results) {
 			p_results[result_count].rid = body->self_rid;
 			p_results[result_count].collider_id = ObjectID(body->object_instance_id);
-			p_results[result_count].collider = ObjectDB::get_instance(ObjectID(body->object_instance_id));
+			p_results[result_count].collider = get_collider_safe(body->object_instance_id);
 			p_results[result_count].shape = 0;
 		}
 		result_count++;

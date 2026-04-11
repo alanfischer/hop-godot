@@ -4,6 +4,7 @@
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 #include <godot_cpp/variant/plane.hpp>
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 
 #include "hop_conversions.h"
 
@@ -199,8 +200,12 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 		}
 
 		case PhysicsServer3D::SHAPE_CONCAVE_POLYGON: {
-			PackedVector3Array faces = data;
+			UtilityFunctions::print("[hop] CONCAVE_POLYGON set_data type=", (int)data.get_type());
+			Dictionary d = data;
+			PackedVector3Array faces = d["faces"];
+			bool backface_collision = d.get("backface_collision", false);
 			int face_count = faces.size();
+			UtilityFunctions::print("[hop] CONCAVE_POLYGON faces=", face_count, " backface=", backface_collision);
 			// Godot passes concave polygon data as a flat array of face vertices
 			// (3 vertices per triangle)
 			if (face_count < 3 || (face_count % 3) != 0)
@@ -233,7 +238,7 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 				int i2 = find_or_add(pts[i * 3 + 2]);
 				if (i0 == i1 || i1 == i2 || i0 == i2)
 					continue; // degenerate
-				tris.push_back({ i0, i1, i2 });
+				tris.push_back({ i0, i2, i1 }); // GoldSrc BSP uses CW winding from outside → reverse to get outward normals
 			}
 
 			if (tris.empty())
@@ -241,7 +246,8 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 
 			trimesh_traceable = std::make_shared<HopTrimeshTraceable<hop_scalar>>();
 			trimesh_traceable->build(verts.data(), (int)verts.size(),
-			                         tris.data(), (int)tris.size());
+			                         tris.data(), (int)tris.size(),
+			                         backface_collision);
 			return std::make_shared<hop::shape<hop_scalar>>(trimesh_traceable.get());
 		}
 

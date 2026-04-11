@@ -4,14 +4,77 @@
 #include "hop_conversions.h"
 
 #include <godot_cpp/classes/object.hpp>
+#include <hop/math/intersect.h>
+#include <algorithm>
+#include <vector>
 
 Vector3 HopDirectBodyState::_get_total_gravity() const {
 	if (!body || !body->hop_solid) return Vector3(0, -9.8f, 0);
 	HopSpaceData *space = server->space_owner.get_or_null(body->space_rid);
-	if (space) {
-		return to_godot(space->simulator->get_gravity()) * body->gravity_scale;
+	if (!space) return Vector3(0, -9.8f, 0);
+
+	Vector3 global_gravity = to_godot(space->simulator->get_gravity());
+	auto body_wb = body->hop_solid->get_world_bound();
+
+	// Collect areas overlapping this body that have a gravity override
+	struct AreaEntry { int priority; PhysicsServer3D::AreaSpaceOverrideMode mode; Vector3 gravity; };
+	std::vector<AreaEntry> matched;
+
+	server->area_owner.for_each([&](HopAreaData *area) {
+		if (area->space_override_mode == PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED) return;
+		if (!area->space_rid.is_valid() || area->space_rid != body->space_rid) return;
+
+		// Build area world AABB from its shapes
+		bool has_box = false;
+		hop::aa_box<hop_scalar> area_wb;
+		for (auto &se : area->shapes) {
+			if (se.disabled) continue;
+			HopShapeData *sd = server->shape_owner.get_or_null(se.shape_rid);
+			if (!sd) continue;
+			auto hs = sd->make_hop_shape(se.local_xform);
+			if (!hs) continue;
+			hop::aa_box<hop_scalar> sb;
+			hs->get_bound(sb);
+			hop::vec3<hop_scalar> p = to_hop(area->transform.origin);
+			hop::add(sb.mins, p);
+			hop::add(sb.maxs, p);
+			if (!has_box) { area_wb = sb; has_box = true; }
+			else { area_wb.merge(sb.mins); area_wb.merge(sb.maxs); }
+		}
+		if (!has_box) return;
+		if (!hop::test_intersection(body_wb, area_wb)) return;
+		if (!(area->collision_mask & body->hop_solid->get_collision_scope())) return;
+
+		Vector3 ag = area->gravity_direction.normalized() * area->gravity;
+		matched.push_back({ area->priority, area->space_override_mode, ag });
+	});
+
+	if (matched.empty()) return global_gravity * body->gravity_scale;
+
+	// Higher priority areas are processed first
+	std::sort(matched.begin(), matched.end(), [](const AreaEntry &a, const AreaEntry &b) {
+		return a.priority > b.priority;
+	});
+
+	Vector3 result;
+	bool done = false;
+	for (auto &e : matched) {
+		switch (e.mode) {
+			case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE:
+				result += e.gravity; break;
+			case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE_REPLACE:
+				result += e.gravity; done = true; break;
+			case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE:
+				result = e.gravity; done = true; break;
+			case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE_COMBINE:
+				result = e.gravity; break;
+			default: break;
+		}
+		if (done) break;
 	}
-	return Vector3(0, -9.8f, 0);
+	if (!done) result += global_gravity;
+
+	return result * body->gravity_scale;
 }
 
 float HopDirectBodyState::_get_total_linear_damp() const {
@@ -196,8 +259,7 @@ uint64_t HopDirectBodyState::_get_contact_collider_id(int32_t p_contact_idx) con
 
 Object *HopDirectBodyState::_get_contact_collider_object(int32_t p_contact_idx) const {
 	uint64_t id = _get_contact_collider_id(p_contact_idx);
-	if (id == 0) return nullptr;
-	return ObjectDB::get_instance(ObjectID(id));
+	return get_collider_safe(id);
 }
 
 int32_t HopDirectBodyState::_get_contact_collider_shape(int32_t p_contact_idx) const {

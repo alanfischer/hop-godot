@@ -1,11 +1,24 @@
 #pragma once
 
 #include <godot_cpp/variant/vector3.hpp>
+#include <godot_cpp/classes/object.hpp>
+#include <godot_cpp/godot.hpp>
 #include <hop/fixed16.h>
 #include <hop/math/vec3.h>
 #include <type_traits>
 
 using namespace godot;
+
+// Safely get an Object* for a known instance id.
+// Only returns non-null if the GDExtension binding already exists for this object.
+// Avoids crash in get_parent_class when the object's class is a GDScript type.
+inline godot::Object *get_collider_safe(uint64_t p_id) {
+	if (!p_id) return nullptr;
+	GDExtensionObjectPtr obj = godot::internal::gdextension_interface_object_get_instance_from_id(p_id);
+	if (!obj) return nullptr;
+	return reinterpret_cast<godot::Object *>(
+		godot::internal::gdextension_interface_object_get_instance_binding(obj, godot::internal::token, nullptr));
+}
 
 // The scalar type used throughout the GDExtension.
 // Switch between float and hop::fixed16 here.

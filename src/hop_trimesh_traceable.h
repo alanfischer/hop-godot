@@ -3,6 +3,7 @@
 #include <hop/hop.h>
 #include <vector>
 #include "hop_conversions.h"
+#include "hop_debug.h"
 
 // A traceable implementation for triangle meshes.  Stores triangles as
 // vertices + index triplets and accelerates queries with a BVH over
@@ -18,7 +19,9 @@ public:
 	};
 
 	void build(const hop::vec3<T> * verts, int vert_count,
-	           const triangle * tris, int tri_count) {
+	           const triangle * tris, int tri_count,
+	           bool backface_collision = false) {
+		backface_collision_ = backface_collision;
 		verts_.assign(verts, verts + vert_count);
 		tris_.assign(tris, tris + tri_count);
 
@@ -122,65 +125,83 @@ public:
 		end_box.maxs.z = end.z + swept_box.maxs.z;
 		query_box.merge(end_box);
 
+		int dbg_bvh_hits = 0, dbg_denom_pass = 0, dbg_t_pass = 0, dbg_bary_pass = 0;
 		bvh_.query_aabb(query_box, [&](int tri_idx) {
+			dbg_bvh_hits++;
 			auto & tri = tris_[tri_idx];
 			auto & n = normals_[tri_idx];
 
-			// For each shape on the solid, compute how far to expand
-			// the triangle plane along its normal using support()
-			for (int si = 0; si < s->get_num_shapes(); ++si) {
-				auto * sh = s->get_shape(si);
+			// Test front face, and optionally the back face
+			int num_sides = backface_collision_ ? 2 : 1;
+			for (int side = 0; side < num_sides; ++side) {
+				hop::vec3<T> face_n;
+				if (side == 0) {
+					face_n = n;
+				} else {
+					hop::neg(face_n, n);
+				}
 
-				// support() in the negative-normal direction gives the point on
-				// the shape furthest into the triangle plane
-				hop::vec3<T> neg_n;
-				hop::neg(neg_n, n);
-				hop::vec3<T> sup;
-				hop::support(sup, *sh, neg_n);
-
-				// The expansion distance: how far the support point extends
-				// along the negative normal from the shape's local origin
-				T expand = hop::dot(sup, neg_n);
-
-				// Build the expanded plane in mesh-local space
-				auto & v0 = verts_[tri.i0];
-				T plane_d = hop::dot(n, v0);
-				// Expand the plane outward by the shape's extent
-				T expanded_d = plane_d + expand;
-
-				// Trace the segment origin point against the expanded triangle
-				// First, check segment vs expanded plane
-				T denom = hop::dot(n, seg.direction);
+				T denom = hop::dot(face_n, seg.direction);
 				if (denom >= T {})
 					continue; // Moving away or parallel
+				dbg_denom_pass++;
 
-				T t = (expanded_d - hop::dot(n, local_origin)) / denom;
-				if (t < T {} || t > tr::one() || t >= result.time)
-					continue;
+				// For each shape on the solid, compute how far to expand
+				// the triangle plane along its normal using support()
+				for (int si = 0; si < s->get_num_shapes(); ++si) {
+					auto * sh = s->get_shape(si);
 
-				// Compute hit point on the expanded plane
-				hop::vec3<T> hit;
-				hop::mul(hit, seg.direction, t);
-				hop::add(hit, local_origin);
+					// support() in the negative-normal direction gives the point on
+					// the shape furthest into the triangle plane
+					hop::vec3<T> neg_fn;
+					hop::neg(neg_fn, face_n);
+					hop::vec3<T> sup;
+					hop::support(sup, *sh, neg_fn);
 
-				// Project hit point onto the original triangle plane and
-				// check if it's inside the triangle (barycentric test)
-				// The hit is on the expanded plane, offset by 'expand' from
-				// the original. Project back to the original plane along normal.
-				hop::vec3<T> proj;
-				T offset = hop::dot(n, hit) - plane_d;
-				hop::vec3<T> n_scaled;
-				hop::mul(n_scaled, n, offset);
-				hop::sub(proj, hit, n_scaled);
+					// The expansion distance: how far the support point extends
+					// along the negative normal from the shape's local origin
+					T expand = hop::dot(sup, neg_fn);
 
-				if (point_in_triangle(proj, tri_idx)) {
-					result.time = t;
-					hop::mul(result.point, seg.direction, t);
-					hop::add(result.point, seg.origin);
-					result.normal = n;
+					// Build the expanded plane in mesh-local space
+					auto & v0 = verts_[tri.i0];
+					T plane_d = hop::dot(face_n, v0);
+					// Expand the plane outward by the shape's extent
+					T expanded_d = plane_d + expand;
+
+					T t = (expanded_d - hop::dot(face_n, local_origin)) / denom;
+					if (t < T {} || t > tr::one() || t >= result.time)
+						continue;
+					dbg_t_pass++;
+
+					// Compute hit point on the expanded plane
+					hop::vec3<T> hit;
+					hop::mul(hit, seg.direction, t);
+					hop::add(hit, local_origin);
+
+					// Project hit point onto the original triangle plane and
+					// check if it's inside the triangle (barycentric test)
+					// The hit is on the expanded plane, offset by 'expand' from
+					// the original. Project back to the original plane along normal.
+					hop::vec3<T> proj;
+					T offset = hop::dot(face_n, hit) - plane_d;
+					hop::vec3<T> n_scaled;
+					hop::mul(n_scaled, face_n, offset);
+					hop::sub(proj, hit, n_scaled);
+
+					if (point_in_triangle(proj, tri_idx)) {
+						dbg_bary_pass++;
+						result.time = t;
+						hop::mul(result.point, seg.direction, t);
+						hop::add(result.point, seg.origin);
+						result.normal = face_n;
+					}
 				}
 			}
 		});
+		g_last_trimesh_trace_debug.bvh_hits   = dbg_bvh_hits;
+		g_last_trimesh_trace_debug.denom_pass = dbg_denom_pass;
+		g_last_trimesh_trace_debug.t_pass     = dbg_t_pass;
+		g_last_trimesh_trace_debug.bary_pass  = dbg_bary_pass;
 	}
 
 private:
@@ -189,6 +210,8 @@ private:
 	std::vector<hop::vec3<T>> normals_;
 	hop::bvh<T, int> bvh_;
 	hop::aa_box<T> total_bound_;
+	bool backface_collision_ = false;
+
 
 	void tri_aabb(int idx, hop::aa_box<T> & box) const {
 		auto & t = tris_[idx];

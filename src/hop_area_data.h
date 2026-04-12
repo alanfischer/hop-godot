@@ -49,4 +49,6 @@ struct HopAreaData {
 	// Overlap tracking for monitor callbacks
 	// Maps object_instance_id -> body RID for currently overlapping bodies
 	std::map<uint64_t, RID> overlapping_bodies;
+	// Maps object_instance_id -> area RID for currently overlapping areas
+	std::map<uint64_t, RID> overlapping_areas;
 };

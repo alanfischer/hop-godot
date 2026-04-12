@@ -1242,6 +1242,113 @@ void HopPhysicsServer::_step(float p_step) {
 		}
 	});
 
+	// Apply area space overrides (gravity, linear damp) to dynamic bodies.
+	// hop applies global gravity uniformly, so we must compensate here each step.
+	body_owner.for_each([&](HopBodyData *body) {
+		if (!body->hop_solid || body->is_static_or_kinematic()) return;
+		HopSpaceData *space = space_owner.get_or_null(body->space_rid);
+		if (!space) return;
+
+		struct AreaMatch {
+			int priority;
+			PhysicsServer3D::AreaSpaceOverrideMode grav_mode;
+			Vector3 gravity;
+			PhysicsServer3D::AreaSpaceOverrideMode damp_mode;
+			float lin_damp;
+		};
+		std::vector<AreaMatch> matched;
+		auto body_wb = body->hop_solid->get_world_bound();
+
+		area_owner.for_each([&](HopAreaData *area) {
+			bool has_grav = area->space_override_mode != PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED;
+			bool has_damp = area->linear_damp_override_mode != PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED;
+			if (!has_grav && !has_damp) return;
+			if (!area->space_rid.is_valid() || area->space_rid != body->space_rid) return;
+			if (!(area->collision_mask & body->hop_solid->get_collision_scope())) return;
+
+			bool has_box = false;
+			hop::aa_box<hop_scalar> area_wb;
+			for (auto &se : area->shapes) {
+				if (se.disabled) continue;
+				HopShapeData *sd = shape_owner.get_or_null(se.shape_rid);
+				if (!sd) continue;
+				auto hs = sd->make_hop_shape(se.local_xform);
+				if (!hs) continue;
+				hop::aa_box<hop_scalar> sb;
+				hs->get_bound(sb);
+				hop::vec3<hop_scalar> p = to_hop(area->transform.origin);
+				hop::add(sb.mins, p);
+				hop::add(sb.maxs, p);
+				if (!has_box) { area_wb = sb; has_box = true; }
+				else { area_wb.merge(sb.mins); area_wb.merge(sb.maxs); }
+			}
+			if (!has_box) return;
+			if (!hop::test_intersection(body_wb, area_wb)) return;
+
+			Vector3 ag = area->gravity_direction.normalized() * area->gravity;
+			matched.push_back({ area->priority, area->space_override_mode, ag,
+				area->linear_damp_override_mode, area->linear_damp });
+		});
+
+		// Linear damp: always update so leaving an area resets the coefficient.
+		{
+			float result = body->linear_damp;
+			bool any_damp = false;
+			if (!matched.empty()) {
+				std::sort(matched.begin(), matched.end(), [](const AreaMatch &a, const AreaMatch &b) {
+					return a.priority > b.priority;
+				});
+				result = 0.0f;
+				bool done = false;
+				for (auto &e : matched) {
+					if (e.damp_mode == PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED) continue;
+					any_damp = true;
+					switch (e.damp_mode) {
+						case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE:          result += e.lin_damp; break;
+						case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE_REPLACE:  result += e.lin_damp; done = true; break;
+						case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE:          result  = e.lin_damp; done = true; break;
+						case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE_COMBINE:  result  = e.lin_damp; break;
+						default: break;
+					}
+					if (done) break;
+				}
+				if (!done) result += body->linear_damp;
+			}
+			if (!any_damp) result = body->linear_damp;
+			body->hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(result));
+		}
+
+		if (matched.empty()) return;
+
+		// Gravity override: apply a force that corrects for area gravity vs global gravity.
+		{
+			bool any_grav = false;
+			Vector3 result;
+			bool done = false;
+			for (auto &e : matched) {
+				if (e.grav_mode == PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED) continue;
+				any_grav = true;
+				switch (e.grav_mode) {
+					case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE:          result += e.gravity; break;
+					case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE_REPLACE:  result += e.gravity; done = true; break;
+					case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE:          result  = e.gravity; done = true; break;
+					case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE_COMBINE:  result  = e.gravity; break;
+					default: break;
+				}
+				if (done) break;
+			}
+			if (!any_grav) return;
+			Vector3 global_gravity = to_godot(space->simulator->get_gravity());
+			if (!done) result += global_gravity;
+			result *= body->gravity_scale;
+			// hop already applies global_gravity * gravity_scale; add the difference.
+			Vector3 correction = result - global_gravity * body->gravity_scale;
+			if (correction.length_squared() > 0.0f) {
+				body->hop_solid->add_force(to_hop(correction * body->mass));
+			}
+		}
+	});
+
 	// Step all active spaces
 	space_owner.for_each([&](HopSpaceData *space) {
 		if (!space->active) return;
@@ -1352,6 +1459,78 @@ void HopPhysicsServer::_flush_queries() {
 		}
 
 		area->overlapping_bodies = current_overlaps;
+	});
+
+	// Area-to-area monitoring: detect when areas (monitoring=true) overlap monitorable areas
+	area_owner.for_each([&](HopAreaData *detector) {
+		if (!detector->area_monitor_callback.is_valid()) return;
+		if (!detector->space_rid.is_valid()) return;
+
+		// Compute detector AABB
+		bool det_has_aabb = false;
+		hop::aa_box<hop_scalar> det_aabb;
+		for (auto &entry : detector->shapes) {
+			if (entry.disabled) continue;
+			HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
+			if (!sd) continue;
+			auto hs = sd->make_hop_shape(entry.local_xform);
+			if (!hs) continue;
+			hop::aa_box<hop_scalar> sb;
+			hs->get_bound(sb);
+			hop::vec3<hop_scalar> p = to_hop(detector->transform.origin);
+			add(sb.mins, p);
+			add(sb.maxs, p);
+			if (!det_has_aabb) { det_aabb = sb; det_has_aabb = true; }
+			else { det_aabb.merge(sb.mins); det_aabb.merge(sb.maxs); }
+		}
+		if (!det_has_aabb) return;
+
+		std::map<uint64_t, RID> current_area_overlaps;
+		area_owner.for_each([&](HopAreaData *target) {
+			if (target == detector) return;
+			if (!target->monitorable) return;
+			if (target->space_rid != detector->space_rid) return;
+			if (!(detector->collision_mask & target->collision_layer)) return;
+
+			// Compute target AABB and check intersection
+			bool tgt_has_aabb = false;
+			hop::aa_box<hop_scalar> tgt_aabb;
+			for (auto &entry : target->shapes) {
+				if (entry.disabled) continue;
+				HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
+				if (!sd) continue;
+				auto hs = sd->make_hop_shape(entry.local_xform);
+				if (!hs) continue;
+				hop::aa_box<hop_scalar> sb;
+				hs->get_bound(sb);
+				hop::vec3<hop_scalar> p = to_hop(target->transform.origin);
+				add(sb.mins, p);
+				add(sb.maxs, p);
+				if (!tgt_has_aabb) { tgt_aabb = sb; tgt_has_aabb = true; }
+				else { tgt_aabb.merge(sb.mins); tgt_aabb.merge(sb.maxs); }
+			}
+			if (!tgt_has_aabb) return;
+
+			if (hop::test_intersection(det_aabb, tgt_aabb)) {
+				current_area_overlaps[target->object_instance_id] = target->self_rid;
+			}
+		});
+
+		// Fire ADDED callbacks for newly overlapping areas
+		for (auto &[id, rid] : current_area_overlaps) {
+			if (detector->overlapping_areas.find(id) == detector->overlapping_areas.end()) {
+				detector->area_monitor_callback.call(
+					PhysicsServer3D::AREA_BODY_ADDED, rid, ObjectID(id), 0, 0);
+			}
+		}
+		// Fire REMOVED callbacks for areas that left
+		for (auto &[id, rid] : detector->overlapping_areas) {
+			if (current_area_overlaps.find(id) == current_area_overlaps.end()) {
+				detector->area_monitor_callback.call(
+					PhysicsServer3D::AREA_BODY_REMOVED, rid, ObjectID(id), 0, 0);
+			}
+		}
+		detector->overlapping_areas = current_area_overlaps;
 	});
 
 	flushing_queries = false;

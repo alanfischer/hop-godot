@@ -169,8 +169,14 @@ public:
 					T expanded_d = plane_d + expand;
 
 					T t = (expanded_d - hop::dot(face_n, local_origin)) / denom;
-					if (t < T {} || t > tr::one() || t >= result.time)
+					if (t > tr::one() || t >= result.time)
 						continue;
+					// If t < 0 the body center is already inside the expanded plane
+					// (penetrating). Clamp to 0 so the simulator's depenetration
+					// logic can push the body back out; skipping it entirely lets
+					// the body sink further through the mesh each frame.
+					if (t < T {})
+						t = T {};
 					dbg_t_pass++;
 
 					// Compute hit point on the expanded plane
@@ -219,6 +225,11 @@ private:
 		box.maxs = verts_[t.i0];
 		box.merge(verts_[t.i1]);
 		box.merge(verts_[t.i2]);
+		// Small epsilon expansion so zero-thickness (axis-aligned) triangles
+		// are reliably found by the BVH even when the query box just grazes them.
+		const T eps = T(1e-3f);
+		box.mins.x -= eps; box.mins.y -= eps; box.mins.z -= eps;
+		box.maxs.x += eps; box.maxs.y += eps; box.maxs.z += eps;
 	}
 
 	// Ray-triangle intersection (Möller–Trumbore)

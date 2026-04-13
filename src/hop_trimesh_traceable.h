@@ -111,6 +111,57 @@ public:
 		query_box.maxs.y = local_origin.y + swept_box.maxs.y;
 		query_box.maxs.z = local_origin.z + swept_box.maxs.z;
 
+		// Zero-direction static overlap path.
+		// The sweep loop's `denom >= 0` guard skips every triangle when direction
+		// is zero (denom = dot(face_n, 0) == 0).  Handle this case separately:
+		// a solid overlaps a triangle when its Minkowski-expanded plane is already
+		// crossed, i.e. dot(face_n, local_origin) <= plane_d + expand.
+		if (hop::dot(seg.direction, seg.direction) == T{}) {
+			bool found = false;
+			bvh_.query_aabb(query_box, [&](int tri_idx) {
+				if (found) return;
+				auto & tri = tris_[tri_idx];
+				auto & n   = normals_[tri_idx];
+
+				int num_sides = backface_collision_ ? 2 : 1;
+				for (int side = 0; side < num_sides && !found; ++side) {
+					hop::vec3<T> face_n = n;
+					if (side == 1) hop::neg(face_n, n);
+
+					for (int si = 0; si < s->get_num_shapes() && !found; ++si) {
+						auto * sh = s->get_shape(si);
+
+						hop::vec3<T> neg_fn;
+						hop::neg(neg_fn, face_n);
+						hop::vec3<T> sup;
+						hop::support(sup, *sh, neg_fn);
+						T expand = hop::dot(sup, neg_fn);
+
+						T plane_d    = hop::dot(face_n, verts_[tri.i0]);
+						T expanded_d = plane_d + expand;
+
+						// Not penetrating this face — skip.
+						if (hop::dot(face_n, local_origin) > expanded_d) continue;
+
+						// Project local_origin onto the original triangle plane and
+						// check if it lies inside the triangle.
+						T dist = hop::dot(face_n, local_origin) - plane_d;
+						hop::vec3<T> proj, n_scaled;
+						hop::mul(n_scaled, face_n, dist);
+						hop::sub(proj, local_origin, n_scaled);
+
+						if (point_in_triangle(proj, tri_idx)) {
+							result.time   = T{};
+							result.normal = face_n;
+							result.point  = seg.origin;
+							found = true;
+						}
+					}
+				}
+			});
+			return;
+		}
+
 		// Expand by endpoint
 		hop::vec3<T> end;
 		end.x = local_origin.x + seg.direction.x;

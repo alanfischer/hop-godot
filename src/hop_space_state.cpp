@@ -126,41 +126,57 @@ int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Tran
 	auto hs = sd->make_hop_shape(Transform3D());
 	if (!hs) return 0;
 
-	hop::aa_box<hop_scalar> shape_box;
-	hs->get_bound(shape_box);
+	// Build a temporary solid carrying the test shape.
+	// Only collide with static bodies — kinematic and dynamic bodies (e.g. the
+	// crouched player capsule) must not be counted as blockers.  _intersect_shape
+	// does not receive the caller's exclude list, so without this filter the
+	// player's own body would always register as an overlap and can_uncrouch()
+	// would permanently return false.
+	auto temp_solid = std::make_shared<hop::solid<hop_scalar>>();
+	temp_solid->set_infinite_mass();
+	temp_solid->set_position(to_hop(p_transform.origin));
+	temp_solid->set_collision_scope(0);
+	temp_solid->set_collide_with_scope(p_collision_mask);
+	temp_solid->add_shape(hs);
+	temp_solid->set_collision_filter([](hop::solid<hop_scalar> *other) -> bool {
+		auto *body = static_cast<HopBodyData *>(other->get_user_data());
+		return body && body->mode == PhysicsServer3D::BODY_MODE_STATIC;
+	});
+
+	space->simulator->add_solid(temp_solid);
+
+	// Perform a narrow-phase overlap test via a zero-direction sweep.
+	// All hop primitives return t=0 when the solid's origin is already inside
+	// (aa_box/sphere/capsule via test_inside; trimesh via the static overlap
+	// path in HopTrimeshTraceable::trace_solid).
+	hop::segment<hop_scalar> seg;
 	auto pos = to_hop(p_transform.origin);
-	add(shape_box.mins, pos);
-	add(shape_box.maxs, pos);
+	seg.set_start_end(pos, pos);
 
-	if (p_motion.length_squared() > 0) {
-		hop::aa_box<hop_scalar> end_box = shape_box;
-		auto motion = to_hop(p_motion);
-		add(end_box.mins, motion);
-		add(end_box.maxs, motion);
-		shape_box.merge(end_box.mins);
-		shape_box.merge(end_box.maxs);
-	}
+	hop::collision<hop_scalar> result;
+	space->simulator->trace_solid(result, temp_solid.get(), seg, p_collision_mask);
 
-	std::vector<hop::solid<hop_scalar> *> found(p_max_results * 2);
-	int count = space->simulator->find_solids_in_aa_box(shape_box, found.data(), (int)found.size());
+	space->simulator->remove_solid(temp_solid);
 
-	int result_count = 0;
-	for (int i = 0; i < count && result_count < p_max_results; i++) {
-		hop::solid<hop_scalar> *s = found[i];
-		if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
+	float time_f = to_godot_float(result.time);
+	if (time_f >= 1.0f) return 0;
 
-		HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
-		if (!body) continue;
-
-		if (p_results) {
-			p_results[result_count].rid = body->self_rid;
-			p_results[result_count].collider_id = ObjectID(body->object_instance_id);
-			p_results[result_count].collider = get_collider_safe(body->object_instance_id);
-			p_results[result_count].shape = 0;
+	// At least one static solid overlaps the test shape.
+	// Fill in one result entry; callers that only check is_empty() don't need more.
+	if (p_results && p_max_results > 0) {
+		if (result.collidee) {
+			HopBodyData *hit = static_cast<HopBodyData *>(result.collidee->get_user_data());
+			if (hit) {
+				p_results[0].rid = hit->self_rid;
+				p_results[0].collider_id = ObjectID(hit->object_instance_id);
+				p_results[0].collider = get_collider_safe(hit->object_instance_id);
+				p_results[0].shape = 0;
+			}
 		}
-		result_count++;
+		// result.collidee is null for trimesh hits — that's fine; the only
+		// current caller (can_uncrouch) checks is_empty(), not the body ref.
 	}
-	return result_count;
+	return 1;
 }
 
 bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, float *p_closest_safe, float *p_closest_unsafe, PhysicsServer3DExtensionShapeRestInfo *p_info) {

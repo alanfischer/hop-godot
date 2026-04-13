@@ -123,6 +123,35 @@ int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Tran
 	HopShapeData *sd = server->shape_owner.get_or_null(p_shape_rid);
 	if (!sd) return 0;
 
+	// Separation ray: fire a segment rather than sweeping a solid shape.
+	// The ray fires along p_motion if given, otherwise straight down by the ray's length.
+	if (sd->type == PhysicsServer3D::SHAPE_SEPARATION_RAY) {
+		Dictionary ray_data = sd->data;
+		float length = ray_data.get("length", 1.0f);
+		Vector3 dir = p_motion.length_squared() > 0.0f ? p_motion : Vector3(0.0f, -length, 0.0f);
+
+		hop::segment<hop_scalar> seg;
+		seg.set_start_end(to_hop(p_transform.origin), to_hop(p_transform.origin + dir));
+
+		hop::collision<hop_scalar> result;
+		space->simulator->trace_segment(result, seg, p_collision_mask);
+
+		if (to_godot_float(result.time) >= 1.0f) return 0;
+
+		if (p_results) {
+			if (result.collidee) {
+				HopBodyData *hit = static_cast<HopBodyData *>(result.collidee->get_user_data());
+				if (hit) {
+					p_results[0].rid = hit->self_rid;
+					p_results[0].collider_id = ObjectID(hit->object_instance_id);
+					p_results[0].collider = get_collider_safe(hit->object_instance_id);
+					p_results[0].shape = 0;
+				}
+			}
+		}
+		return 1;
+	}
+
 	auto hs = sd->make_hop_shape(Transform3D());
 	if (!hs) return 0;
 
@@ -184,6 +213,39 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 
 	HopShapeData *sd = server->shape_owner.get_or_null(p_shape_rid);
 	if (!sd) return false;
+
+	// Separation ray: fire a segment rather than sweeping a solid shape.
+	// The ray fires along p_motion if given, otherwise straight down by the ray's length.
+	if (sd->type == PhysicsServer3D::SHAPE_SEPARATION_RAY) {
+		Dictionary ray_data = sd->data;
+		float length = ray_data.get("length", 1.0f);
+		Vector3 dir = p_motion.length_squared() > 0.0f ? p_motion : Vector3(0.0f, -length, 0.0f);
+
+		hop::segment<hop_scalar> seg;
+		seg.set_start_end(to_hop(p_transform.origin), to_hop(p_transform.origin + dir));
+
+		hop::collision<hop_scalar> result;
+		space->simulator->trace_segment(result, seg, p_collision_mask);
+
+		float time_f = to_godot_float(result.time);
+		if (p_closest_safe) *p_closest_safe = time_f;
+		if (p_closest_unsafe) *p_closest_unsafe = time_f;
+
+		if (time_f < 1.0f && p_info) {
+			p_info->point = to_godot(result.point);
+			p_info->normal = to_godot(result.normal);
+			p_info->shape = 0;
+			if (result.collidee) {
+				HopBodyData *hit = static_cast<HopBodyData *>(result.collidee->get_user_data());
+				if (hit) {
+					p_info->rid = hit->self_rid;
+					p_info->collider_id = ObjectID(hit->object_instance_id);
+					p_info->linear_velocity = hit->linear_velocity;
+				}
+			}
+		}
+		return time_f < 1.0f;
+	}
 
 	auto temp_solid = std::make_shared<hop::solid<hop_scalar>>();
 	temp_solid->set_infinite_mass();

@@ -354,6 +354,8 @@ void HopPhysicsServer::add_body_to_space(HopBodyData *body, HopSpaceData *space)
 	body->sync_to_hop();
 	rebuild_body_shapes(body);
 	space->simulator->add_solid(body->hop_solid);
+	space->bvh_manager.add_solid(body->hop_solid.get(),
+		body->mode == PhysicsServer3D::BODY_MODE_STATIC);
 
 	// Deactivate static bodies AFTER shapes/position are set
 	// (add_shape and set_position both call activate())
@@ -366,6 +368,7 @@ void HopPhysicsServer::remove_body_from_space(HopBodyData *body) {
 	if (!body->hop_solid) return;
 	HopSpaceData *space = space_owner.get_or_null(body->space_rid);
 	if (space) {
+		space->bvh_manager.remove_solid(body->hop_solid.get());
 		space->simulator->remove_solid(body->hop_solid);
 	}
 }
@@ -410,6 +413,16 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 			body->hop_solid->set_mass(to_hop_scalar(body->mass));
 			body->hop_solid->set_coefficient_of_gravity(to_hop_scalar(body->gravity_scale));
 			body->hop_solid->activate();
+		}
+
+		// Re-register with the BVH manager — static/dynamic classification may have changed.
+		if (body->space_rid.is_valid()) {
+			HopSpaceData *space = space_owner.get_or_null(body->space_rid);
+			if (space) {
+				space->bvh_manager.remove_solid(body->hop_solid.get());
+				space->bvh_manager.add_solid(body->hop_solid.get(),
+					body->mode == PhysicsServer3D::BODY_MODE_STATIC);
+			}
 		}
 	}
 }

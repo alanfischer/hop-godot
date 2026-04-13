@@ -5,6 +5,7 @@
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 
 #include <hop/hop.h>
+#include <hop/bvh_manager.h>
 #include <memory>
 #include <vector>
 #include "hop_conversions.h"
@@ -18,6 +19,7 @@ struct HopSpaceData {
 	bool active = false;
 
 	std::unique_ptr<hop::simulator<hop_scalar>> simulator;
+	hop::bvh_manager<hop_scalar> bvh_manager;
 
 	// Space params (Godot defaults)
 	float contact_recycle_radius = 0.01f;
@@ -38,6 +40,7 @@ struct HopSpaceData {
 
 	HopSpaceData() {
 		simulator = std::make_unique<hop::simulator<hop_scalar>>();
+		simulator->set_manager(&bvh_manager);
 		simulator->set_gravity(hop::vec3<hop_scalar>(
 			scalar_from_int<hop_scalar>(0),
 			scalar_from_milli<hop_scalar>(-9810),

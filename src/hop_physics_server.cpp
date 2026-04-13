@@ -627,10 +627,16 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 		case PhysicsServer3D::BODY_STATE_TRANSFORM: {
 			body->transform = p_value;
 			if (body->hop_solid) {
-				body->hop_solid->set_position(to_hop(body->transform.origin));
-				// set_position calls activate() — re-deactivate static bodies
-				if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
-					body->hop_solid->deactivate();
+				if (body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC) {
+					// Do NOT teleport kinematic bodies in hop here.  The pre-step
+					// loop in _step computes velocity = delta / dt so the body
+					// sweeps through space and pushes dynamic bodies in its path.
+				} else {
+					body->hop_solid->set_position(to_hop(body->transform.origin));
+					// set_position calls activate() — re-deactivate static bodies
+					if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
+						body->hop_solid->deactivate();
+					}
 				}
 			}
 		} break;
@@ -1328,10 +1334,58 @@ void HopPhysicsServer::_step(float p_step) {
 		}
 	});
 
+	// Drive kinematic bodies by computing velocity = (target - current) / dt.
+	// This makes them sweep through space so they can push dynamic bodies in
+	// their path, rather than teleporting and only passively blocking.
+	{
+		float fdt = p_step > 0.0f ? p_step : (1.0f / 60.0f);
+		hop_scalar inv_dt = scalar_from_float<hop_scalar>(1.0f / fdt);
+		// Teleport threshold: if the requested delta exceeds 10 m treat as a
+		// discontinuous jump (respawn, level load, etc.) and snap instead.
+		const float teleport_dist2 = 10.0f * 10.0f;
+
+		body_owner.for_each([&](HopBodyData *body) {
+			if (!body->hop_solid || body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
+			if (!body->space_rid.is_valid()) return;
+
+			hop::vec3<hop_scalar> old_pos = body->hop_solid->get_position();
+			hop::vec3<hop_scalar> new_pos = to_hop(body->transform.origin);
+			hop::vec3<hop_scalar> delta;
+			hop::sub(delta, new_pos, old_pos);
+
+			float dx = to_godot_float(delta.x);
+			float dy = to_godot_float(delta.y);
+			float dz = to_godot_float(delta.z);
+
+			if (dx * dx + dy * dy + dz * dz > teleport_dist2) {
+				// Discontinuous jump: snap and zero velocity.
+				body->hop_solid->set_position(new_pos);
+				body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
+			} else {
+				// Normal frame: set velocity so hop sweeps the body to new_pos.
+				hop::vec3<hop_scalar> vel;
+				vel.x = delta.x * inv_dt;
+				vel.y = delta.y * inv_dt;
+				vel.z = delta.z * inv_dt;
+				body->hop_solid->set_velocity(vel);
+				body->hop_solid->activate();
+			}
+		});
+	}
+
 	// Step all active spaces
 	space_owner.for_each([&](HopSpaceData *space) {
 		if (!space->active) return;
 		space->simulator->update(dt_ms, 0x3FFFFFFF | hop::simulator<hop_scalar>::scope_report_collisions);
+	});
+
+	// After stepping, snap kinematic bodies back to the Godot-authoritative
+	// position and zero their hop velocity.  hop may have stopped the body
+	// short due to collision response; Godot's transform is still the target.
+	body_owner.for_each([&](HopBodyData *body) {
+		if (!body->hop_solid || body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
+		body->hop_solid->set_position(to_hop(body->transform.origin));
+		body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
 	});
 
 	// Sync positions from hop to Godot

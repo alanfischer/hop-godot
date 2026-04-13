@@ -239,6 +239,10 @@ void HopPhysicsServer::_area_set_param(const RID &p_area, PhysicsServer3D::AreaP
 		case PhysicsServer3D::AREA_PARAM_ANGULAR_DAMP: area->angular_damp = p_value; break;
 		case PhysicsServer3D::AREA_PARAM_PRIORITY: area->priority = p_value; break;
 		case PhysicsServer3D::AREA_PARAM_GRAVITY_OVERRIDE_MODE: area->space_override_mode = (PhysicsServer3D::AreaSpaceOverrideMode)(int)p_value; break;
+		case PhysicsServer3D::AREA_PARAM_WIND_FORCE_MAGNITUDE: area->wind_force_magnitude = p_value; break;
+		case PhysicsServer3D::AREA_PARAM_WIND_DIRECTION: area->wind_direction = p_value; break;
+		case PhysicsServer3D::AREA_PARAM_WIND_ATTENUATION_FACTOR: area->wind_attenuation_factor = p_value; break;
+		case PhysicsServer3D::AREA_PARAM_WIND_SOURCE: break; // node-path; not applicable
 		default: break;
 	}
 }
@@ -262,6 +266,10 @@ Variant HopPhysicsServer::_area_get_param(const RID &p_area, PhysicsServer3D::Ar
 		case PhysicsServer3D::AREA_PARAM_ANGULAR_DAMP: return area->angular_damp;
 		case PhysicsServer3D::AREA_PARAM_PRIORITY: return area->priority;
 		case PhysicsServer3D::AREA_PARAM_GRAVITY_OVERRIDE_MODE: return (int)area->space_override_mode;
+		case PhysicsServer3D::AREA_PARAM_WIND_FORCE_MAGNITUDE: return area->wind_force_magnitude;
+		case PhysicsServer3D::AREA_PARAM_WIND_DIRECTION: return area->wind_direction;
+		case PhysicsServer3D::AREA_PARAM_WIND_ATTENUATION_FACTOR: return area->wind_attenuation_factor;
+		case PhysicsServer3D::AREA_PARAM_WIND_SOURCE: return Variant();
 		default: return Variant();
 	}
 }
@@ -1240,6 +1248,7 @@ void HopPhysicsServer::_step(float p_step) {
 			Vector3 gravity;
 			PhysicsServer3D::AreaSpaceOverrideMode damp_mode;
 			float lin_damp;
+			Vector3 fluid_vel; // wind_direction * wind_force_magnitude
 		};
 		std::vector<AreaMatch> matched;
 		auto body_wb = body->hop_solid->get_world_bound();
@@ -1247,7 +1256,8 @@ void HopPhysicsServer::_step(float p_step) {
 		area_owner.for_each([&](HopAreaData *area) {
 			bool has_grav = area->space_override_mode != PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED;
 			bool has_damp = area->linear_damp_override_mode != PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED;
-			if (!has_grav && !has_damp) return;
+			bool has_wind = area->wind_force_magnitude != 0.0f;
+			if (!has_grav && !has_damp && !has_wind) return;
 			if (!area->space_rid.is_valid() || area->space_rid != body->space_rid) return;
 			if (!(area->collision_mask & body->hop_solid->get_collision_scope())) return;
 
@@ -1271,36 +1281,37 @@ void HopPhysicsServer::_step(float p_step) {
 			if (!hop::test_intersection(body_wb, area_wb)) return;
 
 			Vector3 ag = area->gravity_direction.normalized() * area->gravity;
+			Vector3 fv = area->wind_direction.normalized() * area->wind_force_magnitude;
 			matched.push_back({ area->priority, area->space_override_mode, ag,
-				area->linear_damp_override_mode, area->linear_damp });
+				area->linear_damp_override_mode, area->linear_damp, fv });
 		});
 
 		// Linear damp: always update so leaving an area resets the coefficient.
+		float resolved_drag = body->linear_damp;
 		{
-			float result = body->linear_damp;
 			bool any_damp = false;
 			if (!matched.empty()) {
 				std::sort(matched.begin(), matched.end(), [](const AreaMatch &a, const AreaMatch &b) {
 					return a.priority > b.priority;
 				});
-				result = 0.0f;
+				resolved_drag = 0.0f;
 				bool done = false;
 				for (auto &e : matched) {
 					if (e.damp_mode == PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED) continue;
 					any_damp = true;
 					switch (e.damp_mode) {
-						case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE:          result += e.lin_damp; break;
-						case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE_REPLACE:  result += e.lin_damp; done = true; break;
-						case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE:          result  = e.lin_damp; done = true; break;
-						case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE_COMBINE:  result  = e.lin_damp; break;
+						case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE:          resolved_drag += e.lin_damp; break;
+						case PhysicsServer3D::AREA_SPACE_OVERRIDE_COMBINE_REPLACE:  resolved_drag += e.lin_damp; done = true; break;
+						case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE:          resolved_drag  = e.lin_damp; done = true; break;
+						case PhysicsServer3D::AREA_SPACE_OVERRIDE_REPLACE_COMBINE:  resolved_drag  = e.lin_damp; break;
 						default: break;
 					}
 					if (done) break;
 				}
-				if (!done) result += body->linear_damp;
+				if (!done) resolved_drag += body->linear_damp;
 			}
-			if (!any_damp) result = body->linear_damp;
-			body->hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(result));
+			if (!any_damp) resolved_drag = body->linear_damp;
+			body->hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(resolved_drag));
 		}
 
 		if (matched.empty()) return;
@@ -1330,6 +1341,21 @@ void HopPhysicsServer::_step(float p_step) {
 			Vector3 correction = result - global_gravity * body->gravity_scale;
 			if (correction.length_squared() > 0.0f) {
 				body->hop_solid->add_force(to_hop(correction * body->mass));
+			}
+		}
+
+		// Fluid / wind velocity: sum all area fluid velocities and apply a force
+		// that drives the body toward that velocity via drag.
+		// hop computes: a_drag = (fluid_vel_global - v) * drag_coeff / mass
+		// With fluid_vel_global = 0, we add F = area_fluid_vel * drag_coeff to get
+		// a_net = (area_fluid_vel - v) * drag_coeff / mass — without touching hop.
+		{
+			Vector3 fluid_vel_sum;
+			for (auto &e : matched) {
+				fluid_vel_sum += e.fluid_vel;
+			}
+			if (fluid_vel_sum.length_squared() > 0.0f && resolved_drag > 0.0f) {
+				body->hop_solid->add_force(to_hop(fluid_vel_sum * resolved_drag));
 			}
 		}
 	});

@@ -41,6 +41,13 @@ struct HopAreaData {
 	PhysicsServer3D::AreaSpaceOverrideMode angular_damp_override_mode = PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED;
 	int priority = 0;
 
+	// Fluid / wind: combined with linear_damp, they make a current or wind zone.
+	// Fluid velocity = wind_direction * wind_force_magnitude.
+	// Bodies inside converge toward this velocity via drag: F = fluid_vel * drag_coeff.
+	float wind_force_magnitude = 0.0f;
+	Vector3 wind_direction = Vector3(0, 0, -1); // Godot default
+	float wind_attenuation_factor = 0.0f;
+
 	Callable monitor_callback;
 	Callable area_monitor_callback;
 

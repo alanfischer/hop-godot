@@ -43,9 +43,13 @@ void HopBodyData::sync_to_hop() {
 
 	hop_solid->set_position(to_hop(transform.origin));
 
-	if (is_static_or_kinematic()) {
+	if (mode == PhysicsServer3D::BODY_MODE_STATIC) {
 		hop_solid->set_infinite_mass();
-		hop_solid->set_velocity(to_hop(linear_velocity));
+		hop_solid->set_velocity(hop::vec3<hop_scalar>(hop_scalar{}, hop_scalar{}, hop_scalar{}));
+	} else if (mode == PhysicsServer3D::BODY_MODE_KINEMATIC) {
+		hop_solid->set_infinite_mass();
+		// Do not push linear_velocity into hop_solid — kinematic bodies are
+		// position-controlled; hop must not integrate their velocity.
 	} else {
 		hop_solid->set_mass(to_hop_scalar(mass));
 		hop_solid->set_velocity(to_hop(linear_velocity));

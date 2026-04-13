@@ -2,7 +2,6 @@
 #include "hop_body_state.h"
 #include "hop_space_state.h"
 #include "hop_conversions.h"
-#include "hop_debug.h"
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
@@ -404,11 +403,20 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 	body->mode = p_mode;
 
 	if (body->hop_solid) {
-		if (body->is_static_or_kinematic()) {
+		if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
 			body->hop_solid->set_infinite_mass();
 			body->hop_solid->set_coefficient_of_gravity(scalar_from_int<hop_scalar>(0));
 			body->hop_solid->set_velocity(hop::vec3<hop_scalar>(scalar_from_int<hop_scalar>(0), scalar_from_int<hop_scalar>(0), scalar_from_int<hop_scalar>(0)));
 			body->hop_solid->deactivate();
+		} else if (body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC) {
+			// Kinematic bodies: infinite mass, no gravity, no self-propulsion in hop.
+			// Stay active so dynamic bodies collide with them; position is driven by
+			// Godot each frame via _body_set_state(TRANSFORM). hop must never integrate
+			// their position, so we keep their hop velocity at zero.
+			body->hop_solid->set_infinite_mass();
+			body->hop_solid->set_coefficient_of_gravity(scalar_from_int<hop_scalar>(0));
+			body->hop_solid->set_velocity(hop::vec3<hop_scalar>(scalar_from_int<hop_scalar>(0), scalar_from_int<hop_scalar>(0), scalar_from_int<hop_scalar>(0)));
+			body->hop_solid->activate();
 		} else {
 			body->hop_solid->set_mass(to_hop_scalar(body->mass));
 			body->hop_solid->set_coefficient_of_gravity(to_hop_scalar(body->gravity_scale));
@@ -628,7 +636,10 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 		} break;
 		case PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY: {
 			body->linear_velocity = p_value;
-			if (body->hop_solid) body->hop_solid->set_velocity(to_hop(body->linear_velocity));
+			// Kinematic bodies are position-controlled by game script; hop must not
+			// integrate their velocity, so only push to hop_solid for dynamic bodies.
+			if (body->hop_solid && body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC)
+				body->hop_solid->set_velocity(to_hop(body->linear_velocity));
 		} break;
 		case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY: {
 			body->angular_velocity = p_value; // stored but no-op in hop
@@ -838,51 +849,6 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 
 	float result_time = to_godot_float(result.time);
 
-	// Log non-zero-motion tests when near geometry or successful collision
-	static int dbg_event_count = 0;
-	static bool dbg_dumped_solids = false;
-	float motion_len2 = p_motion.length_squared();
-	int cur_bvh_hits = g_last_trimesh_trace_debug.bvh_hits;
-	bool has_hit = result_time < 1.0f;
-	if (motion_len2 > 1e-6f && dbg_event_count < 30) {
-		dbg_event_count++;
-		const char *tag = has_hit ? "HIT " : "MISS";
-		UtilityFunctions::print("[hop] ", tag, " #", dbg_event_count,
-			" from=", p_from.origin, " motion=", p_motion, " t=", result_time);
-		UtilityFunctions::print("[hop]   trimesh: bvh_hits=", g_last_trimesh_trace_debug.bvh_hits,
-			" denom_pass=", g_last_trimesh_trace_debug.denom_pass,
-			" t_pass=", g_last_trimesh_trace_debug.t_pass,
-			" bary_pass=", g_last_trimesh_trace_debug.bary_pass);
-
-		// On first event, dump all solids to show what's in the simulator
-		if (!dbg_dumped_solids) {
-			dbg_dumped_solids = true;
-			int ns = space->simulator->get_num_solids();
-			UtilityFunctions::print("[hop]   simulator has ", ns, " solids, player mask=", body->collision_mask);
-			for (int _i = 0; _i < ns; ++_i) {
-				auto *sol = space->simulator->get_solid(_i);
-				auto wb = sol->get_world_bound();
-				int scope = sol->get_collision_scope();
-				int nsh = sol->get_num_shapes();
-				// Get shape type name
-				String sh_types = "";
-				for (int si = 0; si < nsh; ++si) {
-					auto *sh = sol->get_shape(si);
-					switch (sh->get_type()) {
-					case hop::shape_type::aa_box:       sh_types += "aabb "; break;
-					case hop::shape_type::sphere:       sh_types += "sphere "; break;
-					case hop::shape_type::capsule:      sh_types += "capsule "; break;
-					case hop::shape_type::convex_solid: sh_types += "convex "; break;
-					case hop::shape_type::traceable:    sh_types += "trimesh "; break;
-					default:                            sh_types += "? "; break;
-					}
-				}
-				UtilityFunctions::print("[hop]     [", _i, "] scope=", scope,
-					" shapes=", nsh, " (", sh_types, ")",
-					" wb_y=(", wb.mins.y, ",", wb.maxs.y, ")");
-			}
-		}
-	}
 	if (result_time >= 1.0f) {
 		// No collision
 		if (p_result) {

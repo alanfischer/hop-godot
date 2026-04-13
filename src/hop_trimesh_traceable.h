@@ -3,7 +3,6 @@
 #include <hop/hop.h>
 #include <vector>
 #include "hop_conversions.h"
-#include "hop_debug.h"
 
 // A traceable implementation for triangle meshes.  Stores triangles as
 // vertices + index triplets and accelerates queries with a BVH over
@@ -176,9 +175,7 @@ public:
 		end_box.maxs.z = end.z + swept_box.maxs.z;
 		query_box.merge(end_box);
 
-		int dbg_bvh_hits = 0, dbg_denom_pass = 0, dbg_t_pass = 0, dbg_bary_pass = 0;
 		bvh_.query_aabb(query_box, [&](int tri_idx) {
-			dbg_bvh_hits++;
 			auto & tri = tris_[tri_idx];
 			auto & n = normals_[tri_idx];
 
@@ -195,7 +192,6 @@ public:
 				T denom = hop::dot(face_n, seg.direction);
 				if (denom >= T {})
 					continue; // Moving away or parallel
-				dbg_denom_pass++;
 
 				// For each shape on the solid, compute how far to expand
 				// the triangle plane along its normal using support()
@@ -228,7 +224,6 @@ public:
 					// the body sink further through the mesh each frame.
 					if (t < T {})
 						t = T {};
-					dbg_t_pass++;
 
 					// Compute hit point on the expanded plane
 					hop::vec3<T> hit;
@@ -246,7 +241,6 @@ public:
 					hop::sub(proj, hit, n_scaled);
 
 					if (point_in_triangle(proj, tri_idx)) {
-						dbg_bary_pass++;
 						result.time = t;
 						hop::mul(result.point, seg.direction, t);
 						hop::add(result.point, seg.origin);
@@ -255,10 +249,6 @@ public:
 				}
 			}
 		});
-		g_last_trimesh_trace_debug.bvh_hits   = dbg_bvh_hits;
-		g_last_trimesh_trace_debug.denom_pass = dbg_denom_pass;
-		g_last_trimesh_trace_debug.t_pass     = dbg_t_pass;
-		g_last_trimesh_trace_debug.bary_pass  = dbg_bary_pass;
 	}
 
 private:

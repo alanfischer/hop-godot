@@ -850,7 +850,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 
 	// Save and set position for the test
 	hop::vec3<hop_scalar> orig_pos = body->hop_solid->get_position();
-	body->hop_solid->set_position_direct(to_hop(p_from.origin));
+	body->hop_solid->set_position(to_hop(p_from.origin));
 
 	hop::segment<hop_scalar> seg;
 	seg.set_start_end(to_hop(p_from.origin), to_hop(p_from.origin + p_motion));
@@ -859,7 +859,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask);
 
 	// Restore position
-	body->hop_solid->set_position_direct(orig_pos);
+	body->hop_solid->set_position(orig_pos);
 
 	float result_time = to_godot_float(result.time);
 

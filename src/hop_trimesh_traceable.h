@@ -90,10 +90,10 @@ public:
 
 		// Compute swept AABB of the other solid along the segment for BVH query
 		hop::aa_box<T> swept_box;
-		s->get_shape(0)->get_bound(swept_box);
-		for (int i = 1; i < s->get_num_shapes(); ++i) {
+		s->get_shapes()[0]->get_bound(swept_box);
+		for (int i = 1; i < s->get_shapes().size(); ++i) {
 			hop::aa_box<T> sb;
-			s->get_shape(i)->get_bound(sb);
+			s->get_shapes()[i]->get_bound(sb);
 			swept_box.merge(sb);
 		}
 
@@ -127,9 +127,7 @@ public:
 					hop::vec3<T> face_n = n;
 					if (side == 1) hop::neg(face_n, n);
 
-					for (int si = 0; si < s->get_num_shapes() && !found; ++si) {
-						auto * sh = s->get_shape(si);
-
+					for (auto & sh : s->get_shapes()) {
 						hop::vec3<T> neg_fn;
 						hop::neg(neg_fn, face_n);
 						hop::vec3<T> sup;
@@ -154,6 +152,7 @@ public:
 							result.normal = face_n;
 							result.point  = seg.origin;
 							found = true;
+							break;
 						}
 					}
 				}
@@ -195,9 +194,7 @@ public:
 
 				// For each shape on the solid, compute how far to expand
 				// the triangle plane along its normal using support()
-				for (int si = 0; si < s->get_num_shapes(); ++si) {
-					auto * sh = s->get_shape(si);
-
+				for (auto & sh : s->get_shapes()) {
 					// support() in the negative-normal direction gives the point on
 					// the shape furthest into the triangle plane
 					hop::vec3<T> neg_fn;

@@ -156,6 +156,7 @@ public:
 							result.normal = face_n;
 							result.point  = seg.origin;
 							found = true;
+							break;
 						}
 					}
 				}

@@ -850,7 +850,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 
 	// Save and set position for the test
 	hop::vec3<hop_scalar> orig_pos = body->hop_solid->get_position();
-	body->hop_solid->set_position_direct(to_hop(p_from.origin));
+	body->hop_solid->set_position(to_hop(p_from.origin));
 
 	hop::segment<hop_scalar> seg;
 	seg.set_start_end(to_hop(p_from.origin), to_hop(p_from.origin + p_motion));
@@ -859,7 +859,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask);
 
 	// Restore position
-	body->hop_solid->set_position_direct(orig_pos);
+	body->hop_solid->set_position(orig_pos);
 
 	float result_time = to_godot_float(result.time);
 
@@ -994,7 +994,7 @@ void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, 
 	j->hop_constraint = std::make_shared<hop::constraint<hop_scalar>>(ba->hop_solid, bb->hop_solid);
 	j->hop_constraint->set_spring_constant(to_hop_scalar(100.0f));
 	j->hop_constraint->set_damping_constant(to_hop_scalar(10.0f));
-	j->hop_constraint->set_distance_threshold(to_hop_scalar(0.0f));
+	j->hop_constraint->set_rest_length(to_hop_scalar(0.0f));
 
 	HopSpaceData *space = space_owner.get_or_null(ba->space_rid);
 	if (space) {
@@ -1074,7 +1074,7 @@ void HopPhysicsServer::_joint_make_generic_6dof(const RID &p_joint, const RID &p
 	j->hop_constraint = std::make_shared<hop::constraint<hop_scalar>>(ba->hop_solid, bb->hop_solid);
 	j->hop_constraint->set_spring_constant(to_hop_scalar(j->linear_spring_stiffness));
 	j->hop_constraint->set_damping_constant(to_hop_scalar(j->linear_spring_damping));
-	j->hop_constraint->set_distance_threshold(to_hop_scalar(j->linear_spring_equilibrium));
+	j->hop_constraint->set_rest_length(to_hop_scalar(j->linear_spring_equilibrium));
 
 	HopSpaceData *space = space_owner.get_or_null(ba->space_rid);
 	if (space) {
@@ -1098,7 +1098,7 @@ void HopPhysicsServer::_generic_6dof_joint_set_param(const RID &p_joint, Vector3
 			break;
 		case PhysicsServer3D::G6DOF_JOINT_LINEAR_SPRING_EQUILIBRIUM_POINT:
 			j->linear_spring_equilibrium = p_value;
-			if (j->hop_constraint) j->hop_constraint->set_distance_threshold(to_hop_scalar(p_value));
+			if (j->hop_constraint) j->hop_constraint->set_rest_length(to_hop_scalar(p_value));
 			break;
 		default:
 			break;
@@ -1402,7 +1402,7 @@ void HopPhysicsServer::_step(float p_step) {
 	// Step all active spaces
 	space_owner.for_each([&](HopSpaceData *space) {
 		if (!space->active) return;
-		space->simulator->update(dt_ms, 0x3FFFFFFF | hop::simulator<hop_scalar>::scope_report_collisions);
+		space->simulator->update(dt_ms, 0x3FFFFFFF);
 	});
 
 	// After stepping, snap kinematic bodies back to the Godot-authoritative

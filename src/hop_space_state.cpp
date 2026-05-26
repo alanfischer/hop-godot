@@ -19,6 +19,7 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 	space->simulator->trace_segment(result, seg, p_collision_mask);
 
 	if (to_godot_float(result.time) >= 1.0f) return false;
+	if (!p_hit_from_inside && to_godot_float(result.time) <= 0.0f) return false;
 
 	if (p_result) {
 		p_result->position = to_godot(result.point);

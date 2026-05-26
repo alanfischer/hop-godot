@@ -47,9 +47,9 @@ public:
 		hop::neg(neg_n, normal_);
 
 		T deepest = T {};
-		for (int i = 0; i < s->get_num_shapes(); ++i) {
+		for (const auto &shape : s->get_shapes()) {
 			hop::vec3<T> sup;
-			hop::support(sup, *s->get_shape(i), neg_n);
+			hop::support(sup, *shape, neg_n);
 			T extent = hop::dot(sup, neg_n);
 			if (extent > deepest)
 				deepest = extent;

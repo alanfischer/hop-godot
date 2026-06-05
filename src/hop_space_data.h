@@ -46,5 +46,6 @@ struct HopSpaceData {
 			scalar_from_milli<hop_scalar>(-9810),
 			scalar_from_int<hop_scalar>(0)));
 		simulator->set_integrator(hop::integrator_type::improved);
+		simulator->set_speculative_contacts(true);
 	}
 };

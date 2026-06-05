@@ -1209,8 +1209,10 @@ void HopPhysicsServer::_step(float p_step) {
 	if (!active) return;
 	last_step = p_step;
 
-	int dt_ms = (int)(p_step * 1000.0f);
-	if (dt_ms < 1) dt_ms = 1;
+	// hop integrates in seconds (gravity is m/s²), so feed it the frame time
+	// directly. Passing milliseconds here over-integrates by 1000x and blows
+	// the scene apart on the first frame.
+	hop_scalar dt = to_hop_scalar(p_step > 0.0f ? p_step : (1.0f / 60.0f));
 
 	// Clear contacts from previous step
 	body_owner.for_each([](HopBodyData *body) {
@@ -1402,7 +1404,7 @@ void HopPhysicsServer::_step(float p_step) {
 	// Step all active spaces
 	space_owner.for_each([&](HopSpaceData *space) {
 		if (!space->active) return;
-		space->simulator->update(dt_ms, 0x3FFFFFFF);
+		space->simulator->update(dt, 0x3FFFFFFF);
 	});
 
 	// After stepping, snap kinematic bodies back to the Godot-authoritative

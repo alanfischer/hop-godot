@@ -41,7 +41,7 @@ void initialize_hop_physics_module(ModuleInitializationLevel p_level) {
 	ClassDB::register_class<HopPhysicsServerFactory>();
 
 	hop_factory = memnew(HopPhysicsServerFactory);
-	PhysicsServer3DManager::get_singleton()->register_server("Hop", Callable(hop_factory, "create_hop_callback"));
+	PhysicsServer3DManager::get_singleton()->register_server("Hop Physics", Callable(hop_factory, "create_hop_callback"));
 }
 
 void uninitialize_hop_physics_module(ModuleInitializationLevel p_level) {

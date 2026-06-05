@@ -41,7 +41,7 @@ public:
 	void trace_solid(hop::collision<T> &result,
 	                 hop::solid<T> *s,
 	                 const hop::vec3<T> &position,
-	                 const hop::segment<T> &seg) override {
+	                 const hop::segment<T> &seg, T margin) override {
 		// Find the solid's extent in the negative-normal direction (into the plane)
 		hop::vec3<T> neg_n;
 		hop::neg(neg_n, normal_);
@@ -55,16 +55,36 @@ public:
 				deepest = extent;
 		}
 
-		// Expand the plane outward by the shape's extent
-		T expanded_d = distance_ + deepest;
-
-		T denom = hop::dot(normal_, seg.direction);
-		if (denom >= T {})
-			return;
+		// Expand the plane outward by the shape's extent, plus the speculative
+		// margin so near-resting solids within `margin` register as contacts.
+		T expanded_d = distance_ + deepest + margin;
 
 		T origin_dot = hop::dot(normal_, seg.origin) - hop::dot(normal_, position);
+		T denom = hop::dot(normal_, seg.direction);
+
+		// Zero-direction (static overlap / proximity) query: the swept solve
+		// below divides by `denom`, so handle a stationary solid separately.
+		if (denom == T {}) {
+			if (origin_dot <= expanded_d && result.time > T {}) {
+				result.time = T {};
+				result.normal = normal_;
+				result.point = seg.origin;
+				// depth measured against the inflated surface (= margin − true_gap)
+				result.depth = expanded_d - origin_dot;
+			}
+			return;
+		}
+		if (denom > T {})
+			return; // moving away
+
 		T t = (expanded_d - origin_dot) / denom;
-		if (t >= T {} && t <= tr::one() && t < result.time) {
+		if (t <= tr::one() && t < result.time) {
+			if (t < T {}) {
+				// Already inside the inflated surface — clamp so the solver can
+				// push back out, and report how far past the surface we are.
+				result.depth = expanded_d - origin_dot;
+				t = T {};
+			}
 			result.time = t;
 			hop::mul(result.point, seg.direction, t);
 			hop::add(result.point, seg.origin);

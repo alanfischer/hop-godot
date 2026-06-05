@@ -79,7 +79,7 @@ public:
 	void trace_solid(hop::collision<T> & result,
 	                 hop::solid<T> * s,
 	                 const hop::vec3<T> & position,
-	                 const hop::segment<T> & seg) override {
+	                 const hop::segment<T> & seg, T margin) override {
 		// seg.origin = other solid's position, seg.direction = its movement
 		// position = traceable's solid position
 		// We need to find when the swept solid first contacts the mesh.
@@ -139,9 +139,11 @@ public:
 						T expand = hop::dot(sup, neg_fn);
 
 						T plane_d    = hop::dot(face_n, verts_[tri.i0]);
-						T expanded_d = plane_d + expand;
+						// Inflate outward by the speculative margin so near-resting
+						// solids within `margin` register as overlapping (t=0).
+						T expanded_d = plane_d + expand + margin;
 
-						// Not penetrating this face — skip.
+						// Not within the inflated surface for this face — skip.
 						if (hop::dot(face_n, local_origin) > expanded_d) continue;
 
 						// Project local_origin onto the original triangle plane and

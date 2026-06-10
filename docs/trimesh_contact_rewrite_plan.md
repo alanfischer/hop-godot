@@ -1,6 +1,32 @@
 # Trimesh contact rewrite — plan & findings
 
-Status: **planned.** The committed branch `fix/trimesh-winding-agnostic-collision`
+Status: **IMPLEMENTED** (offline-validated; pending in-game playtest). The capsule
+query paths in `HopTrimeshTraceable::trace_solid` now do real capsule-segment-vs-
+triangle closest-point contact as designed below. Non-capsule shapes (box/sphere,
+e.g. area queries) keep the older winding-agnostic support-plane approximation.
+
+Offline validation (harness `/tmp/htest`, real ww_2fort BSP collision):
+- **Basement replay** (`replay.cpp`): recovery now pushes **+0.901 up**
+  (game previously saw `recover.y = -1.810`, i.e. shoved down through the floor).
+- **Ramp climb** (`ramp2fort.cpp -20 14.2 50.4`): reaches the top (`x≈-27.0,
+  y≈19.8`), crossing the seam at `x≈-24.3` smoothly — no fall-through/stick.
+- **Map sweep** (`bstress.cpp`): **0 void-falls** across 3880 walks at 12/24/40/
+  **80** m/s (the distance-based conservative-advancement cast is tunnel-proof,
+  so no `seam_tol_` hack is needed on the capsule path; stuck count ~ unchanged
+  vs the prior baseline and dominated by genuine walls at the sweep boundary).
+- **Unit test** (`tests/test_trimesh_traceable.cpp`): rewritten to pin the new
+  one-sided/closest-point invariants (front-face recovery, mixed-winding surface,
+  deep-sink-pushes-up regression, two-sided swept cast, resting-allows-horizontal-
+  motion, capsule-gap-fit, ramp climb) — all pass via ctest.
+
+All 6 dylib variants rebuilt via `./build_hop.sh`. In-game playtest still TODO
+(strafe the blue basement resupply door; re-walk ramps across maps).
+
+---
+
+Original plan & diagnosis below (kept for reference).
+
+The committed branch `fix/trimesh-winding-agnostic-collision`
 made player-vs-trimesh "much better" (ramps mostly walkable) but two classes of
 bug remain, and they can't be fixed by patching the current approximation. This
 doc captures the full diagnosis so the rewrite can start cold.

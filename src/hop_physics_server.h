@@ -40,6 +40,16 @@ public:
 	void add_body_to_space(HopBodyData *body, HopSpaceData *space);
 	void remove_body_from_space(HopBodyData *body);
 
+	// Areas are modeled as persistent hop sensor solids: shapes built once and
+	// reused for narrow-phase overlap tests / world-bound checks (rebuilt only when
+	// the area's shapes change), and indexed in the space's dedicated area_bvh
+	// broadphase so overlap queries and area-area monitoring are O(log areas).
+	void ensure_area_solid(HopAreaData *area);
+	void rebuild_area_shapes(HopAreaData *area);
+	void add_area_to_space(HopAreaData *area, HopSpaceData *space);
+	void remove_area_from_space(HopAreaData *area);
+	void mark_area_bvh_dirty(HopAreaData *area);
+
 	// === Shape API ===
 	RID _world_boundary_shape_create() override;
 	RID _separation_ray_shape_create() override;

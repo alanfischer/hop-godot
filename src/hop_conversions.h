@@ -9,15 +9,19 @@
 
 using namespace godot;
 
-// Safely get an Object* for a known instance id.
-// Only returns non-null if the GDExtension binding already exists for this object.
-// Avoids crash in get_parent_class when the object's class is a GDScript type.
+// Resolve the engine Object pointer for an instance id, for use in physics
+// result structs (RayResult/ShapeResult/MotionCollision `.collider`).
+//
+// These fields are read DIRECTLY by the engine, which expects the raw engine
+// object pointer (GDExtensionObjectPtr) — exactly what object_get_instance_from_id
+// returns. It must NOT be the godot-cpp binding *wrapper*
+// (object_get_instance_binding / ObjectDB::get_instance): the wrapper is a
+// different address, and the engine misreads it as a freed object, so GDScript
+// sees a "previously freed" instance when it dereferences result.collider.
 inline godot::Object *get_collider_safe(uint64_t p_id) {
 	if (!p_id) return nullptr;
-	GDExtensionObjectPtr obj = godot::internal::gdextension_interface_object_get_instance_from_id(p_id);
-	if (!obj) return nullptr;
 	return reinterpret_cast<godot::Object *>(
-		godot::internal::gdextension_interface_object_get_instance_binding(obj, godot::internal::token, nullptr));
+		godot::gdextension_interface::object_get_instance_from_id(p_id));
 }
 
 // The scalar type used throughout the GDExtension.

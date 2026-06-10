@@ -5,8 +5,11 @@
 #include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/rid.hpp>
 
+#include <hop/hop.h>
+#include <memory>
 #include <vector>
 #include <map>
+#include "hop_conversions.h"
 
 using namespace godot;
 
@@ -14,6 +17,9 @@ struct HopAreaShapeEntry {
 	RID shape_rid;
 	Transform3D local_xform;
 	bool disabled = false;
+	// Built once from the shape data and reused; rebuilt only when the entry
+	// changes (see HopPhysicsServer::rebuild_area_shapes).
+	std::shared_ptr<hop::shape<hop_scalar>> hop_shape;
 };
 
 struct HopAreaData {
@@ -52,6 +58,13 @@ struct HopAreaData {
 	Callable area_monitor_callback;
 
 	std::vector<HopAreaShapeEntry> shapes;
+
+	// Persistent free-standing hop solid representing this area's volume.
+	// Built once (shapes positioned at their local xforms, solid positioned at
+	// the area's world origin) and reused for narrow-phase overlap tests and
+	// world-bound checks.  Never added to the simulator or broadphase, so it can
+	// never block or be stepped — it is a positioned shape carrier only.
+	std::shared_ptr<hop::solid<hop_scalar>> hop_solid;
 
 	// Overlap tracking for monitor callbacks
 	// Maps object_instance_id -> body RID for currently overlapping bodies

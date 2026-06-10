@@ -1,6 +1,7 @@
 #pragma once
 
 #include <hop/hop.h>
+#include <type_traits>
 #include <vector>
 
 // A traceable implementation for triangle meshes.  Stores triangles as
@@ -81,11 +82,20 @@ public:
 	                 const hop::segment<T> & seg, T margin) override {
 		// seg.origin = other solid's position, seg.direction = its movement
 		// position = traceable's solid position
-		// We need to find when the swept solid first contacts the mesh.
 		//
-		// For each triangle, we expand the triangle along its inward normal
-		// by the other solid's support extent in that direction (Minkowski sum).
-		// Then we trace the segment origin against the expanded plane.
+		// The player is a CAPSULE; for capsule shapes we do real capsule-segment-
+		// vs-triangle CLOSEST-POINT contact (Godot's approach), which fixes the two
+		// bugs the old center+plane approximation couldn't:
+		//   * Recovery pushes out along the triangle's FRONT face, by the true
+		//     penetration, and never flips downward when the body sinks below a
+		//     floor (the basement fall-through). One-sided front gating rejects the
+		//     coincident back-wound twin on the BSP's mixed-winding ramps.
+		//   * The swept cast is distance-based (two-sided by nature), so it stops
+		//     the capsule at the surface from whichever side it approaches — no
+		//     holes on the mixed-winding ramp — keeping penetration shallow so the
+		//     recovery only ever sees the clean case.
+		// Non-capsule shapes (boxes/spheres, e.g. area queries) keep the older
+		// winding-agnostic support-plane approximation.
 
 		// Compute swept AABB of the other solid along the segment for BVH query
 		hop::aa_box<T> swept_box;
@@ -110,76 +120,38 @@ public:
 		query_box.maxs.y = local_origin.y + swept_box.maxs.y;
 		query_box.maxs.z = local_origin.z + swept_box.maxs.z;
 
-		// Zero-direction static overlap path.
-		// The sweep loop's `denom >= 0` guard skips every triangle when direction
-		// is zero (denom = dot(face_n, 0) == 0).  Handle this case separately:
-		// a solid overlaps a triangle when its Minkowski-expanded plane is already
-		// crossed, i.e. dot(face_n, local_origin) <= plane_d + expand.
+		// Zero-direction static-overlap (recovery) path. The swept cast's
+		// "moving-into" guard skips everything when the direction is zero, so the
+		// depenetration query is handled separately here.
 		if (hop::dot(seg.direction, seg.direction) == T{}) {
-			// Find the NEAREST overlapping surface to push out of (minimum-translation
-			// depenetration). Triangle normals are oriented toward the body, so this
-			// is winding-agnostic — matching Godot's concave collision, which is
-			// double-sided. The BSP emits coincident inverted (back-facing) triangles
-			// on walkable surfaces; the old "deepest face, raw winding" logic latched
-			// the inverted one and reported a bogus ~2*extent penetration with an
-			// inward normal, shoving the body straight through ramps/floors.
 			bool found = false;
 			T best_depth = T{};
 			bvh_.query_aabb(query_box, [&](int tri_idx) {
-				auto & tri = tris_[tri_idx];
-				auto & n   = normals_[tri_idx];
-
-				// Orient this triangle's normal toward the body's reference point so
-				// the contact normal points the way the body must move to separate,
-				// regardless of triangle winding.
-				hop::vec3<T> face_n = n;
-				if (hop::dot(n, local_origin) - hop::dot(n, verts_[tri.i0]) < T{})
-					hop::neg(face_n, n);
-
 				for (const auto & sh_ptr : s->get_shapes()) {
 					auto * sh = sh_ptr.get();
-
-					hop::vec3<T> neg_fn;
-					hop::neg(neg_fn, face_n);
-					hop::vec3<T> sup;
-					hop::support(sup, *sh, neg_fn);
-					T expand = hop::dot(sup, neg_fn);
-
-					T plane_d   = hop::dot(face_n, verts_[tri.i0]);
-					// The Minkowski-expanded contact surface for this shape.
-					T surface_d = plane_d + expand;
-					// Inflate outward by the speculative margin so near-resting
-					// solids within `margin` register as overlapping (t=0).
-					T expanded_d = surface_d + margin;
-
-					T along = hop::dot(face_n, local_origin);
-					// Not within the inflated surface for this face — skip.
-					if (along > expanded_d) continue;
-
-					// Project local_origin onto the original triangle plane and
-					// check if it lies inside the triangle. dist >= 0 by orientation.
-					T dist = along - plane_d;
-					hop::vec3<T> proj, n_scaled;
-					hop::mul(n_scaled, face_n, dist);
-					hop::sub(proj, local_origin, n_scaled);
-
-					if (point_near_triangle(proj, tri_idx, seam_tol_)) {
-						// Positive when the solid is buried past the contact
-						// surface; clamped so a grazing touch reports zero.
-						T depth = surface_d - along;
-						if (depth < T{}) depth = T{};
-
-						// Push out of the NEAREST surface (minimum depth), not the
-						// deepest — picking the deepest on a thin/coincident surface
-						// ejects the body the wrong way (through the floor).
-						if (!found || depth < best_depth) {
-							best_depth    = depth;
-							result.time   = T{};
-							result.depth  = depth;
-							result.normal = face_n;
-							result.point  = seg.origin;
-							found = true;
+					if (sh->get_type() == hop::shape_type::capsule) {
+						hop::vec3<T> base;
+						hop::add(base, local_origin, sh->get_local_position());
+						const auto & cap = sh->get_capsule();
+						T depth;
+						hop::vec3<T> n;
+						if (recover_capsule_triangle(tri_idx, cap, base, margin, depth, n)) {
+							// One-sided front gating already rejects the inverted twin,
+							// so escaping the DEEPEST front contact first is safe (and
+							// resolves corners better than nearest-first). A resting
+							// touch (depth 0) still registers t=0 with the up normal.
+							if (!found || depth > best_depth) {
+								best_depth    = depth;
+								result.time   = T{};
+								result.depth  = depth;
+								result.normal = n;
+								result.point  = seg.origin;
+								found = true;
+							}
 						}
+					} else {
+						recover_support_plane(tri_idx, sh, local_origin, seg,
+						                      margin, result, found, best_depth);
 					}
 				}
 			});
@@ -201,78 +173,25 @@ public:
 		query_box.merge(end_box);
 
 		bvh_.query_aabb(query_box, [&](int tri_idx) {
-			auto & tri = tris_[tri_idx];
-			auto & n = normals_[tri_idx];
-
-			{
-				// Winding-agnostic, like Godot's concave collision: orient this
-				// triangle's normal toward the body's reference point so the contact
-				// normal is STABLE regardless of winding. The BSP emits coincident
-				// opposite-wound triangles on walkable surfaces; testing raw front/back
-				// faces makes the swept normal flip ± between sub-steps, so
-				// velocity.slide() over-cancels and the body catches/stops on the ramp.
-				hop::vec3<T> face_n = n;
-				auto & v0o = verts_[tri.i0];
-				if (hop::dot(n, local_origin) - hop::dot(n, v0o) < T {})
-					hop::neg(face_n, n);
-
-				T denom = hop::dot(face_n, seg.direction);
-				if (denom >= T {})
-					return; // Body not moving into this (body-facing) surface — slide freely
-
-				// For each shape on the solid, compute how far to expand
-				// the triangle plane along its normal using support()
-				for (const auto & sh_ptr : s->get_shapes()) {
-					auto * sh = sh_ptr.get();
-
-					// support() in the negative-normal direction gives the point on
-					// the shape furthest into the triangle plane
-					hop::vec3<T> neg_fn;
-					hop::neg(neg_fn, face_n);
-					hop::vec3<T> sup;
-					hop::support(sup, *sh, neg_fn);
-
-					// The expansion distance: how far the support point extends
-					// along the negative normal from the shape's local origin
-					T expand = hop::dot(sup, neg_fn);
-
-					// Build the expanded plane in mesh-local space
-					auto & v0 = verts_[tri.i0];
-					T plane_d = hop::dot(face_n, v0);
-					// Expand the plane outward by the shape's extent
-					T expanded_d = plane_d + expand;
-
-					T t = (expanded_d - hop::dot(face_n, local_origin)) / denom;
-					if (t > tr::one() || t >= result.time)
-						continue;
-					// If t < 0 the body center is already inside the expanded plane
-					// (penetrating). Clamp to 0 so the simulator's depenetration
-					// logic can push the body back out; skipping it entirely lets
-					// the body sink further through the mesh each frame.
-					if (t < T {})
-						t = T {};
-
-					// Compute hit point on the expanded plane
-					hop::vec3<T> hit;
-					hop::mul(hit, seg.direction, t);
-					hop::add(hit, local_origin);
-
-					// Project hit point onto the original triangle plane and
-					// check if it's inside the triangle (barycentric test)
-					// The hit is on the expanded plane, offset by 'expand' from
-					// the original. Project back to the original plane along normal.
-					hop::vec3<T> proj;
-					T offset = hop::dot(face_n, hit) - plane_d;
-					hop::vec3<T> n_scaled;
-					hop::mul(n_scaled, face_n, offset);
-					hop::sub(proj, hit, n_scaled);
-
-					if (point_near_triangle(proj, tri_idx, seam_tol_)) {
-						result.time = t;
-						hop::mul(result.point, seg.direction, t);
+			for (const auto & sh_ptr : s->get_shapes()) {
+				auto * sh = sh_ptr.get();
+				if (sh->get_type() == hop::shape_type::capsule) {
+					hop::vec3<T> base, p1, p2;
+					hop::add(base, local_origin, sh->get_local_position());
+					const auto & cap = sh->get_capsule();
+					hop::add(p1, base, cap.origin);
+					hop::add(p2, p1, cap.direction);
+					T toi;
+					hop::vec3<T> n;
+					if (sweep_capsule_triangle(tri_idx, p1, p2, seg.direction,
+					                           cap.radius, margin, result.time, toi, n)) {
+						result.time = toi;
+						hop::mul(result.point, seg.direction, toi);
 						hop::add(result.point, seg.origin);
-						result.normal = face_n;
+						result.normal = n;
 					}
+				} else {
+					sweep_support_plane(tri_idx, sh, local_origin, seg, result);
 				}
 			}
 		});
@@ -286,11 +205,328 @@ private:
 	hop::aa_box<T> total_bound_;
 	bool backface_collision_ = false;
 	// World-space tolerance for accepting a contact just off a triangle, so
-	// hairline seam / T-junction gaps between triangles can't tunnel a swept
-	// step (the rare "fall through the floor into the void" case). ~1cm at the
-	// game's scale: bridges sub-cm mesh seams without papering over real holes.
+	// hairline seam / T-junction gaps can't tunnel a swept step. Used only by the
+	// non-capsule (box/sphere) support-plane fallback; the capsule closest-point
+	// path is distance-based and bridges seams up to the capsule radius for free.
+	// ~1cm at the game's scale: bridges sub-cm mesh seams without papering over
+	// real holes.
 	T seam_tol_ = T(1) / T(100);
 
+
+	// A small distance below which we treat two points as coincident (avoids
+	// dividing by a ~zero length when forming a contact normal).
+	static T contact_eps() {
+		if constexpr (std::is_same_v<T, hop::fixed16>)
+			return hop::fixed16::from_raw(16);
+		else if constexpr (std::is_same_v<T, hop::fixed32>)
+			return hop::fixed32::from_raw(int64_t(1) << 8);
+		else
+			return T(1e-6);
+	}
+
+	static T clamp01(T v) {
+		if (v < T{}) return T{};
+		if (v > tr::one()) return tr::one();
+		return v;
+	}
+
+	// Closest point on triangle (a,b,c) to point p. Ericson, Real-Time Collision
+	// Detection §5.1.5 (Voronoi-region test).
+	static hop::vec3<T> closest_pt_point_triangle(const hop::vec3<T> & p,
+	        const hop::vec3<T> & a, const hop::vec3<T> & b, const hop::vec3<T> & c) {
+		const T zero{};
+		hop::vec3<T> ab, ac, ap, tmp, closest;
+		hop::sub(ab, b, a); hop::sub(ac, c, a); hop::sub(ap, p, a);
+		T d1 = hop::dot(ab, ap), d2 = hop::dot(ac, ap);
+		if (d1 <= zero && d2 <= zero) return a;                 // vertex A
+		hop::vec3<T> bp; hop::sub(bp, p, b);
+		T d3 = hop::dot(ab, bp), d4 = hop::dot(ac, bp);
+		if (d3 >= zero && d4 <= d3) return b;                   // vertex B
+		T vc = d1 * d4 - d3 * d2;
+		if (vc <= zero && d1 >= zero && d3 <= zero) {           // edge AB
+			T v = d1 / (d1 - d3);
+			hop::mul(tmp, ab, v); hop::add(closest, a, tmp); return closest;
+		}
+		hop::vec3<T> cp; hop::sub(cp, p, c);
+		T d5 = hop::dot(ab, cp), d6 = hop::dot(ac, cp);
+		if (d6 >= zero && d5 <= d6) return c;                   // vertex C
+		T vb = d5 * d2 - d1 * d6;
+		if (vb <= zero && d2 >= zero && d6 <= zero) {           // edge AC
+			T w = d2 / (d2 - d6);
+			hop::mul(tmp, ac, w); hop::add(closest, a, tmp); return closest;
+		}
+		T va = d3 * d6 - d5 * d4;
+		if (va <= zero && (d4 - d3) >= zero && (d5 - d6) >= zero) { // edge BC
+			T w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+			hop::vec3<T> bc; hop::sub(bc, c, b);
+			hop::mul(tmp, bc, w); hop::add(closest, b, tmp); return closest;
+		}
+		T denom = tr::one() / (va + vb + vc);                  // face interior
+		T v = vb * denom, w = vc * denom;
+		hop::mul(tmp, ab, v); hop::add(closest, a, tmp);
+		hop::mul(tmp, ac, w); hop::add(closest, tmp);
+		return closest;
+	}
+
+	// Closest points c1,c2 between segments [p1,q1] and [p2,q2]. Ericson §5.1.9.
+	static void closest_pt_segment_segment(const hop::vec3<T> & p1, const hop::vec3<T> & q1,
+	        const hop::vec3<T> & p2, const hop::vec3<T> & q2,
+	        hop::vec3<T> & c1, hop::vec3<T> & c2) {
+		const T zero{};
+		const T eps = contact_eps();
+		hop::vec3<T> d1, d2, r;
+		hop::sub(d1, q1, p1);
+		hop::sub(d2, q2, p2);
+		hop::sub(r, p1, p2);
+		T a = hop::dot(d1, d1);
+		T e = hop::dot(d2, d2);
+		T f = hop::dot(d2, r);
+		T s, t;
+		if (a <= eps && e <= eps) {
+			s = zero; t = zero;
+		} else if (a <= eps) {
+			s = zero; t = clamp01(f / e);
+		} else {
+			T c = hop::dot(d1, r);
+			if (e <= eps) {
+				t = zero; s = clamp01(-c / a);
+			} else {
+				T b = hop::dot(d1, d2);
+				T denom = a * e - b * b;
+				s = (denom != zero) ? clamp01((b * f - c * e) / denom) : zero;
+				t = (b * s + f) / e;
+				if (t < zero) { t = zero; s = clamp01(-c / a); }
+				else if (t > tr::one()) { t = tr::one(); s = clamp01((b - c) / a); }
+			}
+		}
+		hop::vec3<T> tmp;
+		hop::mul(tmp, d1, s); hop::add(c1, p1, tmp);
+		hop::mul(tmp, d2, t); hop::add(c2, p2, tmp);
+	}
+
+	// Squared closest distance between segment (p,q) and triangle tri_idx, with
+	// the closest point on the segment (cs) and on the triangle (ct). Considers
+	// the spine-pierces-triangle case (distance 0), both spine endpoints vs the
+	// triangle, and the spine vs each of the three edges.
+	T closest_seg_triangle(const hop::vec3<T> & p, const hop::vec3<T> & q, int tri_idx,
+	        hop::vec3<T> & cs, hop::vec3<T> & ct) const {
+		auto & tri = tris_[tri_idx];
+		const auto & a = verts_[tri.i0];
+		const auto & b = verts_[tri.i1];
+		const auto & c = verts_[tri.i2];
+
+		// Spine pierces the triangle interior → distance 0.
+		const auto & fn = normals_[tri_idx];
+		hop::vec3<T> pq; hop::sub(pq, q, p);
+		T denom = hop::dot(fn, pq);
+		if (denom > contact_eps() || denom < -contact_eps()) {
+			hop::vec3<T> ap; hop::sub(ap, a, p);
+			T tt = hop::dot(fn, ap) / denom;
+			if (tt >= T{} && tt <= tr::one()) {
+				hop::vec3<T> x; hop::mul(x, pq, tt); hop::add(x, p);
+				if (point_in_triangle(x, tri_idx)) { cs = x; ct = x; return T{}; }
+			}
+		}
+
+		auto consider = [&](const hop::vec3<T> & sp, const hop::vec3<T> & tp,
+		                    T & best, bool & have) {
+			hop::vec3<T> diff; hop::sub(diff, sp, tp);
+			T d2 = hop::length_squared(diff);
+			if (!have || d2 < best) { best = d2; cs = sp; ct = tp; have = true; }
+		};
+
+		T best{}; bool have = false;
+		hop::vec3<T> tp, sc, tc;
+		tp = closest_pt_point_triangle(p, a, b, c); consider(p, tp, best, have);
+		tp = closest_pt_point_triangle(q, a, b, c); consider(q, tp, best, have);
+		closest_pt_segment_segment(p, q, a, b, sc, tc); consider(sc, tc, best, have);
+		closest_pt_segment_segment(p, q, b, c, sc, tc); consider(sc, tc, best, have);
+		closest_pt_segment_segment(p, q, c, a, sc, tc); consider(sc, tc, best, have);
+		return best;
+	}
+
+	// Static-overlap recovery of a capsule against one triangle, one-sided to the
+	// triangle's FRONT face (Godot's rule). `base` is the body origin in mesh-
+	// local space (plus the shape's local offset). Returns true and fills the
+	// push-out depth + normal when the capsule overlaps the front of the face
+	// within `radius + margin`.
+	bool recover_capsule_triangle(int tri_idx, const hop::capsule<T> & cap,
+	        const hop::vec3<T> & base, T margin, T & out_depth,
+	        hop::vec3<T> & out_normal) const {
+		hop::vec3<T> p1, p2;
+		hop::add(p1, base, cap.origin);
+		hop::add(p2, p1, cap.direction);
+
+		hop::vec3<T> cs, ct;
+		T d2 = closest_seg_triangle(p1, p2, tri_idx, cs, ct);
+		T thresh = cap.radius + margin;
+		// Strict: a capsule resting exactly at d == radius still registers as a
+		// (zero-depth) touch, matching the speculative-margin behaviour callers rely
+		// on for ground detection.
+		if (d2 > thresh * thresh) return false;
+
+		T d = tr::sqrt(d2);
+		const hop::vec3<T> & face_n = normals_[tri_idx];
+
+		// Contact normal: from the triangle toward the capsule spine. Degenerate
+		// when the spine pierces the face (d≈0); fall back to the stored face
+		// normal (consistently up on flat floors), which keeps the basement push
+		// pointing UP no matter how deep the body has sunk.
+		hop::vec3<T> n;
+		if (d > contact_eps()) {
+			hop::sub(n, cs, ct);
+			hop::mul(n, tr::one() / d);
+		} else {
+			n = face_n;
+		}
+
+		// One-sided front gate: only push out of the FRONT face. Rejects the
+		// coincident back-wound twin on mixed-winding BSP surfaces and never flips
+		// downward when the center sinks below a floor.
+		if (hop::dot(face_n, n) < T{}) return false;
+
+		T depth = cap.radius - d;
+		if (depth < T{}) depth = T{};
+		out_depth = depth;
+		out_normal = n;
+		return true;
+	}
+
+	// Conservative-advancement swept contact of a capsule (spine p1..p2 at t=0,
+	// radius) moving by `dir` against one triangle. Distance-based, hence two-
+	// sided: it stops the capsule at the surface from whichever side it
+	// approaches, so the BSP's mixed-winding ramp has no holes. Returns true and
+	// fills the time-of-impact (in [0,1]) + contact normal if it hits before
+	// `result_time` while moving INTO the surface.
+	bool sweep_capsule_triangle(int tri_idx, const hop::vec3<T> & p1_0,
+	        const hop::vec3<T> & p2_0, const hop::vec3<T> & dir, T radius, T margin,
+	        T result_time, T & out_t, hop::vec3<T> & out_normal) const {
+		T speed = tr::sqrt(hop::dot(dir, dir));
+		if (speed <= contact_eps()) return false;
+		T thresh = radius + margin; // stop this far from the true surface
+
+		T t = T{};
+		const int MAX_CA = 32;
+		hop::vec3<T> off, p1, p2, cs, ct;
+		for (int it = 0; it < MAX_CA; ++it) {
+			if (t >= result_time) return false; // a nearer contact already wins
+			hop::mul(off, dir, t);
+			hop::add(p1, p1_0, off);
+			hop::add(p2, p2_0, off);
+
+			T d2 = closest_seg_triangle(p1, p2, tri_idx, cs, ct);
+			T d = tr::sqrt(d2);
+			T gap = d - thresh;
+			if (gap <= contact_eps()) {
+				// Contact at parameter t. Normal points from the surface toward the
+				// capsule spine (so it opposes the approach for clean sliding).
+				hop::vec3<T> n;
+				if (d > contact_eps()) {
+					hop::sub(n, cs, ct);
+					hop::mul(n, tr::one() / d);
+				} else {
+					n = normals_[tri_idx];
+					if (hop::dot(n, dir) > T{}) hop::neg(n);
+				}
+				// Only block if actually moving INTO the surface — a body resting on
+				// or grazing along the face (dot≈0) or separating slides freely.
+				if (hop::dot(n, dir) >= -contact_eps()) return false;
+				out_t = t;
+				out_normal = n;
+				return true;
+			}
+			t += gap / speed; // conservative: the gap can't close faster than `speed`
+		}
+		return false;
+	}
+
+	// --- Non-capsule (box/sphere) fallback: winding-agnostic support-plane ---
+	// Recovery of a single non-capsule shape against one triangle. Orients the
+	// face normal toward the body (double-sided, like Godot's concave collision)
+	// and pushes out of the nearest (minimum-depth) surface.
+	void recover_support_plane(int tri_idx, hop::shape<T> * sh,
+	        const hop::vec3<T> & local_origin, const hop::segment<T> & seg, T margin,
+	        hop::collision<T> & result, bool & found, T & best_depth) const {
+		auto & tri = tris_[tri_idx];
+		auto & n = normals_[tri_idx];
+
+		hop::vec3<T> face_n = n;
+		if (hop::dot(n, local_origin) - hop::dot(n, verts_[tri.i0]) < T{})
+			hop::neg(face_n, n);
+
+		hop::vec3<T> neg_fn; hop::neg(neg_fn, face_n);
+		hop::vec3<T> sup; hop::support(sup, *sh, neg_fn);
+		T expand = hop::dot(sup, neg_fn);
+
+		T plane_d = hop::dot(face_n, verts_[tri.i0]);
+		T surface_d = plane_d + expand;
+		T expanded_d = surface_d + margin;
+
+		T along = hop::dot(face_n, local_origin);
+		if (along > expanded_d) return;
+
+		T dist = along - plane_d;
+		hop::vec3<T> proj, n_scaled;
+		hop::mul(n_scaled, face_n, dist);
+		hop::sub(proj, local_origin, n_scaled);
+
+		if (point_near_triangle(proj, tri_idx, seam_tol_)) {
+			T depth = surface_d - along;
+			if (depth < T{}) depth = T{};
+			if (!found || depth < best_depth) {
+				best_depth    = depth;
+				result.time   = T{};
+				result.depth  = depth;
+				result.normal = face_n;
+				result.point  = seg.origin;
+				found = true;
+			}
+		}
+	}
+
+	// Swept cast of a single non-capsule shape against one triangle.
+	void sweep_support_plane(int tri_idx, hop::shape<T> * sh,
+	        const hop::vec3<T> & local_origin, const hop::segment<T> & seg,
+	        hop::collision<T> & result) const {
+		auto & tri = tris_[tri_idx];
+		auto & n = normals_[tri_idx];
+
+		hop::vec3<T> face_n = n;
+		if (hop::dot(n, local_origin) - hop::dot(n, verts_[tri.i0]) < T{})
+			hop::neg(face_n, n);
+
+		T denom = hop::dot(face_n, seg.direction);
+		if (denom >= T{}) return; // not moving into this (body-facing) surface
+
+		hop::vec3<T> neg_fn; hop::neg(neg_fn, face_n);
+		hop::vec3<T> sup; hop::support(sup, *sh, neg_fn);
+		T expand = hop::dot(sup, neg_fn);
+
+		auto & v0 = verts_[tri.i0];
+		T plane_d = hop::dot(face_n, v0);
+		T expanded_d = plane_d + expand;
+
+		T t = (expanded_d - hop::dot(face_n, local_origin)) / denom;
+		if (t > tr::one() || t >= result.time) return;
+		if (t < T{}) t = T{};
+
+		hop::vec3<T> hit;
+		hop::mul(hit, seg.direction, t);
+		hop::add(hit, local_origin);
+
+		hop::vec3<T> proj;
+		T offset = hop::dot(face_n, hit) - plane_d;
+		hop::vec3<T> n_scaled;
+		hop::mul(n_scaled, face_n, offset);
+		hop::sub(proj, hit, n_scaled);
+
+		if (point_near_triangle(proj, tri_idx, seam_tol_)) {
+			result.time = t;
+			hop::mul(result.point, seg.direction, t);
+			hop::add(result.point, seg.origin);
+			result.normal = face_n;
+		}
+	}
 
 	void tri_aabb(int idx, hop::aa_box<T> & box) const {
 		auto & t = tris_[idx];

@@ -21,6 +21,12 @@ struct HopSpaceData {
 	std::unique_ptr<hop::simulator<hop_scalar>> simulator;
 	hop::bvh_manager<hop_scalar> bvh_manager;
 
+	// Dedicated broadphase for area sensor solids — a pure spatial index, NOT
+	// driven by the simulator (areas never step or block).  Accelerates area
+	// overlap queries and area-area monitoring from O(areas) to O(log areas).
+	// Holds only areas, so broadphase results never need body/area disambiguation.
+	hop::bvh_manager<hop_scalar> area_bvh;
+
 	// Space params (Godot defaults)
 	float contact_recycle_radius = 0.01f;
 	float contact_max_separation = 0.05f;

@@ -999,33 +999,6 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	bool recovered = recover != Vector3();
 	bool collided = unsafe < 1.0f;
 
-	// Diagnostic: set env WW_LOG_FALL=1 to log the frame a body leaves the ground
-	// (was grounded last query, now the swept motion finds no floor while
-	// descending). Prints position/motion/recover plus a straight-down re-probe so
-	// a fall-through can be reproduced offline from the exact state. Off by default.
-	if (std::getenv("WW_LOG_FALL")) {
-		static std::unordered_map<const void *, bool> s_grounded;
-		const void *bkey = body;
-		bool now_grounded = (collided && to_godot(result.normal).y > 0.7f) || recover.y > 0.01f;
-		auto it = s_grounded.find(bkey);
-		bool was_grounded = (it != s_grounded.end() && it->second);
-		if (was_grounded && !collided && p_motion.y < -1e-4f) {
-			body->hop_solid->set_position(to_hop(from_pos));
-			hop::segment<hop_scalar> dseg;
-			dseg.set_start_end(to_hop(from_pos), to_hop(from_pos + Vector3(0, -2, 0)));
-			hop::collision<hop_scalar> dcol;
-			dcol.reset();
-			space->simulator->trace_solid(dcol, body->hop_solid.get(), dseg, body->collision_mask);
-			body->hop_solid->set_position(orig_pos);
-			bool found = to_godot_float(dcol.time) < 1.0f;
-			UtilityFunctions::print("[WW_LOG_FALL] left ground @", p_from.origin,
-				" motion=", p_motion, " recover=", recover, " sweptUnsafe=", unsafe,
-				" downReprobe=", found ? Variant(to_godot_float(dcol.time) * 2.0f) : Variant("NONE"),
-				" downN=", found ? to_godot(dcol.normal) : Vector3());
-		}
-		s_grounded[bkey] = now_grounded;
-	}
-
 	if (!collided && !recovered) {
 		// Free motion, no overlap.
 		if (p_result) {

@@ -200,12 +200,10 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 		}
 
 		case PhysicsServer3D::SHAPE_CONCAVE_POLYGON: {
-			UtilityFunctions::print("[hop] CONCAVE_POLYGON set_data type=", (int)data.get_type());
 			Dictionary d = data;
 			PackedVector3Array faces = d["faces"];
 			bool backface_collision = d.get("backface_collision", false);
 			int face_count = faces.size();
-			UtilityFunctions::print("[hop] CONCAVE_POLYGON faces=", face_count, " backface=", backface_collision);
 			// Godot passes concave polygon data as a flat array of face vertices
 			// (3 vertices per triangle)
 			if (face_count < 3 || (face_count % 3) != 0)

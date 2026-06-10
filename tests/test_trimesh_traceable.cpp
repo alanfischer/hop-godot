@@ -1,21 +1,26 @@
-// Unit tests for HopTrimeshTraceable's winding-agnostic collision.
+// Unit tests for HopTrimeshTraceable's capsule-vs-triangle closest-point contact.
 //
-// Background: GoldSrc BSP geometry (via build_hull_collision) produces triangle
-// soup whose per-triangle winding is NOT globally consistent — walkable surfaces
-// can carry coincident, oppositely-wound triangles. The trimesh trace must behave
-// like Godot's concave collision (winding-agnostic / double-sided): a body is
-// pushed out of, and stopped by, the surface FACING it, regardless of winding.
+// Background: the player is a CAPSULE moving against GoldSrc BSP triangle soup
+// (via build_hull_collision). That soup's per-triangle winding is NOT globally
+// consistent — flat floors are wound one way, but walkable ramp faces carry
+// coincident, oppositely-wound triangles. The old center+plane approximation
+// couldn't satisfy both the flat-floor and the mixed-winding-ramp cases at once,
+// producing two bugs: (a) a deep "basement" sink where depenetration flipped and
+// shoved the body DOWN through a floor, and (b) holes/sticking on ramps.
 //
-// These tests pin the invariants that fix the "fall through ramps/floors" and
-// "stuck" bugs:
-//   1. Zero-direction recovery returns a body-facing normal + the true (small)
-//      penetration depth — never the inward normal with a ~2*extent bogus depth
-//      that shoved the body through the surface.
-//   2. That holds for either winding AND for coincident opposite-wound pairs.
-//   3. The swept cast registers a hit with a body-facing normal even when a
-//      triangle's stored winding is inverted.
-//   4. The seam tolerance bridges a hairline gap between triangles but does not
-//      paper over a genuine hole.
+// The rewrite does real capsule-segment-vs-triangle closest-point contact, like
+// Godot's concave collision:
+//   * Recovery is ONE-SIDED to each triangle's FRONT face: it pushes out along
+//     the face the capsule is on, by the true penetration, and never flips
+//     downward when the body sinks below the floor. The front gate rejects the
+//     coincident back-wound twin, so a mixed-winding surface is still solid.
+//   * The swept cast is distance-based, hence TWO-SIDED: it stops the capsule at
+//     the surface from whichever side it approaches (no winding holes), so
+//     penetration stays shallow and recovery only sees the clean case.
+//
+// These tests pin those invariants. Note the winding of `flat_quad`: reversed=
+// true gives an UP face normal (the "solid-from-above" floor), reversed=false an
+// up-side-down (DOWN) normal.
 
 #include <cassert>
 #include <cmath>
@@ -72,6 +77,8 @@ static hop::collision<T> probe_swept(HopTrimeshTraceable<T> & mesh,
 }
 
 // One horizontal quad at y=0 (a flat floor), with explicit winding.
+//   reversed=true  → UP face normal (solid from above)
+//   reversed=false → DOWN face normal
 static void flat_quad(std::vector<V> & v, std::vector<Tri> & t, bool reversed) {
 	int i = (int)v.size();
 	v.push_back(vec(-5, 0, -5));
@@ -82,58 +89,90 @@ static void flat_quad(std::vector<V> & v, std::vector<Tri> & t, bool reversed) {
 	else           { t.push_back({ i, i + 2, i + 1 }); t.push_back({ i, i + 3, i + 2 }); }
 }
 
-// --- Test 1: resting recovery is winding-agnostic and reports the TRUE depth ---
-// A capsule resting on a flat floor must depenetrate UP with ~0 depth, whether
-// the floor triangles are wound up or down. The old deepest-face/raw-winding
-// logic reported ~2*extent (=1.8 here) with a downward normal for the reversed
-// winding — which shoved the body through the floor.
-static void test_recovery_winding_agnostic() {
-	const T r = 0.4, half = 0.5, extent = r + half; // capsule lowest point = center.y - extent
-	for (bool reversed : { false, true }) {
-		std::vector<V> verts; std::vector<Tri> tris;
-		flat_quad(verts, tris, reversed);
-		auto mesh = make_mesh(verts, tris);
-		auto body = make_capsule(r, half);
-
-		// Resting exactly on the floor: lowest point at y=0 → center at y=extent.
-		hop::collision<T> c = probe_static(*mesh, body.get(), vec(0, extent, 0));
-		assert(c.time == T {});                 // static overlap detected
-		assert(c.normal.y > 0.5);               // pushes UP (toward the body), not down
-		assert(c.depth < 0.25);                 // ~0, never the ~2*extent (1.8) bogus depth
-		assert(c.depth < extent);               // strictly less than one body extent
-
-		// Sunk 0.1 into the floor → depth ~0.1, still up.
-		hop::collision<T> s = probe_static(*mesh, body.get(), vec(0, extent - 0.1, 0));
-		assert(s.normal.y > 0.5);
-		assert(approx(s.depth, 0.1, 0.05));
-		printf("  recovery winding-agnostic (reversed=%d): normal.y=%.2f depth=%.3f\n",
-		       (int)reversed, c.normal.y, c.depth);
-	}
-}
-
-// --- Test 2: coincident opposite-wound triangles (the BSP case) ---
-// The exact failure: a walkable surface carries BOTH an up- and a down-wound
-// triangle. A capsule resting on top must still get a small upward depenetration,
-// not a ~2*extent downward shove from the inverted twin.
-static void test_coincident_opposite_faces() {
-	const T r = 0.4, half = 0.5, extent = r + half;
+// --- Test 1: one-sided recovery off an UP floor reports the TRUE depth ---
+static void test_recovery_front_face() {
+	const T r = 0.4, half = 0.5, extent = r + half; // lowest point = center.y - extent
 	std::vector<V> verts; std::vector<Tri> tris;
-	flat_quad(verts, tris, false); // up-wound
-	flat_quad(verts, tris, true);  // coincident down-wound twin
+	flat_quad(verts, tris, true); // UP-facing floor
 	auto mesh = make_mesh(verts, tris);
 	auto body = make_capsule(r, half);
 
+	// Resting exactly on the floor: lowest point at y=0 → center at y=extent.
 	hop::collision<T> c = probe_static(*mesh, body.get(), vec(0, extent, 0));
-	assert(c.time == T {});
-	assert(c.normal.y > 0.5);     // up, despite the inverted twin
-	assert(c.depth < 0.25);       // not the ~1.8 bogus depth
-	printf("  coincident opposite faces: normal.y=%.2f depth=%.3f\n", c.normal.y, c.depth);
+	assert(c.time == T {});       // static overlap detected
+	assert(c.normal.y > 0.9);     // pushes straight UP
+	assert(c.depth < 0.05);       // ~0, never a bogus ~2*extent shove
+
+	// Sunk 0.1 into the floor → depth ~0.1, still up.
+	hop::collision<T> s = probe_static(*mesh, body.get(), vec(0, extent - 0.1, 0));
+	assert(s.normal.y > 0.9);
+	assert(approx(s.depth, 0.1, 0.03));
+	printf("  recovery front face: normal.y=%.2f depth=%.3f\n", c.normal.y, c.depth);
 }
 
-// --- Test 3: swept cast is winding-agnostic ---
+// --- Test 2: mixed-winding surface (the real BSP ramp/coincident case) ---
+// A walkable face carrying BOTH an up- and a down-wound triangle must still push
+// the resting capsule UP — the front gate rejects the inverted twin instead of
+// latching it for a downward shove.
+static void test_recovery_mixed_winding() {
+	const T r = 0.4, half = 0.5, extent = r + half;
+	std::vector<V> verts; std::vector<Tri> tris;
+	flat_quad(verts, tris, true);  // up-wound
+	flat_quad(verts, tris, false); // coincident down-wound twin
+	auto mesh = make_mesh(verts, tris);
+	auto body = make_capsule(r, half);
+
+	hop::collision<T> c = probe_static(*mesh, body.get(), vec(0, extent - 0.05, 0));
+	assert(c.time == T {});
+	assert(c.normal.y > 0.9);     // up, despite the inverted twin
+	assert(c.depth < 0.25);       // not the ~1.8 bogus depth
+	printf("  recovery mixed winding: normal.y=%.2f depth=%.3f\n", c.normal.y, c.depth);
+}
+
+// --- Test 3: the basement regression — deep sink must push UP, never down ---
+// When the capsule sinks far enough that its spine straddles the floor plane, the
+// old code's "orient toward body center" flipped the push DOWN (the captured
+// recover.y = -1.81). The one-sided closest-point recovery must keep pushing UP
+// for every sink depth, converging the body back above the floor over the
+// simulator's iterated recovery.
+static void test_recovery_deep_sink_pushes_up() {
+	const T r = 0.4, half = 0.5;
+	std::vector<V> verts; std::vector<Tri> tris;
+	flat_quad(verts, tris, true); // UP floor at y=0
+	auto mesh = make_mesh(verts, tris);
+	auto body = make_capsule(r, half);
+
+	// Walk the center from on-surface down to where the spine still straddles the
+	// floor plane (center y >= -half, so the capsule's top stays above it — the
+	// captured basement state). Recovery must always be upward, never the -1.81
+	// downward flip. (Once the WHOLE capsule is below an up-facing floor it is, by
+	// design, on the back side and not solid — exactly like Godot's one-sided
+	// concave collision; the two-sided swept cast is what keeps the body from ever
+	// getting there.)
+	for (T cy = 0.3; cy >= -0.4; cy -= 0.1) {
+		hop::collision<T> c = probe_static(*mesh, body.get(), vec(0, cy, 0));
+		assert(c.time == T {});       // overlapping
+		assert(c.normal.y > 0.9);     // UP — never the -1.81 downward flip
+		assert(c.depth > T {});       // a real positive push-out
+	}
+
+	// Emulate the simulator's iterated recovery: a few up pushes must lift the
+	// deeply-sunk body back to resting on the floor (lowest point ~ y=0).
+	V pos = vec(0, -0.4, 0);
+	for (int i = 0; i < 6; ++i) {
+		hop::collision<T> c = probe_static(*mesh, body.get(), pos);
+		if (c.time != T {} || c.depth <= 0) break;
+		pos.y += c.normal.y * c.depth; // push along the (upward) normal
+	}
+	assert(approx(pos.y, r + half, 0.05)); // converged to resting (lowest point ~0)
+	printf("  deep sink pushes up: converged center.y=%.3f\n", pos.y);
+}
+
+// --- Test 4: swept cast is two-sided (catches either winding) ---
 // A capsule dropped onto a single floor triangle must register a hit with an
-// upward-facing normal even when that triangle's stored winding points DOWN.
-static void test_swept_winding_agnostic() {
+// upward-facing normal regardless of that triangle's stored winding, because the
+// cast is distance-based.
+static void test_swept_two_sided() {
 	const T r = 0.4, half = 0.5, extent = r + half;
 	for (bool reversed : { false, true }) {
 		std::vector<V> verts; std::vector<Tri> tris;
@@ -146,40 +185,59 @@ static void test_swept_winding_agnostic() {
 		assert(c.time < T(1));        // hit the floor
 		assert(c.time > T {});        // not already penetrating
 		assert(c.normal.y > 0.5);     // upward (body-facing) normal regardless of winding
-		printf("  swept winding-agnostic (reversed=%d): time=%.3f normal.y=%.2f\n",
+		printf("  swept two-sided (down-winding=%d): time=%.3f normal.y=%.2f\n",
 		       (int)reversed, c.time, c.normal.y);
 	}
 }
 
-// --- Test 4: seam tolerance bridges a hairline gap, not a real hole ---
-static void test_seam_tolerance() {
+// --- Test 5: a body resting on the floor still moves horizontally ---
+// The swept cast must not block a capsule that's resting on (grazing) the floor
+// from sliding along it — only motion INTO a surface blocks. Guards the "can't
+// walk" regression from the moving-into gate.
+static void test_resting_allows_horizontal_motion() {
+	const T r = 0.4, half = 0.5, extent = r + half;
+	std::vector<V> verts; std::vector<Tri> tris;
+	flat_quad(verts, tris, true);
+	auto mesh = make_mesh(verts, tris);
+	auto body = make_capsule(r, half);
+
+	// Resting exactly on the floor, moving horizontally: no blocking contact.
+	hop::collision<T> c = probe_swept(*mesh, body.get(), vec(0, extent, 0), vec(1.0, 0, 0));
+	assert(c.time == T(1));
+	printf("  resting allows horizontal motion: time=%.3f\n", c.time);
+}
+
+// --- Test 6: a finite-radius capsule can't fall through a too-narrow gap ---
+// Distance-based contact naturally bridges gaps narrower than the capsule
+// (it catches on the edge), while a hole wider than the capsule lets it through.
+static void test_capsule_gap_fit() {
 	const T r = 0.4, half = 0.5, extent = r + half;
 	auto run = [&](T gap) {
 		std::vector<V> verts; std::vector<Tri> tris;
-		// two floor halves split along x=0 with a `gap`-wide slit
+		// two floor halves split along x=0 with a `gap`-wide slit (UP-wound)
 		int i = (int)verts.size();
 		verts.push_back(vec(-5, 0, -5)); verts.push_back(vec(-gap / 2, 0, -5));
 		verts.push_back(vec(-gap / 2, 0, 5)); verts.push_back(vec(-5, 0, 5));
-		tris.push_back({ i, i + 1, i + 2 }); tris.push_back({ i, i + 2, i + 3 });
+		tris.push_back({ i, i + 2, i + 1 }); tris.push_back({ i, i + 3, i + 2 });
 		i = (int)verts.size();
 		verts.push_back(vec(gap / 2, 0, -5)); verts.push_back(vec(5, 0, -5));
 		verts.push_back(vec(5, 0, 5)); verts.push_back(vec(gap / 2, 0, 5));
-		tris.push_back({ i, i + 1, i + 2 }); tris.push_back({ i, i + 2, i + 3 });
+		tris.push_back({ i, i + 2, i + 1 }); tris.push_back({ i, i + 3, i + 2 });
 		auto mesh = make_mesh(verts, tris);
 		auto body = make_capsule(r, half);
 		// drop centered exactly over the slit
 		hop::collision<T> c = probe_swept(*mesh, body.get(), vec(0, extent + 1.0, 0), vec(0, -2.0, 0));
 		return c.time < T(1);
 	};
-	assert(run(0.02));   // 2cm hairline seam → bridged (caught)
-	assert(!run(0.30));  // 30cm real hole → correctly NOT bridged
-	printf("  seam tolerance: 2cm gap caught, 30cm hole not\n");
+	assert(run(0.10));   // 10cm slit, capsule r=0.4 can't fit → caught on the edge
+	assert(!run(1.20));  // 1.2m hole > capsule diameter (0.8) → falls through
+	printf("  capsule gap fit: narrow slit caught, wide hole not\n");
 }
 
-// --- Test 5: a body clear of the mesh reports no contact ---
+// --- Test 7: a body clear of the mesh reports no contact ---
 static void test_no_false_contact() {
 	std::vector<V> verts; std::vector<Tri> tris;
-	flat_quad(verts, tris, false);
+	flat_quad(verts, tris, true);
 	auto mesh = make_mesh(verts, tris);
 	auto body = make_capsule(0.4, 0.5);
 	hop::collision<T> c = probe_static(*mesh, body.get(), vec(0, 5.0, 0)); // well above
@@ -187,13 +245,52 @@ static void test_no_false_contact() {
 	printf("  no false contact when clear\n");
 }
 
+// --- Test 8: climbing a 45° ramp does not fall through or stick ---
+// A coincident mixed-winding ramp (both windings, like the BSP) must stop a
+// capsule swept toward it, with an outward-facing normal, all the way up.
+static void test_ramp_climb() {
+	const T r = 0.4, half = 0.5;
+	// 45° ramp in the x-y plane spanning x in [-5,5], y = x+5 (so y from 0..10),
+	// extruded in z. Build both windings (the BSP's coincident-twin case).
+	std::vector<V> verts; std::vector<Tri> tris;
+	auto add_quad = [&](V a, V b, V c, V d) {
+		int i = (int)verts.size();
+		verts.push_back(a); verts.push_back(b); verts.push_back(c); verts.push_back(d);
+		tris.push_back({ i, i + 1, i + 2 }); tris.push_back({ i, i + 2, i + 3 });
+		tris.push_back({ i, i + 2, i + 1 }); tris.push_back({ i, i + 3, i + 2 }); // twin
+	};
+	add_quad(vec(-5, 0, -5), vec(5, 10, -5), vec(5, 10, 5), vec(-5, 0, 5));
+	auto mesh = make_mesh(verts, tris);
+	auto body = make_capsule(r, half);
+
+	// Sample a few points along the ramp; from just above the surface, a downward
+	// probe must catch the ramp (never tunnel) with an upward-ish normal.
+	const T inv_sqrt2 = 0.70710678;
+	int hits = 0;
+	for (T x = -4; x <= 4; x += 1.0) {
+		T surf_y = x + 5;                       // ramp surface height at this x
+		// capsule centered so its lowest point sits ~0.3 above the surface
+		V center = vec(x, surf_y + r + 0.3, 0);
+		hop::collision<T> c = probe_swept(*mesh, body.get(), center, vec(0, -1.0, 0));
+		assert(c.time < T(1));                  // caught the ramp, no fall-through
+		assert(c.normal.y > 0.4);               // outward (up-ish) on a 45° face
+		(void)inv_sqrt2;
+		++hits;
+	}
+	assert(hits == 9);
+	printf("  ramp climb: %d/9 ramp samples caught with up-ish normal\n", hits);
+}
+
 int main() {
 	printf("test_trimesh_traceable:\n");
-	test_recovery_winding_agnostic();
-	test_coincident_opposite_faces();
-	test_swept_winding_agnostic();
-	test_seam_tolerance();
+	test_recovery_front_face();
+	test_recovery_mixed_winding();
+	test_recovery_deep_sink_pushes_up();
+	test_swept_two_sided();
+	test_resting_allows_horizontal_motion();
+	test_capsule_gap_fit();
 	test_no_false_contact();
+	test_ramp_climb();
 	printf("ALL PASSED\n");
 	return 0;
 }

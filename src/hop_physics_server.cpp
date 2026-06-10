@@ -975,10 +975,27 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	Vector3 from_pos = p_from.origin + recover;
 
 	// --- (2) Cast the motion from the recovered position ---
+	// Extend the probe a `margin` beyond the requested motion so we also detect a
+	// surface the body is already resting within `margin` of.  Step (3) leaves the
+	// body sitting `margin` above whatever it stops against (the floor, after a
+	// landing).  A standing body's per-frame motion is just the gravity sliver,
+	// which is smaller than that gap, so an exact-length cast misses the floor and
+	// is_on_floor() flickers as the body drifts in and out of the gap.  The
+	// extension is detection-only: hit distances are re-expressed against the real
+	// motion below, so mid-motion wall hits and sliding are unaffected.  (Walking
+	// grounding doesn't rely on this; the movement code does its own down-cast.)
+	float motion_len = p_motion.length();
+	Vector3 probe_motion = p_motion;
+	float probe_len = motion_len;
+	if (motion_len > 1e-6f) {
+		probe_motion += (p_motion / motion_len) * margin;
+		probe_len = motion_len + margin;
+	}
+
 	body->hop_solid->set_position(to_hop(from_pos));
 
 	hop::segment<hop_scalar> seg;
-	seg.set_start_end(to_hop(from_pos), to_hop(from_pos + p_motion));
+	seg.set_start_end(to_hop(from_pos), to_hop(from_pos + probe_motion));
 
 	// Don't blend normals across triangles for this query: a beveled normal at a
 	// triangle seam makes velocity.slide() over-cancel and the body catch on flat
@@ -994,10 +1011,17 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	// Restore the authoritative position (this is a const query).
 	body->hop_solid->set_position(orig_pos);
 
-	float unsafe = std::min(to_godot_float(result.time), 1.0f);
+	// result.time is a fraction of the (possibly extended) probe.  Convert to a
+	// hit distance, then back to a fraction of the *real* motion for Godot's
+	// safe/unsafe semantics — a contact found only in the margin extension lands
+	// at unsafe == 1 (body doesn't advance) but is still reported below.
+	float probe_time = std::min(to_godot_float(result.time), 1.0f);
+	float hit_dist = probe_time * probe_len;
+	float unsafe = motion_len > 1e-6f ? std::min(hit_dist / motion_len, 1.0f)
+	                                  : (probe_time < 1.0f ? 0.0f : 1.0f);
 
 	bool recovered = recover != Vector3();
-	bool collided = unsafe < 1.0f;
+	bool collided = probe_time < 1.0f;
 
 	if (!collided && !recovered) {
 		// Free motion, no overlap.
@@ -1013,7 +1037,6 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	}
 
 	// --- (3) Back the stopping point off by `margin` so a gap remains ---
-	float motion_len = p_motion.length();
 	float safe = unsafe;
 	if (collided && motion_len > 0.0f) {
 		safe = (unsafe * motion_len - margin) / motion_len;

@@ -8,6 +8,19 @@
 #include <cstdlib>
 #include <unordered_map>
 
+// KINEMATIC bodies (the CharacterBody3D player) resolve contacts via sweep-and-slide
+// so they slide along surfaces; dynamic and static bodies use the speculative solve
+// (the space default, set in HopSpaceData). hop-godot is a generic backend with no
+// "player" concept, so body mode is the only signal available — moving platforms are
+// kinematic too, but contact_mode is moot for infinite-mass bodies, so this is safe.
+static void apply_contact_mode(HopBodyData *body) {
+	if (!body->hop_solid) return;
+	body->hop_solid->set_contact_mode(
+		body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC
+			? hop::contact_mode::sweep_slide
+			: hop::contact_mode::speculative);
+}
+
 // ============================================================
 // Shape API
 // ============================================================
@@ -390,6 +403,10 @@ void HopPhysicsServer::add_body_to_space(HopBodyData *body, HopSpaceData *space)
 	body->sync_to_hop();
 	rebuild_body_shapes(body);
 	space->simulator->add_solid(body->hop_solid);
+	// add_solid stamped the space default (speculative). The player (KINEMATIC
+	// CharacterBody3D) resolves via sweep-and-slide instead; dynamic/static bodies
+	// keep speculative. Re-applied here in case mode was set before the solid existed.
+	apply_contact_mode(body);
 	space->bvh_manager.add_solid(body->hop_solid.get(),
 		body->mode == PhysicsServer3D::BODY_MODE_STATIC);
 
@@ -514,6 +531,9 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 			body->hop_solid->set_coefficient_of_gravity(to_hop_scalar(body->gravity_scale));
 			body->hop_solid->activate();
 		}
+
+		// KINEMATIC (player) → sweep-and-slide; STATIC/RIGID → speculative solve.
+		apply_contact_mode(body);
 
 		// Re-register with the BVH manager — static/dynamic classification may have changed.
 		if (body->space_rid.is_valid()) {

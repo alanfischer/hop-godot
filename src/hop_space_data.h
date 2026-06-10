@@ -52,6 +52,8 @@ struct HopSpaceData {
 			scalar_from_milli<hop_scalar>(-9810),
 			scalar_from_int<hop_scalar>(0)));
 		simulator->set_integrator(hop::integrator_type::improved);
-		simulator->set_speculative_contacts(true);
+		// Default every body to the speculative solve (matches the old global
+		// set_speculative_contacts(true); per-body overridable via set_contact_mode).
+		simulator->set_default_contact_mode(hop::contact_mode::speculative);
 	}
 };

@@ -5,6 +5,8 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
+#include <cstdlib>
+#include <unordered_map>
 
 // ============================================================
 // Shape API
@@ -155,7 +157,13 @@ RID HopPhysicsServer::_area_create() {
 
 void HopPhysicsServer::_area_set_space(const RID &p_area, const RID &p_space) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
-	if (area) area->space_rid = p_space;
+	if (!area) return;
+	if (area->space_rid.is_valid()) remove_area_from_space(area);
+	area->space_rid = p_space;
+	if (p_space.is_valid()) {
+		HopSpaceData *space = space_owner.get_or_null(p_space);
+		if (space) add_area_to_space(area, space);
+	}
 }
 
 RID HopPhysicsServer::_area_get_space(const RID &p_area) const {
@@ -167,24 +175,28 @@ void HopPhysicsServer::_area_add_shape(const RID &p_area, const RID &p_shape, co
 	HopAreaData *area = area_owner.get_or_null(p_area);
 	if (!area) return;
 	area->shapes.push_back({ p_shape, p_transform, p_disabled });
+	rebuild_area_shapes(area);
 }
 
 void HopPhysicsServer::_area_set_shape(const RID &p_area, int32_t p_shape_idx, const RID &p_shape) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
 	if (!area || p_shape_idx < 0 || p_shape_idx >= (int32_t)area->shapes.size()) return;
 	area->shapes[p_shape_idx].shape_rid = p_shape;
+	rebuild_area_shapes(area);
 }
 
 void HopPhysicsServer::_area_set_shape_transform(const RID &p_area, int32_t p_shape_idx, const Transform3D &p_transform) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
 	if (!area || p_shape_idx < 0 || p_shape_idx >= (int32_t)area->shapes.size()) return;
 	area->shapes[p_shape_idx].local_xform = p_transform;
+	rebuild_area_shapes(area);
 }
 
 void HopPhysicsServer::_area_set_shape_disabled(const RID &p_area, int32_t p_shape_idx, bool p_disabled) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
 	if (!area || p_shape_idx < 0 || p_shape_idx >= (int32_t)area->shapes.size()) return;
 	area->shapes[p_shape_idx].disabled = p_disabled;
+	rebuild_area_shapes(area);
 }
 
 int32_t HopPhysicsServer::_area_get_shape_count(const RID &p_area) const {
@@ -208,11 +220,15 @@ void HopPhysicsServer::_area_remove_shape(const RID &p_area, int32_t p_shape_idx
 	HopAreaData *area = area_owner.get_or_null(p_area);
 	if (!area || p_shape_idx < 0 || p_shape_idx >= (int32_t)area->shapes.size()) return;
 	area->shapes.erase(area->shapes.begin() + p_shape_idx);
+	rebuild_area_shapes(area);
 }
 
 void HopPhysicsServer::_area_clear_shapes(const RID &p_area) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
-	if (area) area->shapes.clear();
+	if (!area) return;
+	area->shapes.clear();
+	if (area->hop_solid) area->hop_solid->remove_all_shapes();
+	mark_area_bvh_dirty(area);
 }
 
 void HopPhysicsServer::_area_attach_object_instance_id(const RID &p_area, uint64_t p_id) {
@@ -249,7 +265,15 @@ void HopPhysicsServer::_area_set_param(const RID &p_area, PhysicsServer3D::AreaP
 
 void HopPhysicsServer::_area_set_transform(const RID &p_area, const Transform3D &p_transform) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
-	if (area) area->transform = p_transform;
+	if (!area) return;
+	area->transform = p_transform;
+	// Only the world position moves; shape geometry is unchanged, so just
+	// reposition the persistent solid (no rebuild).  The world bound shifts, so
+	// the area broadphase must rebuild before its next query.
+	if (area->hop_solid) {
+		area->hop_solid->set_position(to_hop(area->transform.origin));
+		mark_area_bvh_dirty(area);
+	}
 }
 
 Variant HopPhysicsServer::_area_get_param(const RID &p_area, PhysicsServer3D::AreaParameter p_param) const {
@@ -281,7 +305,12 @@ Transform3D HopPhysicsServer::_area_get_transform(const RID &p_area) const {
 
 void HopPhysicsServer::_area_set_collision_layer(const RID &p_area, uint32_t p_layer) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
-	if (area) area->collision_layer = p_layer;
+	if (!area) return;
+	area->collision_layer = p_layer;
+	if (area->hop_solid) {
+		area->hop_solid->set_collision_scope(p_layer);
+		area->hop_solid->set_trigger_scope(p_layer);
+	}
 }
 
 uint32_t HopPhysicsServer::_area_get_collision_layer(const RID &p_area) const {
@@ -378,6 +407,61 @@ void HopPhysicsServer::remove_body_from_space(HopBodyData *body) {
 		space->bvh_manager.remove_solid(body->hop_solid.get());
 		space->simulator->remove_solid(body->hop_solid);
 	}
+}
+
+void HopPhysicsServer::ensure_area_solid(HopAreaData *area) {
+	if (area->hop_solid) return;
+	area->hop_solid = std::make_shared<hop::solid<hop_scalar>>();
+	area->hop_solid->set_user_data(area);
+	area->hop_solid->set_infinite_mass();
+	// Sensor semantics: broadcasts on its layer (for future broad-phase use) and
+	// tags that layer as a trigger, but listens to nothing and is never added to
+	// the simulator/broadphase — so it can never block or be stepped.
+	area->hop_solid->set_collision_scope(area->collision_layer);
+	area->hop_solid->set_collide_with_scope(0);
+	area->hop_solid->set_trigger_scope(area->collision_layer);
+	area->hop_solid->set_position(to_hop(area->transform.origin));
+	area->hop_solid->deactivate();
+}
+
+void HopPhysicsServer::rebuild_area_shapes(HopAreaData *area) {
+	ensure_area_solid(area);
+	area->hop_solid->remove_all_shapes();
+	for (auto &entry : area->shapes) {
+		if (entry.disabled) {
+			entry.hop_shape.reset();
+			continue;
+		}
+		HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
+		if (!sd) continue;
+		auto hs = sd->make_hop_shape(entry.local_xform);
+		if (hs) {
+			entry.hop_shape = hs;
+			area->hop_solid->add_shape(hs);
+		}
+	}
+	// add_shape activates and set_position is unnecessary churn otherwise; keep the
+	// position in sync and leave the solid inactive (it is never stepped).
+	area->hop_solid->set_position(to_hop(area->transform.origin));
+	area->hop_solid->deactivate();
+	// World bound changed — the area broadphase must rebuild before its next query.
+	mark_area_bvh_dirty(area);
+}
+
+void HopPhysicsServer::mark_area_bvh_dirty(HopAreaData *area) {
+	HopSpaceData *space = space_owner.get_or_null(area->space_rid);
+	if (space) space->area_bvh.mark_dirty();
+}
+
+void HopPhysicsServer::add_area_to_space(HopAreaData *area, HopSpaceData *space) {
+	rebuild_area_shapes(area); // ensures the solid exists and its shapes are built
+	space->area_bvh.add_solid(area->hop_solid.get(), /*is_static=*/true);
+}
+
+void HopPhysicsServer::remove_area_from_space(HopAreaData *area) {
+	if (!area->hop_solid) return;
+	HopSpaceData *space = space_owner.get_or_null(area->space_rid);
+	if (space) space->area_bvh.remove_solid(area->hop_solid.get());
 }
 
 void HopPhysicsServer::_body_set_space(const RID &p_body, const RID &p_space) {
@@ -848,23 +932,102 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	HopSpaceData *space = space_owner.get_or_null(body->space_rid);
 	if (!space) return false;
 
-	// Save and set position for the test
+	// This drives CharacterBody3D.move_and_slide().  For clean wall sliding it
+	// must, like Godot's own physics: (1) depenetrate the body from anything it
+	// currently overlaps (recovery), (2) leave a `margin`-sized gap between the
+	// body and the wall it stops against (so the next slide step doesn't start
+	// flush and immediately re-collide at t=0), and (3) report distinct
+	// safe/unsafe fractions plus the recovery depth.
 	hop::vec3<hop_scalar> orig_pos = body->hop_solid->get_position();
-	body->hop_solid->set_position(to_hop(p_from.origin));
+
+	float margin = std::max(p_margin, 0.0f);
+	// How far past a contact surface we shove the body during recovery: enough to
+	// re-establish the margin gap, but small enough not to pop through thin walls.
+	float skin = margin > 1e-4f ? margin : 1e-3f;
+
+	// --- (1) Recovery: iteratively push out of any static overlap ---
+	Vector3 recover;
+	Vector3 recover_normal;
+	float recover_depth = 0.0f;
+	const int MAX_RECOVER_ITERS = 4;
+	for (int i = 0; i < MAX_RECOVER_ITERS; ++i) {
+		Vector3 test_pos = p_from.origin + recover;
+		body->hop_solid->set_position(to_hop(test_pos));
+
+		hop::segment<hop_scalar> probe;
+		probe.set_start_end(to_hop(test_pos), to_hop(test_pos));
+
+		hop::collision<hop_scalar> overlap;
+		space->simulator->trace_solid(overlap, body->hop_solid.get(), probe, body->collision_mask);
+
+		// time >= 1 means no static overlap at this position.
+		if (to_godot_float(overlap.time) > 0.0f) break;
+
+		float depth = to_godot_float(overlap.depth);
+		Vector3 n = to_godot(overlap.normal);
+		if (depth <= 0.0f || n == Vector3()) break; // touching, but not penetrating
+
+		recover += n * (depth + skin);
+		recover_normal = n;
+		if (depth > recover_depth) recover_depth = depth;
+	}
+
+	Vector3 from_pos = p_from.origin + recover;
+
+	// --- (2) Cast the motion from the recovered position ---
+	body->hop_solid->set_position(to_hop(from_pos));
 
 	hop::segment<hop_scalar> seg;
-	seg.set_start_end(to_hop(p_from.origin), to_hop(p_from.origin + p_motion));
+	seg.set_start_end(to_hop(from_pos), to_hop(from_pos + p_motion));
+
+	// Don't blend normals across triangles for this query: a beveled normal at a
+	// triangle seam makes velocity.slide() over-cancel and the body catch on flat
+	// walls.  We want the crisp face normal so sliding stays smooth.
+	bool saved_avg = space->simulator->get_average_normals();
+	space->simulator->set_average_normals(false);
 
 	hop::collision<hop_scalar> result;
 	space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask);
 
-	// Restore position
+	space->simulator->set_average_normals(saved_avg);
+
+	// Restore the authoritative position (this is a const query).
 	body->hop_solid->set_position(orig_pos);
 
-	float result_time = to_godot_float(result.time);
+	float unsafe = std::min(to_godot_float(result.time), 1.0f);
 
-	if (result_time >= 1.0f) {
-		// No collision
+	bool recovered = recover != Vector3();
+	bool collided = unsafe < 1.0f;
+
+	// Diagnostic: set env WW_LOG_FALL=1 to log the frame a body leaves the ground
+	// (was grounded last query, now the swept motion finds no floor while
+	// descending). Prints position/motion/recover plus a straight-down re-probe so
+	// a fall-through can be reproduced offline from the exact state. Off by default.
+	if (std::getenv("WW_LOG_FALL")) {
+		static std::unordered_map<const void *, bool> s_grounded;
+		const void *bkey = body;
+		bool now_grounded = (collided && to_godot(result.normal).y > 0.7f) || recover.y > 0.01f;
+		auto it = s_grounded.find(bkey);
+		bool was_grounded = (it != s_grounded.end() && it->second);
+		if (was_grounded && !collided && p_motion.y < -1e-4f) {
+			body->hop_solid->set_position(to_hop(from_pos));
+			hop::segment<hop_scalar> dseg;
+			dseg.set_start_end(to_hop(from_pos), to_hop(from_pos + Vector3(0, -2, 0)));
+			hop::collision<hop_scalar> dcol;
+			dcol.reset();
+			space->simulator->trace_solid(dcol, body->hop_solid.get(), dseg, body->collision_mask);
+			body->hop_solid->set_position(orig_pos);
+			bool found = to_godot_float(dcol.time) < 1.0f;
+			UtilityFunctions::print("[WW_LOG_FALL] left ground @", p_from.origin,
+				" motion=", p_motion, " recover=", recover, " sweptUnsafe=", unsafe,
+				" downReprobe=", found ? Variant(to_godot_float(dcol.time) * 2.0f) : Variant("NONE"),
+				" downN=", found ? to_godot(dcol.normal) : Vector3());
+		}
+		s_grounded[bkey] = now_grounded;
+	}
+
+	if (!collided && !recovered) {
+		// Free motion, no overlap.
 		if (p_result) {
 			p_result->travel = p_motion;
 			p_result->remainder = Vector3();
@@ -876,32 +1039,60 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		return false;
 	}
 
-	// Collision occurred
-	if (p_result) {
-		p_result->travel = p_motion * result_time;
-		p_result->remainder = p_motion * (1.0f - result_time);
-		p_result->collision_safe_fraction = result_time;
-		p_result->collision_unsafe_fraction = result_time;
-		p_result->collision_depth = 0.0f;
-		p_result->collision_count = 1;
-
-		auto &col = p_result->collisions[0];
-		col.position = to_godot(result.point);
-		col.normal = to_godot(result.normal);
-		col.depth = 0.0f;
-		col.local_shape = 0;
-
-		if (result.collidee) {
-			HopBodyData *other = static_cast<HopBodyData *>(result.collidee->get_user_data());
-			if (other) {
-				col.collider = other->self_rid;
-				col.collider_id = ObjectID(other->object_instance_id);
-				col.collider_shape = 0;
-				col.collider_velocity = other->linear_velocity;
-			}
-		}
+	// --- (3) Back the stopping point off by `margin` so a gap remains ---
+	float motion_len = p_motion.length();
+	float safe = unsafe;
+	if (collided && motion_len > 0.0f) {
+		safe = (unsafe * motion_len - margin) / motion_len;
+		if (safe < 0.0f) safe = 0.0f;
+		if (safe > unsafe) safe = unsafe;
 	}
-	return true;
+
+	if (p_result) {
+		Vector3 motion_travel = p_motion * safe;
+		// Recovery displacement is folded into travel so the body ends up
+		// depenetrated; the leftover motion is what move_and_slide will slide.
+		p_result->travel = recover + motion_travel;
+		p_result->remainder = p_motion - motion_travel;
+		p_result->collision_safe_fraction = safe;
+		p_result->collision_unsafe_fraction = unsafe;
+		p_result->collision_depth = recover_depth;
+
+		int count = 0;
+		int max_collisions = p_max_collisions > 0 ? p_max_collisions : 1;
+
+		// Fill one contact entry (other/velocity default to none for static hits).
+		auto add_collision = [&](const Vector3 &position, const Vector3 &normal, float depth, HopBodyData *other) {
+			auto &col = p_result->collisions[count];
+			col.position = position;
+			col.normal = normal;
+			col.depth = depth;
+			col.local_shape = 0;
+			col.collider_shape = 0;
+			col.collider = other ? other->self_rid : RID();
+			col.collider_id = other ? ObjectID(other->object_instance_id) : ObjectID();
+			col.collider_velocity = other ? other->linear_velocity : Vector3();
+			count++;
+		};
+
+		// Primary contact: the wall the swept motion stops against.
+		if (collided) {
+			HopBodyData *other = result.collidee
+				? static_cast<HopBodyData *>(result.collidee->get_user_data())
+				: nullptr;
+			add_collision(to_godot(result.point), to_godot(result.normal), 0.0f, other);
+		}
+
+		// Recovery contact: report the surface we pushed out of so callers that
+		// asked for it (is_on_floor / wall stability) see a stable contact.
+		if (p_recovery_as_collision && recovered && recover_normal != Vector3() && count < max_collisions) {
+			add_collision(from_pos, recover_normal, recover_depth, nullptr);
+		}
+
+		p_result->collision_count = count;
+	}
+
+	return collided || (p_recovery_as_collision && recovered);
 }
 
 PhysicsDirectBodyState3D *HopPhysicsServer::_body_get_direct_state(const RID &p_body) {
@@ -1178,6 +1369,7 @@ void HopPhysicsServer::_free_rid(const RID &p_rid) {
 		delete body;
 	} else if (area_owner.owns(p_rid)) {
 		HopAreaData *area = area_owner.get_or_null(p_rid);
+		remove_area_from_space(area);
 		area_owner.free(p_rid);
 		delete area;
 	} else if (space_owner.owns(p_rid)) {
@@ -1263,23 +1455,8 @@ void HopPhysicsServer::_step(float p_step) {
 			if (!area->space_rid.is_valid() || area->space_rid != body->space_rid) return;
 			if (!(area->collision_mask & body->hop_solid->get_collision_scope())) return;
 
-			bool has_box = false;
-			hop::aa_box<hop_scalar> area_wb;
-			for (auto &se : area->shapes) {
-				if (se.disabled) continue;
-				HopShapeData *sd = shape_owner.get_or_null(se.shape_rid);
-				if (!sd) continue;
-				auto hs = sd->make_hop_shape(se.local_xform);
-				if (!hs) continue;
-				hop::aa_box<hop_scalar> sb;
-				hs->get_bound(sb);
-				hop::vec3<hop_scalar> p = to_hop(area->transform.origin);
-				hop::add(sb.mins, p);
-				hop::add(sb.maxs, p);
-				if (!has_box) { area_wb = sb; has_box = true; }
-				else { area_wb.merge(sb.mins); area_wb.merge(sb.maxs); }
-			}
-			if (!has_box) return;
+			if (!area->hop_solid || area->hop_solid->get_shapes().empty()) return;
+			hop::aa_box<hop_scalar> area_wb = area->hop_solid->get_world_bound();
 			if (!hop::test_intersection(body_wb, area_wb)) return;
 
 			Vector3 ag = area->gravity_direction.normalized() * area->gravity;
@@ -1420,7 +1597,6 @@ void HopPhysicsServer::_step(float p_step) {
 	body_owner.for_each([&](HopBodyData *body) {
 		body->sync_from_hop();
 	});
-
 }
 
 void HopPhysicsServer::_sync() {
@@ -1449,39 +1625,9 @@ void HopPhysicsServer::_flush_queries() {
 		HopSpaceData *space = space_owner.get_or_null(area->space_rid);
 		if (!space) return;
 
-		// Compute the area's world AABB from its shapes
-		bool has_aabb = false;
-		hop::aa_box<hop_scalar> area_aabb;
-
-		for (int si = 0; si < (int)area->shapes.size(); si++) {
-			auto &entry = area->shapes[si];
-			if (entry.disabled) continue;
-
-			HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
-			if (!sd) continue;
-
-			// Build shape AABB at local transform
-			auto hs = sd->make_hop_shape(entry.local_xform);
-			if (!hs) continue;
-
-			hop::aa_box<hop_scalar> shape_box;
-			hs->get_bound(shape_box);
-
-			// Offset by area's world position
-			hop::vec3<hop_scalar> area_pos = to_hop(area->transform.origin);
-			add(shape_box.mins, area_pos);
-			add(shape_box.maxs, area_pos);
-
-			if (!has_aabb) {
-				area_aabb = shape_box;
-				has_aabb = true;
-			} else {
-				area_aabb.merge(shape_box.mins);
-				area_aabb.merge(shape_box.maxs);
-			}
-		}
-
-		if (!has_aabb) return;
+		// The area's world AABB comes straight off its persistent solid.
+		if (!area->hop_solid || area->hop_solid->get_shapes().empty()) return;
+		hop::aa_box<hop_scalar> area_aabb = area->hop_solid->get_world_bound();
 
 		// Find bodies overlapping the area's AABB
 		hop::solid<hop_scalar> *found[64];
@@ -1526,56 +1672,27 @@ void HopPhysicsServer::_flush_queries() {
 	area_owner.for_each([&](HopAreaData *detector) {
 		if (!detector->area_monitor_callback.is_valid()) return;
 		if (!detector->space_rid.is_valid()) return;
+		HopSpaceData *space = space_owner.get_or_null(detector->space_rid);
+		if (!space) return;
 
-		// Compute detector AABB
-		bool det_has_aabb = false;
-		hop::aa_box<hop_scalar> det_aabb;
-		for (auto &entry : detector->shapes) {
-			if (entry.disabled) continue;
-			HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
-			if (!sd) continue;
-			auto hs = sd->make_hop_shape(entry.local_xform);
-			if (!hs) continue;
-			hop::aa_box<hop_scalar> sb;
-			hs->get_bound(sb);
-			hop::vec3<hop_scalar> p = to_hop(detector->transform.origin);
-			add(sb.mins, p);
-			add(sb.maxs, p);
-			if (!det_has_aabb) { det_aabb = sb; det_has_aabb = true; }
-			else { det_aabb.merge(sb.mins); det_aabb.merge(sb.maxs); }
-		}
-		if (!det_has_aabb) return;
+		// Detector AABB from its persistent solid.
+		if (!detector->hop_solid || detector->hop_solid->get_shapes().empty()) return;
+		hop::aa_box<hop_scalar> det_aabb = detector->hop_solid->get_world_bound();
+
+		// Broadphase the area index instead of scanning every area: the candidates
+		// it returns already passed the AABB-overlap test against det_aabb, and are
+		// all in this space (area_bvh is per-space).
+		hop::solid<hop_scalar> *cand[256];
+		int n = space->area_bvh.find_solids_in_aa_box(det_aabb, cand, 256);
 
 		std::map<uint64_t, RID> current_area_overlaps;
-		area_owner.for_each([&](HopAreaData *target) {
-			if (target == detector) return;
-			if (!target->monitorable) return;
-			if (target->space_rid != detector->space_rid) return;
-			if (!(detector->collision_mask & target->collision_layer)) return;
-
-			// Compute target AABB and check intersection
-			bool tgt_has_aabb = false;
-			hop::aa_box<hop_scalar> tgt_aabb;
-			for (auto &entry : target->shapes) {
-				if (entry.disabled) continue;
-				HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
-				if (!sd) continue;
-				auto hs = sd->make_hop_shape(entry.local_xform);
-				if (!hs) continue;
-				hop::aa_box<hop_scalar> sb;
-				hs->get_bound(sb);
-				hop::vec3<hop_scalar> p = to_hop(target->transform.origin);
-				add(sb.mins, p);
-				add(sb.maxs, p);
-				if (!tgt_has_aabb) { tgt_aabb = sb; tgt_has_aabb = true; }
-				else { tgt_aabb.merge(sb.mins); tgt_aabb.merge(sb.maxs); }
-			}
-			if (!tgt_has_aabb) return;
-
-			if (hop::test_intersection(det_aabb, tgt_aabb)) {
-				current_area_overlaps[target->object_instance_id] = target->self_rid;
-			}
-		});
+		for (int i = 0; i < n; i++) {
+			HopAreaData *target = static_cast<HopAreaData *>(cand[i]->get_user_data());
+			if (!target || target == detector) continue;
+			if (!target->monitorable) continue;
+			if (!(detector->collision_mask & target->collision_layer)) continue;
+			current_area_overlaps[target->object_instance_id] = target->self_rid;
+		}
 
 		// Fire ADDED callbacks for newly overlapping areas
 		for (auto &[id, rid] : current_area_overlaps) {

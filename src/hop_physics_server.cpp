@@ -1028,6 +1028,39 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 
 	space->simulator->set_average_normals(saved_avg);
 
+	// --- (2b) Ground probe: detect the floor the body is resting on, independent
+	// of the motion direction.  The motion-aligned cast above only sees the floor
+	// when the motion points at it; it misses it whenever the motion is tangential
+	// (running/strafing along a wall) or near-zero (just landed) — which is exactly
+	// when is_on_floor(), and therefore the ability to jump, would wrongly drop
+	// out.  Cast a short sweep straight down (along gravity) from the recovered
+	// position; a hit becomes an extra resting contact reported below.  Skipped
+	// while moving against gravity so a jump reads as airborne immediately.
+	bool ground_hit = false;
+	Vector3 ground_point;
+	Vector3 ground_normal;
+	if (p_recovery_as_collision) {
+		Vector3 gvec = to_godot(space->simulator->get_gravity());
+		float glen = gvec.length();
+		if (glen > 0.0f && p_motion.dot(gvec / glen) >= -1e-4f) {
+			Vector3 down = gvec / glen;
+			// Cover the `margin` resting gap (step 3) with slack for numerics.
+			float probe_dist = std::max(margin * 2.0f, 0.02f);
+			body->hop_solid->set_position(to_hop(from_pos));
+			hop::segment<hop_scalar> gseg;
+			gseg.set_start_end(to_hop(from_pos), to_hop(from_pos + down * probe_dist));
+			space->simulator->set_average_normals(false);
+			hop::collision<hop_scalar> gres;
+			space->simulator->trace_solid(gres, body->hop_solid.get(), gseg, body->collision_mask);
+			space->simulator->set_average_normals(saved_avg);
+			if (to_godot_float(gres.time) < 1.0f) {
+				ground_hit = true;
+				ground_point = to_godot(gres.point);
+				ground_normal = to_godot(gres.normal);
+			}
+		}
+	}
+
 	// Restore the authoritative position (this is a const query).
 	body->hop_solid->set_position(orig_pos);
 
@@ -1043,7 +1076,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	bool recovered = recover != Vector3();
 	bool collided = probe_time < 1.0f;
 
-	if (!collided && !recovered) {
+	if (!collided && !recovered && !ground_hit) {
 		// Free motion, no overlap.
 		if (p_result) {
 			p_result->travel = p_motion;
@@ -1105,10 +1138,18 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			add_collision(from_pos, recover_normal, recover_depth, nullptr);
 		}
 
+		// Ground-rest contact: the floor found by the gravity-down probe, reported
+		// as a zero-depth touch (it never pushes the body) so is_on_floor() stays
+		// true while the swept motion is sliding along a wall or has just stopped
+		// after a landing.  CharacterBody3D still classifies floor-vs-wall by angle.
+		if (ground_hit && ground_normal != Vector3() && count < max_collisions) {
+			add_collision(ground_point, ground_normal, 0.0f, nullptr);
+		}
+
 		p_result->collision_count = count;
 	}
 
-	return collided || (p_recovery_as_collision && recovered);
+	return collided || (p_recovery_as_collision && recovered) || ground_hit;
 }
 
 PhysicsDirectBodyState3D *HopPhysicsServer::_body_get_direct_state(const RID &p_body) {

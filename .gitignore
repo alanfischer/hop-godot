@@ -1,4 +1,5 @@
 build/
+build-*/
 addons/hop-physics/bin/*.dylib
 addons/hop-physics/bin/*.so
 addons/hop-physics/bin/*.dll

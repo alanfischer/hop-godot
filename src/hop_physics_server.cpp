@@ -1124,10 +1124,19 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			count++;
 		};
 
-		// Primary contact: the wall the swept motion stops against.
+		// Primary contact: the wall the swept motion stops against. test_solid
+		// records the hit partner in `collider` (it sets col.collider = the other
+		// solid and leaves collidee null on the swept-query path), so read that —
+		// falling back to collidee for any path using the opposite convention, and
+		// excluding self. Without this, move_and_collide().get_collider() came back
+		// null/RID(0) for every static hit (worldspawn trimesh AND brush-entity
+		// convex), since the old code read the always-null collidee.
 		if (collided) {
-			HopBodyData *other = result.collidee
-				? static_cast<HopBodyData *>(result.collidee->get_user_data())
+			hop::solid<hop_scalar> *hit = result.collider;
+			if (hit == nullptr || hit == body->hop_solid.get())
+				hit = result.collidee;
+			HopBodyData *other = (hit != nullptr && hit != body->hop_solid.get())
+				? static_cast<HopBodyData *>(hit->get_user_data())
 				: nullptr;
 			add_collision(to_godot(result.point), to_godot(result.normal), 0.0f, other);
 		}

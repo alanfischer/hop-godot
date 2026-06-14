@@ -96,11 +96,44 @@ static bool build_convex_solid_from_points(
 		}
 	}
 
-	if (planes.size() < 4) return false;
+	// Always clamp to the point-cloud AABB. A hop::convex_solid is the intersection
+	// of its half-spaces and is UNBOUNDED unless the extracted planes fully enclose
+	// it. The triplet/epsilon face extraction above misses a cap whenever a face's
+	// vertices aren't coplanar — e.g. ww_2fort's elevator guide-post, whose bottom
+	// 4 verts are skewed ~5u, leaving the -Y face open so the solid extended to
+	// infinity and walled off the lift approach. The 6 axis-aligned bounding planes
+	// can never clip the true hull (every vertex is inside its own AABB), so they
+	// only remove the spurious unbounded extension. (Slivers are dropped earlier in
+	// make_hop_shape; this clamp is what keeps legitimately-kept thin cells bounded.)
+	Vector3 mn = points[0] + origin;
+	Vector3 mx = mn;
+	for (int i = 1; i < count; ++i) {
+		Vector3 p = points[i] + origin;
+		mn = mn.min(p);
+		mx = mx.max(p);
+	}
+	planes.push_back({ Vector3( 1, 0, 0),  mx.x });
+	planes.push_back({ Vector3(-1, 0, 0), -mn.x });
+	planes.push_back({ Vector3( 0, 1, 0),  mx.y });
+	planes.push_back({ Vector3( 0,-1, 0), -mn.y });
+	planes.push_back({ Vector3( 0, 0, 1),  mx.z });
+	planes.push_back({ Vector3( 0, 0,-1), -mn.z });
 
 	for (auto &pf : planes) {
 		out.planes.push_back(hop::plane<hop_scalar>(
 			to_hop(pf.normal), to_hop_scalar(pf.distance)));
+	}
+
+	// Pre-populate the vertex cache with the ACTUAL input hull points. hop's
+	// convex_solid normally derives its vertices lazily from the planes (plane
+	// triple-intersections), but that enumeration produces wrong/far vertices when
+	// the extracted plane set is ill-conditioned or fails to fully enclose the hull
+	// (a thin/skewed cell's missing cap) — and support()/get_bound() run off those
+	// vertices, so the solid collides where no surface is (ww_2fort's elevator
+	// guide-post phantom-walled the lift approach). Seeding vertices with the real
+	// points makes collision use the true, bounded hull regardless of plane health.
+	for (int i = 0; i < count; ++i) {
+		out.vertices.push_back(to_hop(points[i] + origin));
 	}
 	return true;
 }
@@ -149,11 +182,8 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 			if (points.size() < 4) {
 				return nullptr;
 			}
-			hop::convex_solid<hop_scalar> cs;
-			if (build_convex_solid_from_points(points.ptr(), points.size(), origin, cs)) {
-				return std::make_shared<hop::shape<hop_scalar>>(cs);
-			}
-			// Fallback to AABB if plane extraction fails
+
+			// AABB of the hull (in the shape's local+offset frame).
 			Vector3 mn = points[0] + origin;
 			Vector3 mx = mn;
 			for (int i = 1; i < points.size(); i++) {
@@ -161,6 +191,50 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 				mn = mn.min(p);
 				mx = mx.max(p);
 			}
+			Vector3 ext = mx - mn;
+			const float MIN_DIM = 0.2f; // 8 game units
+			int thin = int(ext.x < MIN_DIM) + int(ext.y < MIN_DIM) + int(ext.z < MIN_DIM);
+
+			// "Rod" cells — thin on 2+ axes (e.g. ww_2fort's 886u elevator guide-
+			// post). The triplet plane extraction leaves these unbounded whenever a
+			// cap face's verts aren't coplanar, and the plane-based capsule sweep
+			// (trace_convex_solid) then treats the solid as extending to infinity —
+			// phantom-walling nearby geometry (this was the lift's 52u wall). A
+			// rod's AABB is a faithful box (it is ~axis-aligned) and aa_box
+			// collision is exact and bounded, so emit a box instead of a convex.
+			if (thin >= 2) {
+				hop::aa_box<hop_scalar> box(to_hop(mn), to_hop(mx));
+				return std::make_shared<hop::shape<hop_scalar>>(box);
+			}
+
+			// Degenerate skewed "slivers" — fat AABB (thin on no axis) yet vertices
+			// at only <=2 opposite corners: near-zero volume, no real surface. The
+			// BSP-leaf decomposition emits several of these; they have no business
+			// colliding (Godot's hull builder discards them too). Drop them.
+			if (thin == 0) {
+				const float tol = 0.15f * ext.length();
+				int occupied = 0;
+				for (int cx = 0; cx < 2; cx++)
+					for (int cy = 0; cy < 2; cy++)
+						for (int cz = 0; cz < 2; cz++) {
+							Vector3 corner(cx ? mx.x : mn.x, cy ? mx.y : mn.y, cz ? mx.z : mn.z);
+							for (int i = 0; i < points.size(); i++) {
+								if ((points[i] + origin).distance_to(corner) < tol) {
+									occupied++;
+									break;
+								}
+							}
+						}
+				if (occupied <= 2) {
+					return nullptr;
+				}
+			}
+
+			hop::convex_solid<hop_scalar> cs;
+			if (build_convex_solid_from_points(points.ptr(), points.size(), origin, cs)) {
+				return std::make_shared<hop::shape<hop_scalar>>(cs);
+			}
+			// Fallback to AABB if plane extraction fails.
 			hop::aa_box<hop_scalar> box(to_hop(mn), to_hop(mx));
 			return std::make_shared<hop::shape<hop_scalar>>(box);
 		}

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/vector3.hpp>
 #include <godot_cpp/variant/packed_vector3_array.hpp>
@@ -55,5 +56,12 @@ struct HopSpaceData {
 		// Default every body to the speculative solve (matches the old global
 		// set_speculative_contacts(true); per-body overridable via set_contact_mode).
 		simulator->set_default_contact_mode(hop::contact_mode::speculative);
+		// Narrowphase accuracy for rounded-vs-polytope pairs: accurate GJK
+		// (default) vs the cheap inflate/AABB path. Pick via the project setting
+		// "physics/hop/accurate_narrowphase" (bool); absent => true.
+		bool accurate = true;
+		if (ProjectSettings *ps = ProjectSettings::get_singleton())
+			accurate = ps->get_setting("physics/hop/accurate_narrowphase", true);
+		simulator->set_accurate_narrowphase(accurate);
 	}
 };

@@ -222,125 +222,16 @@ private:
 			return T(1e-6);
 	}
 
-	static T clamp01(T v) {
-		if (v < T{}) return T{};
-		if (v > tr::one()) return tr::one();
-		return v;
-	}
-
-	// Closest point on triangle (a,b,c) to point p. Ericson, Real-Time Collision
-	// Detection §5.1.5 (Voronoi-region test).
-	static hop::vec3<T> closest_pt_point_triangle(const hop::vec3<T> & p,
-	        const hop::vec3<T> & a, const hop::vec3<T> & b, const hop::vec3<T> & c) {
-		const T zero{};
-		hop::vec3<T> ab, ac, ap, tmp, closest;
-		hop::sub(ab, b, a); hop::sub(ac, c, a); hop::sub(ap, p, a);
-		T d1 = hop::dot(ab, ap), d2 = hop::dot(ac, ap);
-		if (d1 <= zero && d2 <= zero) return a;                 // vertex A
-		hop::vec3<T> bp; hop::sub(bp, p, b);
-		T d3 = hop::dot(ab, bp), d4 = hop::dot(ac, bp);
-		if (d3 >= zero && d4 <= d3) return b;                   // vertex B
-		T vc = d1 * d4 - d3 * d2;
-		if (vc <= zero && d1 >= zero && d3 <= zero) {           // edge AB
-			T v = d1 / (d1 - d3);
-			hop::mul(tmp, ab, v); hop::add(closest, a, tmp); return closest;
-		}
-		hop::vec3<T> cp; hop::sub(cp, p, c);
-		T d5 = hop::dot(ab, cp), d6 = hop::dot(ac, cp);
-		if (d6 >= zero && d5 <= d6) return c;                   // vertex C
-		T vb = d5 * d2 - d1 * d6;
-		if (vb <= zero && d2 >= zero && d6 <= zero) {           // edge AC
-			T w = d2 / (d2 - d6);
-			hop::mul(tmp, ac, w); hop::add(closest, a, tmp); return closest;
-		}
-		T va = d3 * d6 - d5 * d4;
-		if (va <= zero && (d4 - d3) >= zero && (d5 - d6) >= zero) { // edge BC
-			T w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-			hop::vec3<T> bc; hop::sub(bc, c, b);
-			hop::mul(tmp, bc, w); hop::add(closest, b, tmp); return closest;
-		}
-		T denom = tr::one() / (va + vb + vc);                  // face interior
-		T v = vb * denom, w = vc * denom;
-		hop::mul(tmp, ab, v); hop::add(closest, a, tmp);
-		hop::mul(tmp, ac, w); hop::add(closest, tmp);
-		return closest;
-	}
-
-	// Closest points c1,c2 between segments [p1,q1] and [p2,q2]. Ericson §5.1.9.
-	static void closest_pt_segment_segment(const hop::vec3<T> & p1, const hop::vec3<T> & q1,
-	        const hop::vec3<T> & p2, const hop::vec3<T> & q2,
-	        hop::vec3<T> & c1, hop::vec3<T> & c2) {
-		const T zero{};
-		const T eps = contact_eps();
-		hop::vec3<T> d1, d2, r;
-		hop::sub(d1, q1, p1);
-		hop::sub(d2, q2, p2);
-		hop::sub(r, p1, p2);
-		T a = hop::dot(d1, d1);
-		T e = hop::dot(d2, d2);
-		T f = hop::dot(d2, r);
-		T s, t;
-		if (a <= eps && e <= eps) {
-			s = zero; t = zero;
-		} else if (a <= eps) {
-			s = zero; t = clamp01(f / e);
-		} else {
-			T c = hop::dot(d1, r);
-			if (e <= eps) {
-				t = zero; s = clamp01(-c / a);
-			} else {
-				T b = hop::dot(d1, d2);
-				T denom = a * e - b * b;
-				s = (denom != zero) ? clamp01((b * f - c * e) / denom) : zero;
-				t = (b * s + f) / e;
-				if (t < zero) { t = zero; s = clamp01(-c / a); }
-				else if (t > tr::one()) { t = tr::one(); s = clamp01((b - c) / a); }
-			}
-		}
-		hop::vec3<T> tmp;
-		hop::mul(tmp, d1, s); hop::add(c1, p1, tmp);
-		hop::mul(tmp, d2, t); hop::add(c2, p2, tmp);
-	}
-
 	// Squared closest distance between segment (p,q) and triangle tri_idx, with
-	// the closest point on the segment (cs) and on the triangle (ct). Considers
-	// the spine-pierces-triangle case (distance 0), both spine endpoints vs the
-	// triangle, and the spine vs each of the three edges.
+	// the closest point on the segment (cs) and on the triangle (ct). Thin wrapper
+	// over hop::closest_segment_triangle (the pure-geometry routine in math/) — it
+	// handles the spine-pierces, endpoint-vs-triangle, and spine-vs-edge cases and
+	// reuses hop::project for the edge tests.
 	T closest_seg_triangle(const hop::vec3<T> & p, const hop::vec3<T> & q, int tri_idx,
 	        hop::vec3<T> & cs, hop::vec3<T> & ct) const {
-		auto & tri = tris_[tri_idx];
-		const auto & a = verts_[tri.i0];
-		const auto & b = verts_[tri.i1];
-		const auto & c = verts_[tri.i2];
-
-		// Spine pierces the triangle interior → distance 0.
-		const auto & fn = normals_[tri_idx];
-		hop::vec3<T> pq; hop::sub(pq, q, p);
-		T denom = hop::dot(fn, pq);
-		if (denom > contact_eps() || denom < -contact_eps()) {
-			hop::vec3<T> ap; hop::sub(ap, a, p);
-			T tt = hop::dot(fn, ap) / denom;
-			if (tt >= T{} && tt <= tr::one()) {
-				hop::vec3<T> x; hop::mul(x, pq, tt); hop::add(x, p);
-				if (point_in_triangle(x, tri_idx)) { cs = x; ct = x; return T{}; }
-			}
-		}
-
-		auto consider = [&](const hop::vec3<T> & sp, const hop::vec3<T> & tp,
-		                    T & best, bool & have) {
-			hop::vec3<T> diff; hop::sub(diff, sp, tp);
-			T d2 = hop::length_squared(diff);
-			if (!have || d2 < best) { best = d2; cs = sp; ct = tp; have = true; }
-		};
-
-		T best{}; bool have = false;
-		hop::vec3<T> tp, sc, tc;
-		tp = closest_pt_point_triangle(p, a, b, c); consider(p, tp, best, have);
-		tp = closest_pt_point_triangle(q, a, b, c); consider(q, tp, best, have);
-		closest_pt_segment_segment(p, q, a, b, sc, tc); consider(sc, tc, best, have);
-		closest_pt_segment_segment(p, q, b, c, sc, tc); consider(sc, tc, best, have);
-		closest_pt_segment_segment(p, q, c, a, sc, tc); consider(sc, tc, best, have);
-		return best;
+		const auto & tri = tris_[tri_idx];
+		return hop::closest_segment_triangle(p, q, verts_[tri.i0], verts_[tri.i1],
+		                                     verts_[tri.i2], cs, ct, contact_eps());
 	}
 
 	// Static-overlap recovery of a capsule against one triangle, one-sided to the

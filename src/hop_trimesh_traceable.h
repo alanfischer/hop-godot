@@ -181,14 +181,12 @@ public:
 					const auto & cap = sh->get_capsule();
 					hop::add(p1, base, cap.origin);
 					hop::add(p2, p1, cap.direction);
-					T toi;
-					hop::vec3<T> n;
-					if (sweep_capsule_triangle(tri_idx, p1, p2, seg.direction,
-					                           cap.radius, margin, result.time, toi, n)) {
-						result.time = toi;
-						hop::mul(result.point, seg.direction, toi);
+					auto sweep = sweep_capsule_triangle(tri_idx, p1, p2, seg.direction, cap.radius, margin);
+					if (sweep.hit && sweep.time < result.time) {
+						result.time = sweep.time;
+						hop::mul(result.point, seg.direction, sweep.time);
 						hop::add(result.point, seg.origin);
-						result.normal = n;
+						result.normal = sweep.normal;
 					}
 				} else {
 					sweep_support_plane(tri_idx, sh, local_origin, seg, result);
@@ -392,52 +390,37 @@ private:
 		return true;
 	}
 
-	// Conservative-advancement swept contact of a capsule (spine p1..p2 at t=0,
-	// radius) moving by `dir` against one triangle. Distance-based, hence two-
-	// sided: it stops the capsule at the surface from whichever side it
-	// approaches, so the BSP's mixed-winding ramp has no holes. Returns true and
-	// fills the time-of-impact (in [0,1]) + contact normal if it hits before
-	// `result_time` while moving INTO the surface.
-	bool sweep_capsule_triangle(int tri_idx, const hop::vec3<T> & p1_0,
-	        const hop::vec3<T> & p2_0, const hop::vec3<T> & dir, T radius, T margin,
-	        T result_time, T & out_t, hop::vec3<T> & out_normal) const {
-		T speed = tr::sqrt(hop::dot(dir, dir));
-		if (speed <= contact_eps()) return false;
-		T thresh = radius + margin; // stop this far from the true surface
-
-		T t = T{};
-		const int MAX_CA = 32;
-		hop::vec3<T> off, p1, p2, cs, ct;
-		for (int it = 0; it < MAX_CA; ++it) {
-			if (t >= result_time) return false; // a nearer contact already wins
-			hop::mul(off, dir, t);
-			hop::add(p1, p1_0, off);
-			hop::add(p2, p2_0, off);
-
-			T d2 = closest_seg_triangle(p1, p2, tri_idx, cs, ct);
-			T d = tr::sqrt(d2);
-			T gap = d - thresh;
-			if (gap <= contact_eps()) {
-				// Contact at parameter t. Normal points from the surface toward the
-				// capsule spine (so it opposes the approach for clean sliding).
-				hop::vec3<T> n;
-				if (d > contact_eps()) {
-					hop::sub(n, cs, ct);
-					hop::mul(n, tr::one() / d);
-				} else {
-					n = normals_[tri_idx];
-					if (hop::dot(n, dir) > T{}) hop::neg(n);
-				}
-				// Only block if actually moving INTO the surface — a body resting on
-				// or grazing along the face (dot≈0) or separating slides freely.
-				if (hop::dot(n, dir) >= -contact_eps()) return false;
-				out_t = t;
-				out_normal = n;
-				return true;
-			}
-			t += gap / speed; // conservative: the gap can't close faster than `speed`
-		}
-		return false;
+	// Swept capsule-vs-triangle contact. The conservative-advancement loop and its
+	// swept-contact semantics (penetration, the block-only-when-approaching rule,
+	// tolerance, undershoot) are shared with the convex/GJK path via
+	// hop::conservative_advance; the closest-point *method* here is an analytic
+	// segment-vs-triangle test — the right tool for a triangle, where iterative GJK
+	// would only approximate it. Distance-based, hence two-sided: it stops the
+	// capsule from whichever side it approaches, so the BSP's mixed-winding ramp
+	// has no holes. Fills hit + time-of-impact + contact normal.
+	hop::gjk_sweep_result<T> sweep_capsule_triangle(int tri_idx, const hop::vec3<T> & p1_0,
+	        const hop::vec3<T> & p2_0, const hop::vec3<T> & dir, T radius, T margin) const {
+		hop::gjk_sweep_result<T> res;
+		hop::conservative_advance<T>(res, dir, radius + margin, contact_eps(),
+		    [&](const hop::vec3<T> & xA, const hop::vec3<T> & /*seed*/,
+		        T & dist, hop::vec3<T> & n, bool & deep) {
+			    deep = false; // closest_seg_triangle is exact; never a degenerate simplex
+			    hop::vec3<T> p1, p2, cs, ct;
+			    hop::add(p1, p1_0, xA);
+			    hop::add(p2, p2_0, xA);
+			    dist = tr::sqrt(closest_seg_triangle(p1, p2, tri_idx, cs, ct));
+			    // Normal: from the surface toward the capsule spine (opposes approach).
+			    // Degenerate when the spine pierces the face (d≈0) — fall back to the
+			    // stored face normal, oriented against the motion.
+			    if (dist > contact_eps()) {
+				    hop::sub(n, cs, ct);
+				    hop::mul(n, tr::one() / dist);
+			    } else {
+				    n = normals_[tri_idx];
+				    if (hop::dot(n, dir) > T{}) hop::neg(n);
+			    }
+		    });
+		return res;
 	}
 
 	// --- Non-capsule (box/sphere) fallback: winding-agnostic support-plane ---

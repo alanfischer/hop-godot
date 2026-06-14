@@ -181,14 +181,21 @@ public:
 					const auto & cap = sh->get_capsule();
 					hop::add(p1, base, cap.origin);
 					hop::add(p2, p1, cap.direction);
-					T toi;
-					hop::vec3<T> n;
-					if (sweep_capsule_triangle(tri_idx, p1, p2, seg.direction,
-					                           cap.radius, margin, result.time, toi, n)) {
-						result.time = toi;
-						hop::mul(result.point, seg.direction, toi);
+					auto sweep = sweep_capsule_triangle(tri_idx, p1, p2, seg.direction, cap.radius, margin);
+					// Take the earliest impact; among equal-time (overlapping, t==0)
+					// contacts take the deepest. Crucially, propagate sweep.depth: at a
+					// resting/penetrating start the contact is reported at t==0 with the
+					// overlap depth, and the speculative solver derives the contact
+					// separation from it. Dropping it (as the old sweep did, which computed
+					// no depth) left every trimesh contact reading depth 0, so a dynamic
+					// body's penetration was never corrected and it sank through the floor.
+					if (sweep.hit && (sweep.time < result.time ||
+					                  (sweep.time == result.time && sweep.depth > result.depth))) {
+						result.time = sweep.time;
+						result.depth = sweep.depth;
+						hop::mul(result.point, seg.direction, sweep.time);
 						hop::add(result.point, seg.origin);
-						result.normal = n;
+						result.normal = sweep.normal;
 					}
 				} else {
 					sweep_support_plane(tri_idx, sh, local_origin, seg, result);
@@ -224,125 +231,16 @@ private:
 			return T(1e-6);
 	}
 
-	static T clamp01(T v) {
-		if (v < T{}) return T{};
-		if (v > tr::one()) return tr::one();
-		return v;
-	}
-
-	// Closest point on triangle (a,b,c) to point p. Ericson, Real-Time Collision
-	// Detection §5.1.5 (Voronoi-region test).
-	static hop::vec3<T> closest_pt_point_triangle(const hop::vec3<T> & p,
-	        const hop::vec3<T> & a, const hop::vec3<T> & b, const hop::vec3<T> & c) {
-		const T zero{};
-		hop::vec3<T> ab, ac, ap, tmp, closest;
-		hop::sub(ab, b, a); hop::sub(ac, c, a); hop::sub(ap, p, a);
-		T d1 = hop::dot(ab, ap), d2 = hop::dot(ac, ap);
-		if (d1 <= zero && d2 <= zero) return a;                 // vertex A
-		hop::vec3<T> bp; hop::sub(bp, p, b);
-		T d3 = hop::dot(ab, bp), d4 = hop::dot(ac, bp);
-		if (d3 >= zero && d4 <= d3) return b;                   // vertex B
-		T vc = d1 * d4 - d3 * d2;
-		if (vc <= zero && d1 >= zero && d3 <= zero) {           // edge AB
-			T v = d1 / (d1 - d3);
-			hop::mul(tmp, ab, v); hop::add(closest, a, tmp); return closest;
-		}
-		hop::vec3<T> cp; hop::sub(cp, p, c);
-		T d5 = hop::dot(ab, cp), d6 = hop::dot(ac, cp);
-		if (d6 >= zero && d5 <= d6) return c;                   // vertex C
-		T vb = d5 * d2 - d1 * d6;
-		if (vb <= zero && d2 >= zero && d6 <= zero) {           // edge AC
-			T w = d2 / (d2 - d6);
-			hop::mul(tmp, ac, w); hop::add(closest, a, tmp); return closest;
-		}
-		T va = d3 * d6 - d5 * d4;
-		if (va <= zero && (d4 - d3) >= zero && (d5 - d6) >= zero) { // edge BC
-			T w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-			hop::vec3<T> bc; hop::sub(bc, c, b);
-			hop::mul(tmp, bc, w); hop::add(closest, b, tmp); return closest;
-		}
-		T denom = tr::one() / (va + vb + vc);                  // face interior
-		T v = vb * denom, w = vc * denom;
-		hop::mul(tmp, ab, v); hop::add(closest, a, tmp);
-		hop::mul(tmp, ac, w); hop::add(closest, tmp);
-		return closest;
-	}
-
-	// Closest points c1,c2 between segments [p1,q1] and [p2,q2]. Ericson §5.1.9.
-	static void closest_pt_segment_segment(const hop::vec3<T> & p1, const hop::vec3<T> & q1,
-	        const hop::vec3<T> & p2, const hop::vec3<T> & q2,
-	        hop::vec3<T> & c1, hop::vec3<T> & c2) {
-		const T zero{};
-		const T eps = contact_eps();
-		hop::vec3<T> d1, d2, r;
-		hop::sub(d1, q1, p1);
-		hop::sub(d2, q2, p2);
-		hop::sub(r, p1, p2);
-		T a = hop::dot(d1, d1);
-		T e = hop::dot(d2, d2);
-		T f = hop::dot(d2, r);
-		T s, t;
-		if (a <= eps && e <= eps) {
-			s = zero; t = zero;
-		} else if (a <= eps) {
-			s = zero; t = clamp01(f / e);
-		} else {
-			T c = hop::dot(d1, r);
-			if (e <= eps) {
-				t = zero; s = clamp01(-c / a);
-			} else {
-				T b = hop::dot(d1, d2);
-				T denom = a * e - b * b;
-				s = (denom != zero) ? clamp01((b * f - c * e) / denom) : zero;
-				t = (b * s + f) / e;
-				if (t < zero) { t = zero; s = clamp01(-c / a); }
-				else if (t > tr::one()) { t = tr::one(); s = clamp01((b - c) / a); }
-			}
-		}
-		hop::vec3<T> tmp;
-		hop::mul(tmp, d1, s); hop::add(c1, p1, tmp);
-		hop::mul(tmp, d2, t); hop::add(c2, p2, tmp);
-	}
-
 	// Squared closest distance between segment (p,q) and triangle tri_idx, with
-	// the closest point on the segment (cs) and on the triangle (ct). Considers
-	// the spine-pierces-triangle case (distance 0), both spine endpoints vs the
-	// triangle, and the spine vs each of the three edges.
+	// the closest point on the segment (cs) and on the triangle (ct). Thin wrapper
+	// over hop::closest_segment_triangle (the pure-geometry routine in math/) — it
+	// handles the spine-pierces, endpoint-vs-triangle, and spine-vs-edge cases and
+	// reuses hop::project for the edge tests.
 	T closest_seg_triangle(const hop::vec3<T> & p, const hop::vec3<T> & q, int tri_idx,
 	        hop::vec3<T> & cs, hop::vec3<T> & ct) const {
-		auto & tri = tris_[tri_idx];
-		const auto & a = verts_[tri.i0];
-		const auto & b = verts_[tri.i1];
-		const auto & c = verts_[tri.i2];
-
-		// Spine pierces the triangle interior → distance 0.
-		const auto & fn = normals_[tri_idx];
-		hop::vec3<T> pq; hop::sub(pq, q, p);
-		T denom = hop::dot(fn, pq);
-		if (denom > contact_eps() || denom < -contact_eps()) {
-			hop::vec3<T> ap; hop::sub(ap, a, p);
-			T tt = hop::dot(fn, ap) / denom;
-			if (tt >= T{} && tt <= tr::one()) {
-				hop::vec3<T> x; hop::mul(x, pq, tt); hop::add(x, p);
-				if (point_in_triangle(x, tri_idx)) { cs = x; ct = x; return T{}; }
-			}
-		}
-
-		auto consider = [&](const hop::vec3<T> & sp, const hop::vec3<T> & tp,
-		                    T & best, bool & have) {
-			hop::vec3<T> diff; hop::sub(diff, sp, tp);
-			T d2 = hop::length_squared(diff);
-			if (!have || d2 < best) { best = d2; cs = sp; ct = tp; have = true; }
-		};
-
-		T best{}; bool have = false;
-		hop::vec3<T> tp, sc, tc;
-		tp = closest_pt_point_triangle(p, a, b, c); consider(p, tp, best, have);
-		tp = closest_pt_point_triangle(q, a, b, c); consider(q, tp, best, have);
-		closest_pt_segment_segment(p, q, a, b, sc, tc); consider(sc, tc, best, have);
-		closest_pt_segment_segment(p, q, b, c, sc, tc); consider(sc, tc, best, have);
-		closest_pt_segment_segment(p, q, c, a, sc, tc); consider(sc, tc, best, have);
-		return best;
+		const auto & tri = tris_[tri_idx];
+		return hop::closest_segment_triangle(p, q, verts_[tri.i0], verts_[tri.i1],
+		                                     verts_[tri.i2], cs, ct, contact_eps());
 	}
 
 	// Static-overlap recovery of a capsule against one triangle, one-sided to the
@@ -392,52 +290,37 @@ private:
 		return true;
 	}
 
-	// Conservative-advancement swept contact of a capsule (spine p1..p2 at t=0,
-	// radius) moving by `dir` against one triangle. Distance-based, hence two-
-	// sided: it stops the capsule at the surface from whichever side it
-	// approaches, so the BSP's mixed-winding ramp has no holes. Returns true and
-	// fills the time-of-impact (in [0,1]) + contact normal if it hits before
-	// `result_time` while moving INTO the surface.
-	bool sweep_capsule_triangle(int tri_idx, const hop::vec3<T> & p1_0,
-	        const hop::vec3<T> & p2_0, const hop::vec3<T> & dir, T radius, T margin,
-	        T result_time, T & out_t, hop::vec3<T> & out_normal) const {
-		T speed = tr::sqrt(hop::dot(dir, dir));
-		if (speed <= contact_eps()) return false;
-		T thresh = radius + margin; // stop this far from the true surface
-
-		T t = T{};
-		const int MAX_CA = 32;
-		hop::vec3<T> off, p1, p2, cs, ct;
-		for (int it = 0; it < MAX_CA; ++it) {
-			if (t >= result_time) return false; // a nearer contact already wins
-			hop::mul(off, dir, t);
-			hop::add(p1, p1_0, off);
-			hop::add(p2, p2_0, off);
-
-			T d2 = closest_seg_triangle(p1, p2, tri_idx, cs, ct);
-			T d = tr::sqrt(d2);
-			T gap = d - thresh;
-			if (gap <= contact_eps()) {
-				// Contact at parameter t. Normal points from the surface toward the
-				// capsule spine (so it opposes the approach for clean sliding).
-				hop::vec3<T> n;
-				if (d > contact_eps()) {
-					hop::sub(n, cs, ct);
-					hop::mul(n, tr::one() / d);
-				} else {
-					n = normals_[tri_idx];
-					if (hop::dot(n, dir) > T{}) hop::neg(n);
-				}
-				// Only block if actually moving INTO the surface — a body resting on
-				// or grazing along the face (dot≈0) or separating slides freely.
-				if (hop::dot(n, dir) >= -contact_eps()) return false;
-				out_t = t;
-				out_normal = n;
-				return true;
-			}
-			t += gap / speed; // conservative: the gap can't close faster than `speed`
-		}
-		return false;
+	// Swept capsule-vs-triangle contact. The conservative-advancement loop and its
+	// swept-contact semantics (penetration, the block-only-when-approaching rule,
+	// tolerance, undershoot) are shared with the convex/GJK path via
+	// hop::conservative_advance; the closest-point *method* here is an analytic
+	// segment-vs-triangle test — the right tool for a triangle, where iterative GJK
+	// would only approximate it. Distance-based, hence two-sided: it stops the
+	// capsule from whichever side it approaches, so the BSP's mixed-winding ramp
+	// has no holes. Fills hit + time-of-impact + contact normal.
+	hop::gjk_sweep_result<T> sweep_capsule_triangle(int tri_idx, const hop::vec3<T> & p1_0,
+	        const hop::vec3<T> & p2_0, const hop::vec3<T> & dir, T radius, T margin) const {
+		hop::gjk_sweep_result<T> res;
+		hop::conservative_advance<T>(res, dir, radius + margin, contact_eps(),
+		    [&](const hop::vec3<T> & xA, const hop::vec3<T> & /*seed*/,
+		        T & dist, hop::vec3<T> & n, bool & deep) {
+			    deep = false; // closest_seg_triangle is exact; never a degenerate simplex
+			    hop::vec3<T> p1, p2, cs, ct;
+			    hop::add(p1, p1_0, xA);
+			    hop::add(p2, p2_0, xA);
+			    dist = tr::sqrt(closest_seg_triangle(p1, p2, tri_idx, cs, ct));
+			    // Normal: from the surface toward the capsule spine (opposes approach).
+			    // Degenerate when the spine pierces the face (d≈0) — fall back to the
+			    // stored face normal, oriented against the motion.
+			    if (dist > contact_eps()) {
+				    hop::sub(n, cs, ct);
+				    hop::mul(n, tr::one() / dist);
+			    } else {
+				    n = normals_[tri_idx];
+				    if (hop::dot(n, dir) > T{}) hop::neg(n);
+			    }
+		    });
+		return res;
 	}
 
 	// --- Non-capsule (box/sphere) fallback: winding-agnostic support-plane ---

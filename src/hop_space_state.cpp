@@ -68,8 +68,14 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 		p_result->face_index = -1;
 		p_result->shape = 0;
 
-		if (result.collidee) {
-			HopBodyData *hit_body = static_cast<HopBodyData *>(result.collidee->get_user_data());
+		// The hit solid is recorded in result.collider (test_segment sets it per
+		// traced solid); result.collidee is null on the segment/trimesh path. Read
+		// collider, falling back to collidee. Without this a raycast against
+		// worldspawn (a trimesh traceable) reported a null collider, so impact
+		// decals — which gate on `ray.result.collider is StaticBody3D` — never placed.
+		hop::solid<hop_scalar> *hit = result.collider ? result.collider : result.collidee;
+		if (hit) {
+			HopBodyData *hit_body = static_cast<HopBodyData *>(hit->get_user_data());
 			if (hit_body) {
 				p_result->rid = hit_body->self_rid;
 				p_result->collider_id = ObjectID(hit_body->object_instance_id);

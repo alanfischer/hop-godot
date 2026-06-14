@@ -182,8 +182,17 @@ public:
 					hop::add(p1, base, cap.origin);
 					hop::add(p2, p1, cap.direction);
 					auto sweep = sweep_capsule_triangle(tri_idx, p1, p2, seg.direction, cap.radius, margin);
-					if (sweep.hit && sweep.time < result.time) {
+					// Take the earliest impact; among equal-time (overlapping, t==0)
+					// contacts take the deepest. Crucially, propagate sweep.depth: at a
+					// resting/penetrating start the contact is reported at t==0 with the
+					// overlap depth, and the speculative solver derives the contact
+					// separation from it. Dropping it (as the old sweep did, which computed
+					// no depth) left every trimesh contact reading depth 0, so a dynamic
+					// body's penetration was never corrected and it sank through the floor.
+					if (sweep.hit && (sweep.time < result.time ||
+					                  (sweep.time == result.time && sweep.depth > result.depth))) {
 						result.time = sweep.time;
+						result.depth = sweep.depth;
 						hop::mul(result.point, seg.direction, sweep.time);
 						hop::add(result.point, seg.origin);
 						result.normal = sweep.normal;

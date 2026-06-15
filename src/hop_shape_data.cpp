@@ -145,6 +145,23 @@ void HopShapeData::set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_
 }
 
 std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Transform3D &p_local_xform) {
+	// Split the local transform into a pure rotation (carried as the shape's static
+	// local_rotation, which the narrowphase composes with the solid's orientation)
+	// and the scale + translation, which is baked into the geometry (hop shapes
+	// have no orientation of their own). Identity rotation is an exact no-op, so
+	// existing axis-aligned content is unchanged.
+	Basis rot_basis = Basis(p_local_xform.basis.get_rotation_quaternion());
+	Transform3D geom_xform;
+	geom_xform.basis = rot_basis.inverse() * p_local_xform.basis; // scale, rotation stripped
+	geom_xform.origin = p_local_xform.origin;
+
+	auto shape = build_shape_geometry(geom_xform);
+	if (shape)
+		shape->set_local_rotation(to_hop_mat3(rot_basis));
+	return shape;
+}
+
+std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const Transform3D &p_local_xform) {
 	Vector3 origin = p_local_xform.origin;
 
 	switch (type) {

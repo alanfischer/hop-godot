@@ -279,12 +279,22 @@ void HopPhysicsServer::_area_set_param(const RID &p_area, PhysicsServer3D::AreaP
 void HopPhysicsServer::_area_set_transform(const RID &p_area, const Transform3D &p_transform) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
 	if (!area) return;
+	Transform3D old_transform = area->transform;
 	area->transform = p_transform;
-	// Only the world position moves; shape geometry is unchanged, so just
-	// reposition the persistent solid (no rebuild).  The world bound shifts, so
-	// the area broadphase must rebuild before its next query.
+	// Position moves the persistent solid; a static rotation just updates its
+	// orientation (no rebuild). Scale is baked into the geometry, so a scale
+	// change requires a shape rebuild. The world bound shifts either way, so the
+	// area broadphase must rebuild before its next query.
 	if (area->hop_solid) {
 		area->hop_solid->set_position(to_hop(area->transform.origin));
+		if (!area->transform.basis.is_equal_approx(old_transform.basis)) {
+			if (!area->transform.basis.get_scale().is_equal_approx(
+			        old_transform.basis.get_scale())) {
+				rebuild_area_shapes(area);
+			}
+			area->hop_solid->set_orientation(
+			    to_hop_mat3(Basis(area->transform.basis.get_rotation_quaternion())));
+		}
 		mark_area_bvh_dirty(area);
 	}
 }
@@ -377,10 +387,15 @@ void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 	if (!body || !body->hop_solid) return;
 	body->hop_solid->remove_all_shapes();
 
-	// If the body itself is rotated/scaled, we must bake that into the shapes
-	// because hop::solid only supports translation.
-	Transform3D body_basis_only = body->transform;
-	body_basis_only.origin = Vector3();
+	// Static rotation: the body's ROTATION is carried as the solid's orientation
+	// (set in sync_to_hop / _body_set_state), not baked. hop has no scale, so the
+	// body's SCALE is still baked into the shape geometry here — composed in front
+	// of each shape's local transform (world = body_rot · body_scale · local · p,
+	// and body_rot is applied by the narrowphase). make_hop_shape further splits
+	// the resulting local transform into rotation (→ shape.local_rotation) + scale
+	// (baked), so a rotated CollisionShape within the body is honored too.
+	Transform3D body_scale_only;
+	body_scale_only.basis.scale(body->transform.basis.get_scale());
 
 	for (auto &entry : body->shapes) {
 		if (entry.disabled) continue;
@@ -388,7 +403,7 @@ void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 		HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
 		if (!sd) continue;
 
-		auto hs = sd->make_hop_shape(body_basis_only * entry.local_xform);
+		auto hs = sd->make_hop_shape(body_scale_only * entry.local_xform);
 		if (hs) {
 			entry.hop_shape = hs;
 			body->hop_solid->add_shape(hs);
@@ -449,6 +464,10 @@ void HopPhysicsServer::ensure_area_solid(HopAreaData *area) {
 void HopPhysicsServer::rebuild_area_shapes(HopAreaData *area) {
 	ensure_area_solid(area);
 	area->hop_solid->remove_all_shapes();
+	// Static rotation: bake the area's SCALE into the geometry (hop has no scale);
+	// its ROTATION is carried as the solid's orientation below, like a body.
+	Transform3D area_scale_only;
+	area_scale_only.basis.scale(area->transform.basis.get_scale());
 	for (auto &entry : area->shapes) {
 		if (entry.disabled) {
 			entry.hop_shape.reset();
@@ -456,15 +475,16 @@ void HopPhysicsServer::rebuild_area_shapes(HopAreaData *area) {
 		}
 		HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
 		if (!sd) continue;
-		auto hs = sd->make_hop_shape(entry.local_xform);
+		auto hs = sd->make_hop_shape(area_scale_only * entry.local_xform);
 		if (hs) {
 			entry.hop_shape = hs;
 			area->hop_solid->add_shape(hs);
 		}
 	}
 	// add_shape activates and set_position is unnecessary churn otherwise; keep the
-	// position in sync and leave the solid inactive (it is never stepped).
+	// position/orientation in sync and leave the solid inactive (it is never stepped).
 	area->hop_solid->set_position(to_hop(area->transform.origin));
+	area->hop_solid->set_orientation(to_hop_mat3(Basis(area->transform.basis.get_rotation_quaternion())));
 	area->hop_solid->deactivate();
 	// World bound changed — the area broadphase must rebuild before its next query.
 	mark_area_bvh_dirty(area);
@@ -751,11 +771,18 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 					// sweeps through space and pushes dynamic bodies in its path.
 				} else {
 					body->hop_solid->set_position(to_hop(body->transform.origin));
-					
-					// If the basis (rotation/scale) changed, we MUST rebuild shapes
-					// to bake the new orientation into the translation-only engine.
+
+					// Static rotation: a rotation change just updates the solid's
+					// orientation (cheap — no geometry rebake; the narrowphase honors
+					// it directly). Scale is still baked into the shapes, so a scale
+					// change requires a rebuild.
 					if (!body->transform.basis.is_equal_approx(old_transform.basis)) {
-						rebuild_body_shapes(body);
+						if (!body->transform.basis.get_scale().is_equal_approx(
+						        old_transform.basis.get_scale())) {
+							rebuild_body_shapes(body);
+						}
+						body->hop_solid->set_orientation(
+						    to_hop_mat3(Basis(body->transform.basis.get_rotation_quaternion())));
 					}
 
 					// set_position calls activate() — re-deactivate static bodies

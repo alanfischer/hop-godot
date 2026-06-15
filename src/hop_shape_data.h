@@ -30,4 +30,10 @@ struct HopShapeData {
 
 	void set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_data);
 	std::shared_ptr<hop::shape<hop_scalar>> make_hop_shape(const Transform3D &p_local_xform);
+
+	// Builds the shape geometry from a rotation-stripped (scale + translation)
+	// transform. make_hop_shape splits the local transform into rotation (carried
+	// as the shape's static local_rotation, honored by the narrowphase) and the
+	// scale/origin baked here, since hop geometry has no orientation of its own.
+	std::shared_ptr<hop::shape<hop_scalar>> build_shape_geometry(const Transform3D &p_local_xform);
 };

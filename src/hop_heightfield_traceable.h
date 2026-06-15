@@ -59,10 +59,17 @@ public:
 
 	void trace_segment(hop::collision<T> & result,
 	                   const hop::vec3<T> & position,
+	                   const hop::mat3<T> & orientation,
 	                   const hop::segment<T> & seg) override {
+		// Rotate the ray into grid-local space (Rᵀ about `position`); the grid never
+		// moves and the hit maps back by R. Identity orientation is an exact no-op.
+		hop::mat3<T> Rt;
+		hop::transpose(Rt, orientation);
 		hop::segment<T> local;
-		hop::sub(local.origin, seg.origin, position);
-		local.direction = seg.direction;
+		hop::vec3<T> rel;
+		hop::sub(rel, seg.origin, position);
+		hop::mul(local.origin, Rt, rel);
+		hop::mul(local.direction, Rt, seg.direction);
 
 		// Walk only the cells the ray crosses (Amanatides–Woo over the XZ grid).
 		dda_cells(local, [&](int i, int j) -> bool {
@@ -72,8 +79,9 @@ public:
 				T th = hoptri::ray_triangle(local, a, b, c, n, point, normal);
 				if (th < result.time) {
 					result.time = th;
-					hop::add(result.point, point, position);
-					result.normal = normal;
+					hop::mul(result.point, orientation, point);
+					hop::add(result.point, position);
+					hop::mul(result.normal, orientation, normal);
 				}
 			}
 			// DDA visits cells in increasing t, so the first cell with a hit holds
@@ -85,7 +93,13 @@ public:
 	void trace_solid(hop::collision<T> & result,
 	                 hop::solid<T> * s,
 	                 const hop::vec3<T> & position,
+	                 const hop::mat3<T> & orientation,
 	                 const hop::segment<T> & seg, T margin) override {
+		const hop::mat3<T> identity;
+		if (orientation != identity) {
+			trace_solid_rotated(result, s, position, orientation, seg, margin);
+			return;
+		}
 		// Swept query AABB in heightfield-local space (mirrors the trimesh path).
 		hop::aa_box<T> swept_box;
 		const auto & shapes = s->get_shapes();
@@ -134,6 +148,84 @@ public:
 	}
 
 private:
+	// Static-rotation path (mirrors the trimesh traceable). The grid carries a
+	// non-identity world rotation: rotate the query into grid-local space by Rᵀ,
+	// reduce the mover to an explicit capsule/sphere spine in that frame, run the
+	// shared per-triangle routines over the covered cells, then map the contact
+	// back to world by R. Box movers are skipped (no rotation-invariant spine).
+	void trace_solid_rotated(hop::collision<T> & result, hop::solid<T> * s,
+	                         const hop::vec3<T> & position, const hop::mat3<T> & orientation,
+	                         const hop::segment<T> & seg, T margin) {
+		hop::mat3<T> Rt;
+		hop::transpose(Rt, orientation);
+		hop::segment<T> local_seg;
+		hop::vec3<T> rel;
+		hop::sub(rel, seg.origin, position);
+		hop::mul(local_seg.origin, Rt, rel);
+		hop::mul(local_seg.direction, Rt, seg.direction);
+
+		const bool is_static = (hop::dot(seg.direction, seg.direction) == T {});
+		hop::collision<T> local;
+		local.time = result.time;
+		local.depth = result.depth;
+		bool found = false;
+		T best_depth = T {};
+
+		for (const auto & sh_ptr : s->get_shapes()) {
+			hop::vec3<T> p1w, p2w;
+			T radius;
+			if (!hoptri::mover_world_capsule(s, sh_ptr.get(), seg.origin, p1w, p2w, radius))
+				continue;
+			hop::vec3<T> p1, p2, t;
+			hop::sub(t, p1w, position); hop::mul(p1, Rt, t);
+			hop::sub(t, p2w, position); hop::mul(p2, Rt, t);
+
+			hop::aa_box<T> q;
+			spine_aabb(q, p1, p2, radius);
+			if (!is_static) {
+				hop::vec3<T> e1, e2;
+				hop::add(e1, p1, local_seg.direction);
+				hop::add(e2, p2, local_seg.direction);
+				hop::aa_box<T> qe;
+				spine_aabb(qe, e1, e2, radius);
+				q.merge(qe);
+			}
+
+			int i0, i1, j0, j1;
+			if (!cell_range(q, i0, i1, j0, j1))
+				continue;
+			for (int j = j0; j <= j1; ++j) {
+				for (int i = i0; i <= i1; ++i) {
+					hop::vec3<T> a, b, c, n;
+					for (int k = 0; k < 2; ++k) {
+						cell_triangle(i, j, k, a, b, c, n);
+						hoptri::capsule_local_vs_triangle(p1, p2, radius, local_seg, is_static,
+						    margin, a, b, c, n, local, found, best_depth);
+					}
+				}
+			}
+		}
+
+		if (found || local.time < result.time) {
+			result.time = local.time;
+			result.depth = local.depth;
+			hop::mul(result.normal, orientation, local.normal);
+			hop::vec3<T> wp;
+			hop::mul(wp, orientation, local.point);
+			hop::add(result.point, wp, position);
+		}
+	}
+
+	// AABB enclosing the capsule spine p1..p2 grown by `radius`.
+	static void spine_aabb(hop::aa_box<T> & box, const hop::vec3<T> & p1,
+	                       const hop::vec3<T> & p2, T radius) {
+		box.mins = p1;
+		box.maxs = p1;
+		box.merge(p2);
+		box.mins.x -= radius; box.mins.y -= radius; box.mins.z -= radius;
+		box.maxs.x += radius; box.maxs.y += radius; box.maxs.z += radius;
+	}
+
 	int width_ = 0, depth_ = 0;
 	std::vector<T> heights_;
 	hop::vec3<T> origin_;

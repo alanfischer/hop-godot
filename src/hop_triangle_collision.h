@@ -109,22 +109,20 @@ inline T ray_triangle(const hop::segment<T> & seg, const hop::vec3<T> & v0,
 
 // --- capsule (player) vs triangle: analytic closest-point ---
 
-// One-sided (FRONT face) static-overlap recovery of a capsule against a
-// triangle. `base` is the capsule's body origin in mesh-local space (incl. the
-// shape's local offset). Returns true + push-out depth/normal when within
-// radius + margin of the front face.
+// One-sided (FRONT face) static-overlap recovery of a capsule spine (explicit
+// endpoints p1,p2 + radius) against a triangle, all in the same frame. Returns
+// true + push-out depth/normal when within radius + margin of the front face.
+// The base/cap.* overload below is the common (axis-aligned) caller; the rotated
+// traceable path supplies endpoints transformed into the target's local frame.
 template <typename T>
-inline bool recover_capsule_triangle(const hop::capsule<T> & cap, const hop::vec3<T> & base,
+inline bool recover_capsule_triangle(const hop::vec3<T> & p1, const hop::vec3<T> & p2, T radius,
                                      const hop::vec3<T> & a, const hop::vec3<T> & b, const hop::vec3<T> & c,
                                      const hop::vec3<T> & face_n, T margin, T & out_depth,
                                      hop::vec3<T> & out_normal) {
 	using tr = hop::scalar_traits<T>;
-	hop::vec3<T> p1, p2;
-	hop::add(p1, base, cap.origin);
-	hop::add(p2, p1, cap.direction);
 	hop::vec3<T> cs, ct;
 	T d2 = hop::closest_segment_triangle(p1, p2, a, b, c, cs, ct, contact_eps<T>());
-	T thresh = cap.radius + margin;
+	T thresh = radius + margin;
 	if (d2 > thresh * thresh)
 		return false;
 	T d = tr::sqrt(d2);
@@ -140,12 +138,25 @@ inline bool recover_capsule_triangle(const hop::capsule<T> & cap, const hop::vec
 	// Front gate: reject the back-wound twin on mixed-winding BSP surfaces.
 	if (hop::dot(face_n, n) < T {})
 		return false;
-	T depth = cap.radius - d;
+	T depth = radius - d;
 	if (depth < T {})
 		depth = T {};
 	out_depth = depth;
 	out_normal = n;
 	return true;
+}
+
+// `base` is the capsule's body origin in mesh-local space (incl. the shape's
+// local offset); the spine is base+cap.origin .. +cap.direction.
+template <typename T>
+inline bool recover_capsule_triangle(const hop::capsule<T> & cap, const hop::vec3<T> & base,
+                                     const hop::vec3<T> & a, const hop::vec3<T> & b, const hop::vec3<T> & c,
+                                     const hop::vec3<T> & face_n, T margin, T & out_depth,
+                                     hop::vec3<T> & out_normal) {
+	hop::vec3<T> p1, p2;
+	hop::add(p1, base, cap.origin);
+	hop::add(p2, p1, cap.direction);
+	return recover_capsule_triangle(p1, p2, cap.radius, a, b, c, face_n, margin, out_depth, out_normal);
 }
 
 // Swept capsule-vs-triangle via the shared conservative-advancement loop with an
@@ -317,6 +328,85 @@ inline void sweep_shape_vs_triangle(hop::shape<T> * sh, const hop::vec3<T> & loc
 		}
 	} else {
 		sweep_support_plane(sh, local_origin, seg, a, b, c, face_n, seam_tol, result);
+	}
+}
+
+// --- static-rotation support: rotated traceable frame ---
+//
+// When a trimesh/heightfield target carries a non-identity world rotation, the
+// query is transformed into the target's local frame (where the geometry lives)
+// and the result mapped back. The mover's spine can no longer be reconstructed
+// from the shape alone — once tilted into the target frame a capsule is not
+// axis-aligned — so the mover is reduced to an explicit world-space spine
+// (capsule) or point (sphere) here, transformed by the caller, and fed to the
+// explicit-endpoint routines above. Box movers have no rotation-invariant spine
+// and are out of scope for static rotation (the caller skips them).
+
+// World-space capsule spine (p1,p2) + radius for the mover shape, honoring the
+// mover solid's own orientation and the shape's local pose. A sphere collapses
+// to a zero-length spine (p1==p2). Returns false for shapes with no spine (box).
+template <typename T>
+inline bool mover_world_capsule(hop::solid<T> * s, hop::shape<T> * sh, const hop::vec3<T> & mover_pos,
+                                hop::vec3<T> & p1, hop::vec3<T> & p2, T & radius) {
+	hop::mat3<T> Rm;
+	hop::mul(Rm, s->get_orientation(), sh->get_local_rotation());
+	hop::vec3<T> base, off;
+	hop::mul(base, s->get_orientation(), sh->get_local_position());
+	hop::add(base, mover_pos);
+	if (sh->get_type() == hop::shape_type::capsule) {
+		const auto & cap = sh->get_capsule();
+		hop::mul(off, Rm, cap.origin);
+		hop::add(p1, base, off);
+		hop::mul(off, Rm, cap.direction);
+		hop::add(p2, p1, off);
+		radius = cap.radius;
+		return true;
+	}
+	if (sh->get_type() == hop::shape_type::sphere) {
+		const auto & sph = sh->get_sphere();
+		hop::mul(off, Rm, sph.origin);
+		hop::add(p1, base, off);
+		p2 = p1;
+		radius = sph.radius;
+		return true;
+	}
+	return false;
+}
+
+// Per-(spine, triangle) swept/recover, all expressed in the target's LOCAL
+// frame: `p1`/`p2` are the local spine, `local_seg` the local mover segment
+// (origin = mover position, direction = displacement). Results are written in
+// local space — the caller maps point/normal back to world by the target's
+// rotation. Mirrors {sweep,recover}_shape_vs_triangle for the capsule case.
+template <typename T>
+inline void capsule_local_vs_triangle(const hop::vec3<T> & p1, const hop::vec3<T> & p2, T radius,
+                                      const hop::segment<T> & local_seg, bool is_static, T margin,
+                                      const hop::vec3<T> & a, const hop::vec3<T> & b, const hop::vec3<T> & c,
+                                      const hop::vec3<T> & face_n, hop::collision<T> & result,
+                                      bool & found, T & best_depth) {
+	if (is_static) {
+		T depth;
+		hop::vec3<T> n;
+		if (recover_capsule_triangle(p1, p2, radius, a, b, c, face_n, margin, depth, n)) {
+			if (!found || depth > best_depth) {
+				best_depth = depth;
+				result.time = T {};
+				result.depth = depth;
+				result.normal = n;
+				result.point = local_seg.origin;
+				found = true;
+			}
+		}
+	} else {
+		auto sweep = sweep_capsule_triangle(p1, p2, local_seg.direction, radius, a, b, c, face_n, margin);
+		if (sweep.hit && (sweep.time < result.time ||
+		                  (sweep.time == result.time && sweep.depth > result.depth))) {
+			result.time = sweep.time;
+			result.depth = sweep.depth;
+			hop::mul(result.point, local_seg.direction, sweep.time);
+			hop::add(result.point, local_seg.origin);
+			result.normal = sweep.normal;
+		}
 	}
 }
 

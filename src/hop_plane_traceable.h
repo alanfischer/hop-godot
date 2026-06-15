@@ -24,27 +24,38 @@ public:
 
 	void trace_segment(hop::collision<T> &result,
 	                   const hop::vec3<T> &position,
+	                   const hop::mat3<T> &orientation,
 	                   const hop::segment<T> &seg) override {
-		T denom = hop::dot(normal_, seg.direction);
+		// The plane normal is authored in local space; a static rotation just turns
+		// it. Working with the world-rotated plane (normal n = R·normal_ through
+		// `position`) needs no query transform and is identity-equivalent.
+		hop::vec3<T> normal;
+		hop::mul(normal, orientation, normal_);
+
+		T denom = hop::dot(normal, seg.direction);
 		if (denom >= T {})
 			return; // Moving away or parallel
 
-		T t = (distance_ + hop::dot(normal_, position) - hop::dot(normal_, seg.origin)) / denom;
+		T t = (distance_ + hop::dot(normal, position) - hop::dot(normal, seg.origin)) / denom;
 		if (t >= T {} && t <= tr::one() && t < result.time) {
 			result.time = t;
 			hop::mul(result.point, seg.direction, t);
 			hop::add(result.point, seg.origin);
-			result.normal = normal_;
+			result.normal = normal;
 		}
 	}
 
 	void trace_solid(hop::collision<T> &result,
 	                 hop::solid<T> *s,
 	                 const hop::vec3<T> &position,
+	                 const hop::mat3<T> &orientation,
 	                 const hop::segment<T> &seg, T margin) override {
+		hop::vec3<T> normal;
+		hop::mul(normal, orientation, normal_);
+
 		// Find the solid's extent in the negative-normal direction (into the plane)
 		hop::vec3<T> neg_n;
-		hop::neg(neg_n, normal_);
+		hop::neg(neg_n, normal);
 
 		T deepest = T {};
 		for (const auto &shape : s->get_shapes()) {
@@ -59,15 +70,15 @@ public:
 		// margin so near-resting solids within `margin` register as contacts.
 		T expanded_d = distance_ + deepest + margin;
 
-		T origin_dot = hop::dot(normal_, seg.origin) - hop::dot(normal_, position);
-		T denom = hop::dot(normal_, seg.direction);
+		T origin_dot = hop::dot(normal, seg.origin) - hop::dot(normal, position);
+		T denom = hop::dot(normal, seg.direction);
 
 		// Zero-direction (static overlap / proximity) query: the swept solve
 		// below divides by `denom`, so handle a stationary solid separately.
 		if (denom == T {}) {
 			if (origin_dot <= expanded_d && result.time > T {}) {
 				result.time = T {};
-				result.normal = normal_;
+				result.normal = normal;
 				result.point = seg.origin;
 				// depth measured against the inflated surface (= margin − true_gap)
 				result.depth = expanded_d - origin_dot;
@@ -88,7 +99,7 @@ public:
 			result.time = t;
 			hop::mul(result.point, seg.direction, t);
 			hop::add(result.point, seg.origin);
-			result.normal = normal_;
+			result.normal = normal;
 		}
 	}
 

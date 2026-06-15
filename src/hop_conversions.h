@@ -89,3 +89,13 @@ inline Vector3 to_godot(const hop::vec3<hop_scalar> &v) {
 		scalar_to_float(v.y),
 		scalar_to_float(v.z));
 }
+
+// Godot Basis → hop mat3 (rotation only; pass an orthonormal basis). Both are
+// applied as r[i] = Σⱼ m(i,j)·v[j] and to_hop maps godot XYZ straight through, so
+// element (i,j) copies directly. The hop mat3 ctor is row-major.
+inline hop::mat3<hop_scalar> to_hop_mat3(const Basis &b) {
+	return hop::mat3<hop_scalar>(
+		to_hop_scalar(b[0][0]), to_hop_scalar(b[0][1]), to_hop_scalar(b[0][2]),
+		to_hop_scalar(b[1][0]), to_hop_scalar(b[1][1]), to_hop_scalar(b[1][2]),
+		to_hop_scalar(b[2][0]), to_hop_scalar(b[2][1]), to_hop_scalar(b[2][2]));
+}

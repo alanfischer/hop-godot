@@ -38,7 +38,10 @@ public:
 		heights_.resize(width_ * depth_);
 		min_h_ = max_h_ = T {};
 		for (int k = 0; k < width_ * depth_; ++k) {
-			T h = to_hop_scalar(heights[k]) * scale.y; // bake Y scale
+			// Raw map_data height (along Y), scaled — exactly as Godot's
+			// HeightMapShape3D interprets it. Any "ground at gray 0.5" convention
+			// belongs in the terrain data / shape transform, not here.
+			T h = to_hop_scalar(heights[k]) * scale.y;
 			heights_[k] = h;
 			if (k == 0 || h < min_h_) min_h_ = h;
 			if (k == 0 || h > max_h_) max_h_ = h;
@@ -152,17 +155,17 @@ private:
 	}
 
 	// The `t`-th (0 or 1) triangle of cell (i, j), with an upward-oriented face
-	// normal. Diagonal runs (i+1,j)→(i,j+1); winding gives +Y on flat ground.
+	// normal. Godot diagonal runs (i,j)→(i+1,j+1); winding gives +Y on flat ground.
 	void cell_triangle(int i, int j, int t, hop::vec3<T> & a, hop::vec3<T> & b,
 	                   hop::vec3<T> & c, hop::vec3<T> & n) const {
 		if (t == 0) {
 			a = point_at(i, j);
 			b = point_at(i, j + 1);
-			c = point_at(i + 1, j);
-		} else {
-			a = point_at(i + 1, j);
-			b = point_at(i, j + 1);
 			c = point_at(i + 1, j + 1);
+		} else {
+			a = point_at(i, j);
+			b = point_at(i + 1, j + 1);
+			c = point_at(i + 1, j);
 		}
 		hop::vec3<T> e1, e2;
 		hop::sub(e1, b, a);

@@ -152,7 +152,8 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 	// existing axis-aligned content is unchanged.
 	Basis rot_basis = Basis(p_local_xform.basis.get_rotation_quaternion());
 	Transform3D geom_xform;
-	geom_xform.basis = rot_basis.inverse() * p_local_xform.basis; // scale, rotation stripped
+	// rot_basis is orthonormal, so its inverse is its transpose (exact + cheaper).
+	geom_xform.basis = rot_basis.transposed() * p_local_xform.basis; // scale, rotation stripped
 	geom_xform.origin = p_local_xform.origin;
 
 	auto shape = build_shape_geometry(geom_xform);

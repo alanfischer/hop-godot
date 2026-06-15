@@ -410,4 +410,79 @@ inline void capsule_local_vs_triangle(const hop::vec3<T> & p1, const hop::vec3<T
 	}
 }
 
+// AABB enclosing the capsule spine p1..p2 grown by `radius`.
+template <typename T>
+inline void spine_aabb(hop::aa_box<T> & box, const hop::vec3<T> & p1,
+                       const hop::vec3<T> & p2, T radius) {
+	box.mins = p1;
+	box.maxs = p1;
+	box.merge(p2);
+	box.mins.x -= radius; box.mins.y -= radius; box.mins.z -= radius;
+	box.maxs.x += radius; box.maxs.y += radius; box.maxs.z += radius;
+}
+
+// Drives a traceable's rotated-frame solid trace, shared by the trimesh (BVH)
+// and heightfield (grid) traceables: transform the world query into the target's
+// local frame by Rᵀ, reduce each mover shape to a capsule/sphere spine in that
+// frame, dispatch per candidate triangle, then map the contact back to world by
+// R. The only per-traceable difference — how candidate triangles are found — is
+// the `enumerate` callback: it receives the local query AABB and a visitor
+// `visit(a, b, c, face_n)` to call for each candidate triangle (already in local
+// space). Results are written into `result` in WORLD space.
+template <typename T, typename Enumerate>
+inline void trace_solid_rotated(hop::collision<T> & result, hop::solid<T> * s,
+                                const hop::vec3<T> & position, const hop::mat3<T> & orientation,
+                                const hop::segment<T> & seg, T margin, Enumerate && enumerate) {
+	hop::mat3<T> Rt;
+	hop::transpose(Rt, orientation);
+	hop::segment<T> local_seg;
+	hop::vec3<T> rel;
+	hop::sub(rel, seg.origin, position);
+	hop::mul(local_seg.origin, Rt, rel);
+	hop::mul(local_seg.direction, Rt, seg.direction);
+
+	const bool is_static = (hop::dot(seg.direction, seg.direction) == T {});
+	hop::collision<T> local;
+	local.time = result.time;
+	local.depth = result.depth;
+	bool found = false;
+	T best_depth = T {};
+
+	for (const auto & sh_ptr : s->get_shapes()) {
+		hop::vec3<T> p1w, p2w;
+		T radius;
+		if (!mover_world_capsule(s, sh_ptr.get(), seg.origin, p1w, p2w, radius))
+			continue; // box movers have no rotation-invariant spine (out of scope)
+		hop::vec3<T> p1, p2, t;
+		hop::sub(t, p1w, position); hop::mul(p1, Rt, t);
+		hop::sub(t, p2w, position); hop::mul(p2, Rt, t);
+
+		hop::aa_box<T> q;
+		spine_aabb(q, p1, p2, radius);
+		if (!is_static) {
+			hop::vec3<T> e1, e2;
+			hop::add(e1, p1, local_seg.direction);
+			hop::add(e2, p2, local_seg.direction);
+			hop::aa_box<T> qe;
+			spine_aabb(qe, e1, e2, radius);
+			q.merge(qe);
+		}
+
+		enumerate(q, [&](const hop::vec3<T> & a, const hop::vec3<T> & b,
+		                 const hop::vec3<T> & c, const hop::vec3<T> & face_n) {
+			capsule_local_vs_triangle(p1, p2, radius, local_seg, is_static, margin,
+			    a, b, c, face_n, local, found, best_depth);
+		});
+	}
+
+	if (found || local.time < result.time) {
+		result.time = local.time;
+		result.depth = local.depth;
+		hop::mul(result.normal, orientation, local.normal);
+		hop::vec3<T> wp;
+		hop::mul(wp, orientation, local.point);
+		hop::add(result.point, wp, position);
+	}
+}
+
 } // namespace hoptri

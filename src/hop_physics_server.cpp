@@ -8,6 +8,15 @@
 #include <cstdlib>
 #include <unordered_map>
 
+// Scale-only transform from a Godot basis: hop has no scale, so a body/area's
+// scale is baked into the shape geometry (composed in front of each shape's local
+// transform), while its rotation rides on the solid's orientation.
+static Transform3D scale_only_xform(const Basis &basis) {
+	Transform3D t;
+	t.basis.scale(basis.get_scale());
+	return t;
+}
+
 // KINEMATIC bodies (the CharacterBody3D player) resolve contacts via sweep-and-slide
 // so they slide along surfaces; dynamic and static bodies use the speculative solve
 // (the space default, set in HopSpaceData). hop-godot is a generic backend with no
@@ -293,7 +302,7 @@ void HopPhysicsServer::_area_set_transform(const RID &p_area, const Transform3D 
 				rebuild_area_shapes(area);
 			}
 			area->hop_solid->set_orientation(
-			    to_hop_mat3(Basis(area->transform.basis.get_rotation_quaternion())));
+			    to_hop_orientation(area->transform.basis));
 		}
 		mark_area_bvh_dirty(area);
 	}
@@ -394,8 +403,7 @@ void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 	// and body_rot is applied by the narrowphase). make_hop_shape further splits
 	// the resulting local transform into rotation (→ shape.local_rotation) + scale
 	// (baked), so a rotated CollisionShape within the body is honored too.
-	Transform3D body_scale_only;
-	body_scale_only.basis.scale(body->transform.basis.get_scale());
+	Transform3D body_scale_only = scale_only_xform(body->transform.basis);
 
 	for (auto &entry : body->shapes) {
 		if (entry.disabled) continue;
@@ -466,8 +474,7 @@ void HopPhysicsServer::rebuild_area_shapes(HopAreaData *area) {
 	area->hop_solid->remove_all_shapes();
 	// Static rotation: bake the area's SCALE into the geometry (hop has no scale);
 	// its ROTATION is carried as the solid's orientation below, like a body.
-	Transform3D area_scale_only;
-	area_scale_only.basis.scale(area->transform.basis.get_scale());
+	Transform3D area_scale_only = scale_only_xform(area->transform.basis);
 	for (auto &entry : area->shapes) {
 		if (entry.disabled) {
 			entry.hop_shape.reset();
@@ -484,7 +491,7 @@ void HopPhysicsServer::rebuild_area_shapes(HopAreaData *area) {
 	// add_shape activates and set_position is unnecessary churn otherwise; keep the
 	// position/orientation in sync and leave the solid inactive (it is never stepped).
 	area->hop_solid->set_position(to_hop(area->transform.origin));
-	area->hop_solid->set_orientation(to_hop_mat3(Basis(area->transform.basis.get_rotation_quaternion())));
+	area->hop_solid->set_orientation(to_hop_orientation(area->transform.basis));
 	area->hop_solid->deactivate();
 	// World bound changed — the area broadphase must rebuild before its next query.
 	mark_area_bvh_dirty(area);
@@ -782,7 +789,7 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 							rebuild_body_shapes(body);
 						}
 						body->hop_solid->set_orientation(
-						    to_hop_mat3(Basis(body->transform.basis.get_rotation_quaternion())));
+						    to_hop_orientation(body->transform.basis));
 					}
 
 					// set_position calls activate() — re-deactivate static bodies

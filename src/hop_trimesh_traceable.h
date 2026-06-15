@@ -61,16 +61,24 @@ public:
 	                   const hop::vec3<T> & position,
 	                   const hop::mat3<T> & orientation,
 	                   const hop::segment<T> & seg) override {
-		// Transform the ray into mesh-local space: rotate by Rᵀ about `position`.
-		// Mesh verts never move; the ray rotates into their frame, and the hit
-		// point/normal map back by R. Identity orientation is an exact no-op.
+		// Transform the ray into mesh-local space (mesh verts never move). For a
+		// rotated mesh that's a rotate by Rᵀ about `position`, with the hit mapped
+		// back by R; the common identity case is just the translate, with no matrix
+		// math on the hot raycast path.
+		static const hop::mat3<T> identity;
+		const bool rotated = (orientation != identity);
 		hop::mat3<T> Rt;
-		hop::transpose(Rt, orientation);
 		hop::segment<T> local_seg;
-		hop::vec3<T> rel;
-		hop::sub(rel, seg.origin, position);
-		hop::mul(local_seg.origin, Rt, rel);
-		hop::mul(local_seg.direction, Rt, seg.direction);
+		if (rotated) {
+			hop::transpose(Rt, orientation);
+			hop::vec3<T> rel;
+			hop::sub(rel, seg.origin, position);
+			hop::mul(local_seg.origin, Rt, rel);
+			hop::mul(local_seg.direction, Rt, seg.direction);
+		} else {
+			hop::sub(local_seg.origin, seg.origin, position);
+			local_seg.direction = seg.direction;
+		}
 
 		bvh_.query_ray(local_seg.origin, local_seg.direction, [&](int tri_idx, T & best_t) {
 			const auto & t_ = tris_[tri_idx];
@@ -80,10 +88,14 @@ public:
 			if (t < best_t && t < result.time) {
 				best_t = t;
 				result.time = t;
-				// Map the hit back to world: R·point + position, R·normal.
-				hop::mul(result.point, orientation, point);
-				hop::add(result.point, position);
-				hop::mul(result.normal, orientation, normal);
+				if (rotated) {
+					hop::mul(result.point, orientation, point);
+					hop::add(result.point, position);
+					hop::mul(result.normal, orientation, normal);
+				} else {
+					hop::add(result.point, point, position);
+					result.normal = normal;
+				}
 			}
 		});
 	}
@@ -93,9 +105,17 @@ public:
 	                 const hop::vec3<T> & position,
 	                 const hop::mat3<T> & orientation,
 	                 const hop::segment<T> & seg, T margin) override {
-		const hop::mat3<T> identity;
+		static const hop::mat3<T> identity;
 		if (orientation != identity) {
-			trace_solid_rotated(result, s, position, orientation, seg, margin);
+			// Rotated mesh: the shared driver handles the frame transform + mover
+			// spine reduction; we supply only the BVH broadphase over the local AABB.
+			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin,
+			    [&](const hop::aa_box<T> & q, auto && visit) {
+				    bvh_.query_aabb(q, [&](int tri_idx) {
+					    const auto & tri = tris_[tri_idx];
+					    visit(verts_[tri.i0], verts_[tri.i1], verts_[tri.i2], normals_[tri_idx]);
+				    });
+			    });
 			return;
 		}
 		// seg.origin = other solid's position, seg.direction = its movement
@@ -179,78 +199,6 @@ public:
 	}
 
 private:
-	// Static-rotation path: the mesh carries a non-identity world rotation. Rotate
-	// the query into mesh-local space (where the verts live) by Rᵀ, reduce the
-	// mover to an explicit capsule/sphere spine transformed into the same frame,
-	// run the per-triangle routines, then map the contact back to world by R. Box
-	// movers have no rotation-invariant spine and are skipped (out of scope for
-	// static rotation — see hoptri::mover_world_capsule).
-	void trace_solid_rotated(hop::collision<T> & result, hop::solid<T> * s,
-	                         const hop::vec3<T> & position, const hop::mat3<T> & orientation,
-	                         const hop::segment<T> & seg, T margin) {
-		hop::mat3<T> Rt;
-		hop::transpose(Rt, orientation);
-		hop::segment<T> local_seg;
-		hop::vec3<T> rel;
-		hop::sub(rel, seg.origin, position);
-		hop::mul(local_seg.origin, Rt, rel);
-		hop::mul(local_seg.direction, Rt, seg.direction);
-
-		const bool is_static = (hop::dot(seg.direction, seg.direction) == T {});
-		hop::collision<T> local;
-		local.time = result.time;
-		local.depth = result.depth;
-		bool found = false;
-		T best_depth = T {};
-
-		for (const auto & sh_ptr : s->get_shapes()) {
-			hop::vec3<T> p1w, p2w;
-			T radius;
-			if (!hoptri::mover_world_capsule(s, sh_ptr.get(), seg.origin, p1w, p2w, radius))
-				continue;
-			hop::vec3<T> p1, p2, t;
-			hop::sub(t, p1w, position); hop::mul(p1, Rt, t);
-			hop::sub(t, p2w, position); hop::mul(p2, Rt, t);
-
-			hop::aa_box<T> q;
-			spine_aabb(q, p1, p2, radius);
-			if (!is_static) {
-				hop::vec3<T> e1, e2;
-				hop::add(e1, p1, local_seg.direction);
-				hop::add(e2, p2, local_seg.direction);
-				hop::aa_box<T> qe;
-				spine_aabb(qe, e1, e2, radius);
-				q.merge(qe);
-			}
-
-			bvh_.query_aabb(q, [&](int tri_idx) {
-				const auto & tri = tris_[tri_idx];
-				hoptri::capsule_local_vs_triangle(p1, p2, radius, local_seg, is_static, margin,
-				    verts_[tri.i0], verts_[tri.i1], verts_[tri.i2], normals_[tri_idx],
-				    local, found, best_depth);
-			});
-		}
-
-		if (found || local.time < result.time) {
-			result.time = local.time;
-			result.depth = local.depth;
-			hop::mul(result.normal, orientation, local.normal);
-			hop::vec3<T> wp;
-			hop::mul(wp, orientation, local.point);
-			hop::add(result.point, wp, position);
-		}
-	}
-
-	// AABB enclosing the capsule spine p1..p2 grown by `radius` (+ a margin pad).
-	static void spine_aabb(hop::aa_box<T> & box, const hop::vec3<T> & p1,
-	                       const hop::vec3<T> & p2, T radius) {
-		box.mins = p1;
-		box.maxs = p1;
-		box.merge(p2);
-		box.mins.x -= radius; box.mins.y -= radius; box.mins.z -= radius;
-		box.maxs.x += radius; box.maxs.y += radius; box.maxs.z += radius;
-	}
-
 	std::vector<hop::vec3<T>> verts_;
 	std::vector<triangle> tris_;
 	std::vector<hop::vec3<T>> normals_;

@@ -99,3 +99,9 @@ inline hop::mat3<hop_scalar> to_hop_mat3(const Basis &b) {
 		to_hop_scalar(b[1][0]), to_hop_scalar(b[1][1]), to_hop_scalar(b[1][2]),
 		to_hop_scalar(b[2][0]), to_hop_scalar(b[2][1]), to_hop_scalar(b[2][2]));
 }
+
+// hop solid orientation (rotation only) from a Godot transform basis: drops the
+// basis's scale (which hop bakes into geometry) and keeps the pure rotation.
+inline hop::mat3<hop_scalar> to_hop_orientation(const Basis &b) {
+	return to_hop_mat3(Basis(b.get_rotation_quaternion()));
+}

@@ -45,7 +45,7 @@ void HopBodyData::sync_to_hop() {
 	// Static rotation: the body's world orientation (rotation only — scale is
 	// baked into the shapes by rebuild_body_shapes). hop has no angular dynamics;
 	// this is a fixed pose the narrowphase respects.
-	hop_solid->set_orientation(to_hop_mat3(Basis(transform.basis.get_rotation_quaternion())));
+	hop_solid->set_orientation(to_hop_orientation(transform.basis));
 
 	if (mode == PhysicsServer3D::BODY_MODE_STATIC) {
 		hop_solid->set_infinite_mass();

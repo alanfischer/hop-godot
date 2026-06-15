@@ -28,9 +28,9 @@ public:
 	                   const hop::segment<T> &seg) override {
 		// The plane normal is authored in local space; a static rotation just turns
 		// it. Working with the world-rotated plane (normal n = R·normal_ through
-		// `position`) needs no query transform and is identity-equivalent.
-		hop::vec3<T> normal;
-		hop::mul(normal, orientation, normal_);
+		// `position`) needs no query transform and is identity-equivalent — and the
+		// common identity case skips the matrix multiply entirely.
+		hop::vec3<T> normal = world_normal(orientation);
 
 		T denom = hop::dot(normal, seg.direction);
 		if (denom >= T {})
@@ -50,8 +50,7 @@ public:
 	                 const hop::vec3<T> &position,
 	                 const hop::mat3<T> &orientation,
 	                 const hop::segment<T> &seg, T margin) override {
-		hop::vec3<T> normal;
-		hop::mul(normal, orientation, normal_);
+		hop::vec3<T> normal = world_normal(orientation);
 
 		// Find the solid's extent in the negative-normal direction (into the plane)
 		hop::vec3<T> neg_n;
@@ -104,6 +103,17 @@ public:
 	}
 
 private:
+	// World plane normal under a static rotation: R·normal_. The common identity
+	// case returns the stored normal directly, skipping the matrix multiply.
+	hop::vec3<T> world_normal(const hop::mat3<T> &orientation) const {
+		static const hop::mat3<T> identity;
+		if (orientation == identity)
+			return normal_;
+		hop::vec3<T> n;
+		hop::mul(n, orientation, normal_);
+		return n;
+	}
+
 	hop::vec3<T> normal_;
 	T distance_ {};
 };

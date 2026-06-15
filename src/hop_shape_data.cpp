@@ -323,6 +323,26 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 			return std::make_shared<hop::shape<hop_scalar>>(trimesh_traceable.get());
 		}
 
+		case PhysicsServer3D::SHAPE_HEIGHTMAP: {
+			// Godot passes heightmap data as {width, depth, heights (row-major
+			// PackedFloat32Array, depth rows of width), min_height, max_height}.
+			Dictionary d = data;
+			int w = (int)d.get("width", 0);
+			int dp = (int)d.get("depth", 0);
+			PackedFloat32Array heights = d.get("heights", PackedFloat32Array());
+			if (w < 2 || dp < 2 || heights.size() != w * dp)
+				return nullptr;
+
+			// The grid is 1-unit-spaced in shape-local X/Z with heights along Y;
+			// real spacing/scale lives in the transform basis (hop solids carry no
+			// scale, so bake it into the traceable). to_hop is identity, so godot
+			// X/Z/Y map straight through.
+			Vector3 gscale = p_local_xform.basis.get_scale();
+			heightfield_traceable = std::make_shared<HopHeightfieldTraceable<hop_scalar>>();
+			heightfield_traceable->build(w, dp, heights.ptr(), to_hop(gscale), to_hop(origin));
+			return std::make_shared<hop::shape<hop_scalar>>(heightfield_traceable.get());
+		}
+
 		default:
 			return nullptr;
 	}

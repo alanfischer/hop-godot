@@ -377,13 +377,18 @@ void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 	if (!body || !body->hop_solid) return;
 	body->hop_solid->remove_all_shapes();
 
+	// If the body itself is rotated/scaled, we must bake that into the shapes
+	// because hop::solid only supports translation.
+	Transform3D body_basis_only = body->transform;
+	body_basis_only.origin = Vector3();
+
 	for (auto &entry : body->shapes) {
 		if (entry.disabled) continue;
 
 		HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
 		if (!sd) continue;
 
-		auto hs = sd->make_hop_shape(entry.local_xform);
+		auto hs = sd->make_hop_shape(body_basis_only * entry.local_xform);
 		if (hs) {
 			entry.hop_shape = hs;
 			body->hop_solid->add_shape(hs);
@@ -737,6 +742,7 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 	if (!body) return;
 	switch (p_state) {
 		case PhysicsServer3D::BODY_STATE_TRANSFORM: {
+			Transform3D old_transform = body->transform;
 			body->transform = p_value;
 			if (body->hop_solid) {
 				if (body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC) {
@@ -745,6 +751,13 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 					// sweeps through space and pushes dynamic bodies in its path.
 				} else {
 					body->hop_solid->set_position(to_hop(body->transform.origin));
+					
+					// If the basis (rotation/scale) changed, we MUST rebuild shapes
+					// to bake the new orientation into the translation-only engine.
+					if (!body->transform.basis.is_equal_approx(old_transform.basis)) {
+						rebuild_body_shapes(body);
+					}
+
 					// set_position calls activate() — re-deactivate static bodies
 					if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
 						body->hop_solid->deactivate();

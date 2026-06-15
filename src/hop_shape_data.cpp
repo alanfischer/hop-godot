@@ -293,7 +293,8 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Trans
 			tris.reserve(tri_count);
 
 			auto find_or_add = [&](const Vector3 &p) -> int {
-				hop::vec3<hop_scalar> hp = to_hop(p + origin);
+				// Apply full transform (basis + origin) to vertices
+				hop::vec3<hop_scalar> hp = to_hop(p_local_xform.xform(p));
 				for (int i = 0; i < (int)verts.size(); ++i) {
 					hop::vec3<hop_scalar> diff;
 					hop::sub(diff, verts[i], hp);

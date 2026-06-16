@@ -10,6 +10,36 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <unordered_map>
+
+// Spatial-hash key for trimesh vertex dedup: a vertex position quantized to a
+// grid cell. Coincident / bit-identical verts (the common case from Godot's
+// flat face array) land in the same cell and share an index, turning dedup from
+// an O(N) linear scan per vertex into an O(1) lookup. The cell size matches the
+// old 1e-4 merge tolerance; quantizing only ever under-merges (two distinct
+// verts never collapse below the grid resolution), so it can't distort geometry.
+namespace {
+struct VertKey {
+	int64_t x, y, z;
+	bool operator==(const VertKey &o) const { return x == o.x && y == o.y && z == o.z; }
+};
+struct VertKeyHash {
+	size_t operator()(const VertKey &k) const {
+		// Cheap spatial hash (large primes, à la Teschner et al.).
+		return (size_t)(k.x * 73856093) ^ (size_t)(k.y * 19349663) ^ (size_t)(k.z * 83492791);
+	}
+};
+inline VertKey quantize_vert(const Vector3 &p) {
+	// ≈ the old length_squared < 1e-8 merge tolerance. Done in double so binning
+	// stays exact at large terrain coordinates (float loses integer precision
+	// past ~1.6e7, i.e. ~1.6km at this 1e-4 step).
+	const double q = 1e-4;
+	return VertKey{ (int64_t)std::llround((double)p.x / q),
+	                (int64_t)std::llround((double)p.y / q),
+	                (int64_t)std::llround((double)p.z / q) };
+}
+} // namespace
 
 // Build a hop::convex_solid from a set of convex hull vertices by extracting
 // the unique bounding planes.  For each triplet of non-collinear vertices we
@@ -304,23 +334,27 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			int tri_count = face_count / 3;
 			const Vector3 *pts = faces.ptr();
 
-			// Deduplicate vertices and build index list
+			// Deduplicate vertices and build index list. A spatial hash keyed on
+			// the quantized position makes this O(N) — the old linear rescan was
+			// O(N²) and took tens of seconds on large terrain/BSP meshes.
 			std::vector<hop::vec3<hop_scalar>> verts;
 			std::vector<HopTrimeshTraceable<hop_scalar>::triangle> tris;
 			verts.reserve(face_count);
 			tris.reserve(tri_count);
+			std::unordered_map<VertKey, int, VertKeyHash> vert_index;
+			vert_index.reserve(face_count);
 
 			auto find_or_add = [&](const Vector3 &p) -> int {
 				// Apply full transform (basis + origin) to vertices
-				hop::vec3<hop_scalar> hp = to_hop(p_local_xform.xform(p));
-				for (int i = 0; i < (int)verts.size(); ++i) {
-					hop::vec3<hop_scalar> diff;
-					hop::sub(diff, verts[i], hp);
-					if (hop::length_squared(diff) < to_hop_scalar(1e-8f))
-						return i;
-				}
-				verts.push_back(hp);
-				return (int)verts.size() - 1;
+				Vector3 wp = p_local_xform.xform(p);
+				VertKey key = quantize_vert(wp);
+				auto it = vert_index.find(key);
+				if (it != vert_index.end())
+					return it->second;
+				int idx = (int)verts.size();
+				verts.push_back(to_hop(wp));
+				vert_index.emplace(key, idx);
+				return idx;
 			};
 
 			for (int i = 0; i < tri_count; ++i) {

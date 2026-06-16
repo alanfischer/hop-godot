@@ -59,11 +59,26 @@ public:
 
 	void trace_segment(hop::collision<T> & result,
 	                   const hop::vec3<T> & position,
+	                   const hop::mat3<T> & orientation,
 	                   const hop::segment<T> & seg) override {
-		// Transform segment into mesh-local space (subtract traceable position)
+		// Transform the ray into mesh-local space (mesh verts never move). For a
+		// rotated mesh that's a rotate by Rᵀ about `position`, with the hit mapped
+		// back by R; the common identity case is just the translate, with no matrix
+		// math on the hot raycast path.
+		static const hop::mat3<T> identity;
+		const bool rotated = (orientation != identity);
+		hop::mat3<T> Rt;
 		hop::segment<T> local_seg;
-		hop::sub(local_seg.origin, seg.origin, position);
-		local_seg.direction = seg.direction;
+		if (rotated) {
+			hop::transpose(Rt, orientation);
+			hop::vec3<T> rel;
+			hop::sub(rel, seg.origin, position);
+			hop::mul(local_seg.origin, Rt, rel);
+			hop::mul(local_seg.direction, Rt, seg.direction);
+		} else {
+			hop::sub(local_seg.origin, seg.origin, position);
+			local_seg.direction = seg.direction;
+		}
 
 		bvh_.query_ray(local_seg.origin, local_seg.direction, [&](int tri_idx, T & best_t) {
 			const auto & t_ = tris_[tri_idx];
@@ -73,9 +88,14 @@ public:
 			if (t < best_t && t < result.time) {
 				best_t = t;
 				result.time = t;
-				// Convert hit point back to world space
-				hop::add(result.point, point, position);
-				result.normal = normal;
+				if (rotated) {
+					hop::mul(result.point, orientation, point);
+					hop::add(result.point, position);
+					hop::mul(result.normal, orientation, normal);
+				} else {
+					hop::add(result.point, point, position);
+					result.normal = normal;
+				}
 			}
 		});
 	}
@@ -83,7 +103,21 @@ public:
 	void trace_solid(hop::collision<T> & result,
 	                 hop::solid<T> * s,
 	                 const hop::vec3<T> & position,
+	                 const hop::mat3<T> & orientation,
 	                 const hop::segment<T> & seg, T margin) override {
+		static const hop::mat3<T> identity;
+		if (orientation != identity) {
+			// Rotated mesh: the shared driver handles the frame transform + mover
+			// spine reduction; we supply only the BVH broadphase over the local AABB.
+			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin,
+			    [&](const hop::aa_box<T> & q, auto && visit) {
+				    bvh_.query_aabb(q, [&](int tri_idx) {
+					    const auto & tri = tris_[tri_idx];
+					    visit(verts_[tri.i0], verts_[tri.i1], verts_[tri.i2], normals_[tri_idx]);
+				    });
+			    });
+			return;
+		}
 		// seg.origin = other solid's position, seg.direction = its movement
 		// position = traceable's solid position
 		//

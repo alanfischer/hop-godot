@@ -59,10 +59,26 @@ public:
 
 	void trace_segment(hop::collision<T> & result,
 	                   const hop::vec3<T> & position,
+	                   const hop::mat3<T> & orientation,
 	                   const hop::segment<T> & seg) override {
+		// Transform the ray into grid-local space (the grid never moves). For a
+		// rotated grid that's a rotate by Rᵀ about `position`, with the hit mapped
+		// back by R; the common identity case is just the translate, with no matrix
+		// math on the hot raycast path.
+		static const hop::mat3<T> identity;
+		const bool rotated = (orientation != identity);
 		hop::segment<T> local;
-		hop::sub(local.origin, seg.origin, position);
-		local.direction = seg.direction;
+		if (rotated) {
+			hop::mat3<T> Rt;
+			hop::transpose(Rt, orientation);
+			hop::vec3<T> rel;
+			hop::sub(rel, seg.origin, position);
+			hop::mul(local.origin, Rt, rel);
+			hop::mul(local.direction, Rt, seg.direction);
+		} else {
+			hop::sub(local.origin, seg.origin, position);
+			local.direction = seg.direction;
+		}
 
 		// Walk only the cells the ray crosses (Amanatides–Woo over the XZ grid).
 		dda_cells(local, [&](int i, int j) -> bool {
@@ -72,8 +88,14 @@ public:
 				T th = hoptri::ray_triangle(local, a, b, c, n, point, normal);
 				if (th < result.time) {
 					result.time = th;
-					hop::add(result.point, point, position);
-					result.normal = normal;
+					if (rotated) {
+						hop::mul(result.point, orientation, point);
+						hop::add(result.point, position);
+						hop::mul(result.normal, orientation, normal);
+					} else {
+						hop::add(result.point, point, position);
+						result.normal = normal;
+					}
 				}
 			}
 			// DDA visits cells in increasing t, so the first cell with a hit holds
@@ -85,7 +107,28 @@ public:
 	void trace_solid(hop::collision<T> & result,
 	                 hop::solid<T> * s,
 	                 const hop::vec3<T> & position,
+	                 const hop::mat3<T> & orientation,
 	                 const hop::segment<T> & seg, T margin) override {
+		static const hop::mat3<T> identity;
+		if (orientation != identity) {
+			// Rotated grid: the shared driver handles the frame transform + mover
+			// spine reduction; we supply only the cell broadphase over the local AABB.
+			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin,
+			    [&](const hop::aa_box<T> & q, auto && visit) {
+				    int i0, i1, j0, j1;
+				    if (!cell_range(q, i0, i1, j0, j1))
+					    return;
+				    for (int j = j0; j <= j1; ++j)
+					    for (int i = i0; i <= i1; ++i) {
+						    hop::vec3<T> a, b, c, n;
+						    for (int k = 0; k < 2; ++k) {
+							    cell_triangle(i, j, k, a, b, c, n);
+							    visit(a, b, c, n);
+						    }
+					    }
+			    });
+			return;
+		}
 		// Swept query AABB in heightfield-local space (mirrors the trimesh path).
 		hop::aa_box<T> swept_box;
 		const auto & shapes = s->get_shapes();

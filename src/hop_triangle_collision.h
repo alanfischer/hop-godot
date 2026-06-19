@@ -226,6 +226,11 @@ inline void recover_support_plane(hop::shape<T> * sh, const hop::vec3<T> & local
 			result.normal = face_n;
 			result.point = seg.origin;
 			found = true;
+			// Real contact point on the triangle (proj = local_origin projected onto
+			// the face); map local→world by +position (seg.origin - local_origin).
+			hop::vec3<T> off;
+			hop::sub(off, seg.origin, local_origin);
+			hop::add(result.impact, proj, off);
 		}
 	}
 }
@@ -268,6 +273,10 @@ inline void sweep_support_plane(hop::shape<T> * sh, const hop::vec3<T> & local_o
 		hop::mul(result.point, seg.direction, t);
 		hop::add(result.point, seg.origin);
 		result.normal = face_n;
+		// Real contact point on the triangle at TOI; map local→world by +position.
+		hop::vec3<T> off;
+		hop::sub(off, seg.origin, local_origin);
+		hop::add(result.impact, proj, off);
 	}
 }
 
@@ -296,6 +305,14 @@ inline void recover_shape_vs_triangle(hop::shape<T> * sh, const hop::vec3<T> & l
 				result.normal = n;
 				result.point = seg.origin;
 				found = true;
+				// Real contact point on the triangle (a resting rider's footprint),
+				// for lever arms; map local→world by +position (seg.origin-local_origin).
+				hop::vec3<T> p1s, p2s, cs, ct, off;
+				hop::add(p1s, base, cap.origin);
+				hop::add(p2s, p1s, cap.direction);
+				hop::closest_segment_triangle(p1s, p2s, a, b, c, cs, ct, contact_eps<T>());
+				hop::sub(off, seg.origin, local_origin);
+				hop::add(result.impact, ct, off);
 			}
 		}
 	} else {
@@ -325,6 +342,19 @@ inline void sweep_shape_vs_triangle(hop::shape<T> * sh, const hop::vec3<T> & loc
 			hop::mul(result.point, seg.direction, sweep.time);
 			hop::add(result.point, seg.origin);
 			result.normal = sweep.normal;
+			// Real contact point on the TRIANGLE (collidee surface) at TOI, for lever
+			// arms (kinematic carry / angular response). result.point is the MOVER's
+			// origin at impact; this is the witness point on the target. The spine's
+			// closest-point on the triangle (ct) is what we want; recompute it at the
+			// impact position, then map the local point to world by +position
+			// (= seg.origin - local_origin for this identity-oriented traceable).
+			hop::vec3<T> p1t, p2t, cs, ct, off;
+			hop::mul(off, seg.direction, sweep.time);
+			hop::add(p1t, p1, off);
+			hop::add(p2t, p2, off);
+			hop::closest_segment_triangle(p1t, p2t, a, b, c, cs, ct, contact_eps<T>());
+			hop::sub(off, seg.origin, local_origin); // traceable world position
+			hop::add(result.impact, ct, off);
 		}
 	} else {
 		sweep_support_plane(sh, local_origin, seg, a, b, c, face_n, seam_tol, result);
@@ -395,6 +425,11 @@ inline void capsule_local_vs_triangle(const hop::vec3<T> & p1, const hop::vec3<T
 				result.normal = n;
 				result.point = local_seg.origin;
 				found = true;
+				// Local contact point on the triangle; trace_solid_rotated maps it to
+				// world by R alongside point/normal.
+				hop::vec3<T> cs, ct;
+				hop::closest_segment_triangle(p1, p2, a, b, c, cs, ct, contact_eps<T>());
+				result.impact = ct;
 			}
 		}
 	} else {
@@ -406,6 +441,13 @@ inline void capsule_local_vs_triangle(const hop::vec3<T> & p1, const hop::vec3<T
 			hop::mul(result.point, local_seg.direction, sweep.time);
 			hop::add(result.point, local_seg.origin);
 			result.normal = sweep.normal;
+			// Local contact point on the triangle at TOI (mapped to world by caller).
+			hop::vec3<T> p1t, p2t, cs, ct, off;
+			hop::mul(off, local_seg.direction, sweep.time);
+			hop::add(p1t, p1, off);
+			hop::add(p2t, p2, off);
+			hop::closest_segment_triangle(p1t, p2t, a, b, c, cs, ct, contact_eps<T>());
+			result.impact = ct;
 		}
 	}
 }
@@ -482,6 +524,10 @@ inline void trace_solid_rotated(hop::collision<T> & result, hop::solid<T> * s,
 		hop::vec3<T> wp;
 		hop::mul(wp, orientation, local.point);
 		hop::add(result.point, wp, position);
+		// Map the local contact point on the triangle back to world (R·local + pos).
+		hop::vec3<T> wi;
+		hop::mul(wi, orientation, local.impact);
+		hop::add(result.impact, wi, position);
 	}
 }
 

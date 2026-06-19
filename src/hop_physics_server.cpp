@@ -1120,6 +1120,36 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	float unsafe = motion_len > 1e-6f ? std::min(hit_dist / motion_len, 1.0f)
 	                                  : (probe_time < 1.0f ? 0.0f : 1.0f);
 
+	// A t==0 swept contact (the body is already flush — within the speculative
+	// margin of a surface) must not starve a move the body isn't really driving
+	// into. Depenetration is handled separately by the recovery step above. Two
+	// cases get freed (probe_time/unsafe forced to "no swept hit"):
+	//
+	//  1. WALKABLE surface (normal within 45° of up): the floor/ramp you stand on.
+	//     It must never block horizontal motion — but a walk carries a small
+	//     downward gravity sliver, so mdir·n is slightly negative and a pure
+	//     moving-into test wrongly classifies the floor as an obstruction, zeroing
+	//     the safe fraction every tick the capsule settles within the (8mm) spec
+	//     band of the floor. That is the "random stuck on flat floor" bug.
+	//  2. WALL the body is only flush against, not moving into (tangential or
+	//     separating) — so it can slide along a wall instead of sticking in the
+	//     spec band (recovery, measured against the bare radius, never pushes it
+	//     out of that band).
+	//
+	// Genuine into-a-wall motion (low n.y, mdir·n < 0) still blocks normally.
+	if (probe_time <= 1e-4f && motion_len > 1e-6f) {
+		Vector3 n = to_godot(result.normal);
+		Vector3 up(0.0f, 1.0f, 0.0f);
+		Vector3 g = to_godot(space->simulator->get_gravity());
+		if (g.length() > 1e-6f) up = -g.normalized();
+		bool walkable = n.dot(up) >= 0.707f;             // floor/ramp — never blocks the walk
+		bool not_into = (p_motion / motion_len).dot(n) >= -1e-3f; // wall: only blocks motion into it
+		if (walkable || not_into) {
+			probe_time = 1.0f;
+			unsafe = 1.0f;
+		}
+	}
+
 	bool recovered = recover != Vector3();
 	bool collided = probe_time < 1.0f;
 

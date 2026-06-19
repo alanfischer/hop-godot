@@ -46,6 +46,17 @@ static std::shared_ptr<hop::solid<T>> make_capsule(T radius, T half_spine) {
 	return s;
 }
 
+// An axis-aligned box mover with half-extents (hx,hy,hz) — exercises the
+// support-plane (non-capsule) contact path.
+static std::shared_ptr<hop::solid<T>> make_box(T hx, T hy, T hz) {
+	hop::aa_box<T> b;
+	b.mins = vec(-hx, -hy, -hz);
+	b.maxs = vec(hx, hy, hz);
+	auto s = std::make_shared<hop::solid<T>>();
+	s->add_shape(std::make_shared<hop::shape<T>>(b));
+	return s;
+}
+
 static std::unique_ptr<HopTrimeshTraceable<T>> make_mesh(const std::vector<V> & verts,
                                                          const std::vector<Tri> & tris) {
 	auto m = std::make_unique<HopTrimeshTraceable<T>>();
@@ -60,7 +71,8 @@ static hop::collision<T> probe_static(HopTrimeshTraceable<T> & mesh,
 	hop::segment<T> seg;
 	seg.set_start_end(center, center); // zero direction → static-overlap path
 	hop::collision<T> c; c.reset();
-	mesh.trace_solid(c, body, vec(0, 0, 0), seg, T {});
+	static const hop::mat3<T> identity;
+	mesh.trace_solid(c, body, vec(0, 0, 0), identity, seg, T {});
 	return c;
 }
 
@@ -72,7 +84,8 @@ static hop::collision<T> probe_swept(HopTrimeshTraceable<T> & mesh,
 	V end = vec(center.x + motion.x, center.y + motion.y, center.z + motion.z);
 	seg.set_start_end(center, end);
 	hop::collision<T> c; c.reset();
-	mesh.trace_solid(c, body, vec(0, 0, 0), seg, T {});
+	static const hop::mat3<T> identity;
+	mesh.trace_solid(c, body, vec(0, 0, 0), identity, seg, T {});
 	return c;
 }
 
@@ -281,6 +294,124 @@ static void test_ramp_climb() {
 	printf("  ramp climb: %d/9 ramp samples caught with up-ish normal\n", hits);
 }
 
+// --- Test 9: degenerate triangle must not yield a non-normalized normal ---
+// build() runs normalize_carefully with a zero fallback, so a sliver/degenerate
+// triangle (common in BSP soup) stores a ZERO face normal. The swept path must
+// keep the unit radial normal — otherwise move_and_slide
+// gets a (0,0,0) normal, velocity.slide() asserts "must be normalized", and the
+// body's velocity is zeroed (the reported console spam + a hard catch).
+static void test_degenerate_tri_normal() {
+	const T r = 0.4;
+	// A real triangle whose closest feature to the capsule is its vertical x=0.5
+	// edge, but passed with a ZERO face normal to emulate the degenerate case.
+	V a = vec(0.5, -1, 0), b = vec(0.5, 1, 0), c = vec(0.7, 1, 0);
+	V p1 = vec(0.2, -0.5, -0.6), p2 = vec(0.2, 0.5, -0.6); // spine offset toward the edge
+	V dir = vec(0, 0, 1.2);
+	V zero_fn = vec(0, 0, 0);
+	auto res = hoptri::sweep_capsule_triangle<T>(p1, p2, dir, r, a, b, c, zero_fn, T {});
+	assert(res.hit); // it does graze the edge
+	T len = std::sqrt(res.normal.x * res.normal.x + res.normal.y * res.normal.y +
+	                  res.normal.z * res.normal.z);
+	assert(std::fabs(len - 1.0) < 1e-3); // unit radial kept; never the zero face_n
+	printf("  degenerate-tri normal: hit, normal stays unit (len=%.4f)\n", len);
+}
+
+// --- Test 10: a capsule dropping onto a step top is NOT rejected at the edge ---
+// walk_move climbs a step by lift → move forward → drop, and accepts the step only
+// if the drop lands on a floor (down normal·UP >= 0.5). When the capsule drops near
+// the step's front edge, the contact must report an up-ish step-TOP normal, not the
+// vertical RISER face — otherwise landed_on_floor is false and the step can't be
+// climbed. The radial closest-point normal is up-ish here, which is what we want.
+static void test_step_drop_not_rejected() {
+	const T r = 0.4, half = 0.5, H = 0.27; // 27cm step (well under step_height)
+	std::vector<V> verts; std::vector<Tri> tris;
+	auto quad = [&](V a, V b, V c, V d) {
+		int i = (int)verts.size();
+		verts.push_back(a); verts.push_back(b); verts.push_back(c); verts.push_back(d);
+		tris.push_back({ i, i + 1, i + 2 }); tris.push_back({ i, i + 2, i + 3 });
+		tris.push_back({ i, i + 2, i + 1 }); tris.push_back({ i, i + 3, i + 2 });
+	};
+	quad(vec(-5, 0, 0), vec(5, 0, 0), vec(5, 0, 5), vec(-5, 0, 5));       // lower floor y=0
+	quad(vec(-5, 0, 0), vec(-5, H, 0), vec(5, H, 0), vec(5, 0, 0));       // riser z=0 (+z)
+	quad(vec(-5, H, -5), vec(5, H, -5), vec(5, H, 0), vec(-5, H, 0));     // step top y=H
+	auto mesh = make_mesh(verts, tris);
+	auto body = make_capsule(r, half);
+
+	// Lifted capsule dropping onto the step top, from just past the edge (z<0) to
+	// just short of it (z>0, overhanging the edge) — every offset must land "floor".
+	int landed = 0;
+	for (T cz = -0.20; cz <= 0.10 + 1e-9; cz += 0.05) {
+		V start = vec(0, H + r + half + 0.30, cz);
+		hop::collision<T> c = probe_swept(*mesh, body.get(), start, vec(0, -0.46, 0));
+		assert(c.time < T(1));        // the drop lands
+		assert(c.normal.y >= 0.5);    // up-ish → walk_move accepts (never the riser)
+		++landed;
+	}
+	assert(landed == 7);
+	printf("  step drop not rejected: %d/7 drops land on floor (n.y>=0.5)\n", landed);
+}
+
+// --- Test 11: col.impact is the real contact point ON the collidee surface ---
+// Needed for lever arms (rotating-platform carry, angular response): col.point is
+// the MOVER's origin at impact (~the capsule center); col.impact must be the
+// witness point on the triangle, ~one radius away along the normal.
+static void test_contact_point_on_surface() {
+	const T r = 0.4, half = 0.5;
+
+	// (a) Swept into a vertical wall at z=0 (normal +z). Contact point sits on the
+	//     wall (z≈0); the mover origin stops ~radius behind it.
+	{
+		std::vector<V> verts; std::vector<Tri> tris;
+		verts.push_back(vec(-5, -5, 0)); verts.push_back(vec(5, -5, 0));
+		verts.push_back(vec(5, 5, 0)); verts.push_back(vec(-5, 5, 0));
+		tris.push_back({ 0, 1, 2 }); tris.push_back({ 0, 2, 3 });
+		tris.push_back({ 0, 2, 1 }); tris.push_back({ 0, 3, 2 }); // BSP twin
+		auto mesh = make_mesh(verts, tris);
+		auto body = make_capsule(r, half);
+		hop::collision<T> c = probe_swept(*mesh, body.get(), vec(0, 0, -1.0), vec(0, 0, 1.2));
+		assert(c.time < T(1));                       // hit the wall
+		assert(std::fabs(c.impact.z) < 0.02);        // contact ON the wall plane
+		assert(c.point.z < -0.2);                    // mover origin is behind the wall
+		assert(std::fabs((c.impact.z - c.point.z) - r) < 0.05); // ~one radius apart
+		printf("  contact point (swept wall): impact.z=%.3f point.z=%.3f\n",
+		       (double)c.impact.z, (double)c.point.z);
+	}
+
+	// (b) Resting on a floor at y=0 (static overlap): contact is on the floor below,
+	//     not at the capsule center.
+	{
+		std::vector<V> verts; std::vector<Tri> tris;
+		flat_quad(verts, tris, true); // UP-facing floor at y=0
+		auto mesh = make_mesh(verts, tris);
+		auto body = make_capsule(r, half);
+		hop::collision<T> c = probe_static(*mesh, body.get(), vec(0, r + half, 0));
+		assert(c.time == T {});                      // resting contact
+		assert(std::fabs(c.impact.y) < 0.02);        // contact ON the floor
+		assert(c.point.y > 0.5);                     // mover origin is up at the center
+		printf("  contact point (resting floor): impact.y=%.3f point.y=%.3f\n",
+		       (double)c.impact.y, (double)c.point.y);
+	}
+
+	// (c) BOX mover (support-plane path) swept into the same wall: contact on the
+	//     wall (z≈0), box origin ~one half-extent behind.
+	{
+		const T hb = 0.4;
+		std::vector<V> verts; std::vector<Tri> tris;
+		verts.push_back(vec(-5, -5, 0)); verts.push_back(vec(5, -5, 0));
+		verts.push_back(vec(5, 5, 0)); verts.push_back(vec(-5, 5, 0));
+		tris.push_back({ 0, 1, 2 }); tris.push_back({ 0, 2, 3 });
+		tris.push_back({ 0, 2, 1 }); tris.push_back({ 0, 3, 2 });
+		auto mesh = make_mesh(verts, tris);
+		auto box = make_box(hb, hb, hb);
+		hop::collision<T> c = probe_swept(*mesh, box.get(), vec(0, 0, -1.0), vec(0, 0, 1.2));
+		assert(c.time < T(1));
+		assert(std::fabs(c.impact.z) < 0.02);        // contact ON the wall, not the box center
+		assert(c.point.z < -0.2);
+		printf("  contact point (swept box): impact.z=%.3f point.z=%.3f\n",
+		       (double)c.impact.z, (double)c.point.z);
+	}
+}
+
 int main() {
 	printf("test_trimesh_traceable:\n");
 	test_recovery_front_face();
@@ -291,6 +422,9 @@ int main() {
 	test_capsule_gap_fit();
 	test_no_false_contact();
 	test_ramp_climb();
+	test_degenerate_tri_normal();
+	test_step_drop_not_rejected();
+	test_contact_point_on_surface();
 	printf("ALL PASSED\n");
 	return 0;
 }

@@ -81,6 +81,7 @@ public:
 				result.point = seg.origin;
 				// depth measured against the inflated surface (= margin − true_gap)
 				result.depth = expanded_d - origin_dot;
+				project_to_plane(result.impact, result.point, normal, position);
 			}
 			return;
 		}
@@ -99,10 +100,21 @@ public:
 			hop::mul(result.point, seg.direction, t);
 			hop::add(result.point, seg.origin);
 			result.normal = normal;
+			project_to_plane(result.impact, result.point, normal, position);
 		}
 	}
 
 private:
+	// Real contact point on the plane = the mover origin projected onto the world
+	// plane (dot(n, x − position) = distance_). For lever arms (carry / angular).
+	void project_to_plane(hop::vec3<T> &out, const hop::vec3<T> &p,
+	                      const hop::vec3<T> &normal, const hop::vec3<T> &position) const {
+		T gap = hop::dot(normal, p) - hop::dot(normal, position) - distance_;
+		hop::vec3<T> ns;
+		hop::mul(ns, normal, gap);
+		hop::sub(out, p, ns);
+	}
+
 	// World plane normal under a static rotation: R·normal_. The common identity
 	// case returns the stored normal directly, skipping the matrix multiply.
 	hop::vec3<T> world_normal(const hop::mat3<T> &orientation) const {

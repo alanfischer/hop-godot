@@ -139,7 +139,11 @@ Transform3D HopDirectBodyState::_get_transform() const {
 }
 
 Vector3 HopDirectBodyState::_get_velocity_at_local_position(const Vector3 &p_local_position) const {
-	return body ? body->linear_velocity : Vector3(); // no angular, so velocity is uniform
+	if (!body) return Vector3();
+	// v_linear + ω × r, same as GodotPhysicsDirectBodyState3D. For a kinematic mover
+	// linear/angular velocity are the per-frame motion published in _step, so this is
+	// what carries a CharacterBody3D rider on a moving / rotating platform.
+	return body->velocity_at_local(p_local_position);
 }
 
 void HopDirectBodyState::_apply_central_impulse(const Vector3 &p_impulse) {

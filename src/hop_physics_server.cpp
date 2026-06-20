@@ -555,7 +555,8 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 			// Kinematic bodies: infinite mass, no gravity, no self-propulsion in hop.
 			// Stay active so dynamic bodies collide with them; position is driven by
 			// Godot each frame via _body_set_state(TRANSFORM). hop must never integrate
-			// their position, so we keep their hop velocity at zero.
+			// their position, so we keep their hop velocity at zero (the _step loop
+			// prescribes a per-frame velocity to sweep them, then snaps it back).
 			body->hop_solid->set_infinite_mass();
 			body->hop_solid->set_coefficient_of_gravity(scalar_from_int<hop_scalar>(0));
 			body->hop_solid->set_velocity(hop::vec3<hop_scalar>(scalar_from_int<hop_scalar>(0), scalar_from_int<hop_scalar>(0), scalar_from_int<hop_scalar>(0)));
@@ -998,6 +999,16 @@ void HopPhysicsServer::_body_set_ray_pickable(const RID &p_body, bool p_enable) 
 	if (body) body->ray_pickable = p_enable;
 }
 
+// Resolve the HopBodyData behind a collision (preferring the hit collider, falling
+// back to the collidee), excluding the moving body itself. Centralizing this keeps
+// every contact report carrying its collider — a null collider silently zeroes the
+// reported collider_velocity, which once broke moving-platform carry.
+static HopBodyData *body_of(hop::solid<hop_scalar> *collider, hop::solid<hop_scalar> *collidee,
+                            const hop::solid<hop_scalar> *self) {
+	hop::solid<hop_scalar> *hit = (collider != nullptr && collider != self) ? collider : collidee;
+	return (hit != nullptr && hit != self) ? static_cast<HopBodyData *>(hit->get_user_data()) : nullptr;
+}
+
 bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p_from, const Vector3 &p_motion, float p_margin, int32_t p_max_collisions, bool p_collide_separation_ray, bool p_recovery_as_collision, PhysicsServer3DExtensionMotionResult *p_result) const {
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body || !body->hop_solid) return false;
@@ -1022,6 +1033,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	Vector3 recover;
 	Vector3 recover_normal;
 	float recover_depth = 0.0f;
+	HopBodyData *recover_body = nullptr;  // the body we depenetrated from (for its contact velocity)
 	const int MAX_RECOVER_ITERS = 4;
 	for (int i = 0; i < MAX_RECOVER_ITERS; ++i) {
 		Vector3 test_pos = p_from.origin + recover;
@@ -1042,6 +1054,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 
 		recover += n * (depth + skin);
 		recover_normal = n;
+		recover_body = body_of(overlap.collider, overlap.collidee, body->hop_solid.get());
 		if (depth > recover_depth) recover_depth = depth;
 	}
 
@@ -1092,6 +1105,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	bool ground_hit = false;
 	Vector3 ground_point;
 	Vector3 ground_normal;
+	HopBodyData *ground_body = nullptr;  // the floor body (for moving-platform carry velocity)
 	if (p_recovery_as_collision) {
 		Vector3 gvec = to_godot(space->simulator->get_gravity());
 		float glen = gvec.length();
@@ -1110,6 +1124,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 				ground_hit = true;
 				ground_point = to_godot(gres.point);
 				ground_normal = to_godot(gres.normal);
+				ground_body = body_of(gres.collider, gres.collidee, body->hop_solid.get());
 			}
 		}
 	}
@@ -1203,7 +1218,11 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			col.collider_shape = 0;
 			col.collider = other ? other->self_rid : RID();
 			col.collider_id = other ? ObjectID(other->object_instance_id) : ObjectID();
-			col.collider_velocity = other ? other->linear_velocity : Vector3();
+			// Velocity at the contact point (v_linear + ω × r), so a CharacterBody3D
+			// rider is carried by a moving/rotating platform.
+			col.collider_velocity = other
+			    ? other->velocity_at_local(position - other->transform.origin)
+			    : Vector3();
 			count++;
 		};
 
@@ -1215,19 +1234,14 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		// null/RID(0) for every static hit (worldspawn trimesh AND brush-entity
 		// convex), since the old code read the always-null collidee.
 		if (collided) {
-			hop::solid<hop_scalar> *hit = result.collider;
-			if (hit == nullptr || hit == body->hop_solid.get())
-				hit = result.collidee;
-			HopBodyData *other = (hit != nullptr && hit != body->hop_solid.get())
-				? static_cast<HopBodyData *>(hit->get_user_data())
-				: nullptr;
+			HopBodyData *other = body_of(result.collider, result.collidee, body->hop_solid.get());
 			add_collision(to_godot(result.point), to_godot(result.normal), 0.0f, other);
 		}
 
 		// Recovery contact: report the surface we pushed out of so callers that
 		// asked for it (is_on_floor / wall stability) see a stable contact.
 		if (p_recovery_as_collision && recovered && recover_normal != Vector3() && count < max_collisions) {
-			add_collision(from_pos, recover_normal, recover_depth, nullptr);
+			add_collision(from_pos, recover_normal, recover_depth, recover_body);
 		}
 
 		// Ground-rest contact: the floor found by the gravity-down probe, reported
@@ -1235,7 +1249,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		// true while the swept motion is sliding along a wall or has just stopped
 		// after a landing.  CharacterBody3D still classifies floor-vs-wall by angle.
 		if (ground_hit && ground_normal != Vector3() && count < max_collisions) {
-			add_collision(ground_point, ground_normal, 0.0f, nullptr);
+			add_collision(ground_point, ground_normal, 0.0f, ground_body);
 		}
 
 		p_result->collision_count = count;
@@ -1748,13 +1762,15 @@ void HopPhysicsServer::_step(float p_step) {
 			// never integrates it); only position / velocity / ω differ by branch.
 			body->hop_solid->set_orientation(new_R);
 			if (jump) {
-				// Discontinuous jump: snap and zero velocity and spin.
+				// Discontinuous jump (placement/respawn): snap, carry no motion.
 				body->hop_solid->set_position(new_pos);
 				body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
 				body->hop_solid->set_angular_velocity(hop::vec3<hop_scalar>{});
+				body->linear_velocity = Vector3();
+				body->angular_velocity = Vector3();
 			} else {
-				// Normal frame: set velocity so hop sweeps the body to new_pos, and
-				// set ω so the contact solver carries riders tangentially.
+				// Set velocity so hop sweeps the body to new_pos (pushing dynamics and
+				// feeding the contact solver's dynamic-rider carry via ω).
 				hop::vec3<hop_scalar> vel;
 				vel.x = delta.x * inv_dt;
 				vel.y = delta.y * inv_dt;
@@ -1762,6 +1778,12 @@ void HopPhysicsServer::_step(float p_step) {
 				body->hop_solid->set_velocity(vel);
 				body->hop_solid->set_angular_velocity(omega);
 				body->hop_solid->activate();
+				// Publish the per-frame motion as this body's velocity (as GodotPhysics3D
+				// tracks a kinematic body), so a CharacterBody3D rider's platform carry
+				// reads v + ω×r via get_velocity_at_local_position / collider_velocity —
+				// the rider carries itself; it is not a hop dynamic body.
+				body->linear_velocity = to_godot(vel);
+				body->angular_velocity = to_godot(omega);
 			}
 		});
 	}
@@ -1773,14 +1795,13 @@ void HopPhysicsServer::_step(float p_step) {
 	});
 
 	// After stepping, snap kinematic bodies back to the Godot-authoritative
-	// position and zero their hop velocity.  hop may have stopped the body
-	// short due to collision response; Godot's transform is still the target.
+	// position and zero their hop velocity. hop may have stopped the swept body
+	// short at a contact; Godot's transform is the target. (The platform-carry
+	// velocity above lives on body->linear/angular, so it survives this.)
 	body_owner.for_each([&](HopBodyData *body) {
 		if (!body->hop_solid || body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
 		body->hop_solid->set_position(to_hop(body->transform.origin));
 		body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
-		// Orientation is already committed to the frame target (set in the pre-step
-		// loop; hop does not integrate it), so only the carry ω needs clearing.
 		body->hop_solid->set_angular_velocity(hop::vec3<hop_scalar>{});
 	});
 

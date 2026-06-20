@@ -29,10 +29,22 @@ struct HopBodyData {
 	uint64_t object_instance_id = 0;
 
 	Transform3D transform;
+	// Godot-facing velocities. A dynamic body's linear_velocity tracks the hop solid;
+	// angular_velocity is script-set only (hop has no dynamic spin yet). For a
+	// KINEMATIC mover, _step publishes its per-frame motion here (v = Δorigin/dt, ω
+	// from the basis delta) — as GodotPhysics3D tracks a kinematic body — so Godot's
+	// CharacterBody3D platform carry reads v + ω×r via get_velocity_at_local_position
+	// / collider_velocity and a rider is carried by a func_rotating / func_platrot.
 	Vector3 linear_velocity;
-	Vector3 angular_velocity; // stored but not used by hop
+	Vector3 angular_velocity;
 	Vector3 constant_force;
 	Vector3 constant_torque; // stored but not used by hop
+
+	// Rigid-body velocity at a point given relative to this body's origin
+	// (v_linear + ω × r) — the moving-platform carry velocity a rider reads.
+	Vector3 velocity_at_local(const Vector3 &r) const {
+		return linear_velocity + angular_velocity.cross(r);
+	}
 
 	float mass = 1.0f;
 	float bounce = 0.0f;

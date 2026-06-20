@@ -2,6 +2,8 @@
 #include "hop_body_state.h"
 #include "hop_space_state.h"
 #include "hop_conversions.h"
+#include <hop/math/mat3.h>
+#include <hop/math/quat.h>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
@@ -807,7 +809,11 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 				body->hop_solid->set_velocity(to_hop(body->linear_velocity));
 		} break;
 		case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY: {
-			body->angular_velocity = p_value; // stored but no-op in hop
+			// Stored for query parity. Kinematic carry ω is derived from the
+			// per-frame orientation delta in _step (mirroring how kinematic linear
+			// velocity is derived from the position delta, not this setter); a
+			// directly-set avelocity on a dynamic body awaits Phase 8 integration.
+			body->angular_velocity = p_value;
 		} break;
 		case PhysicsServer3D::BODY_STATE_SLEEPING: {
 			body->sleeping = p_value;
@@ -1705,17 +1711,56 @@ void HopPhysicsServer::_step(float p_step) {
 			float dy = to_godot_float(delta.y);
 			float dz = to_godot_float(delta.z);
 
-			if (dx * dx + dy * dy + dz * dz > teleport_dist2) {
-				// Discontinuous jump: snap and zero velocity.
+			// Angular analog of the linear sweep: derive ω from the body's
+			// per-frame orientation delta so a rotating kinematic platform
+			// (func_rotating) carries the riders touching it. ΔR = R_new·R_oldᵀ
+			// (world-frame delta) → axis-angle → ω = axis·θ/dt. hop snapshots
+			// orientation per frame rather than integrating ω, so we also commit
+			// the new orientation here; the post-step snap-back zeroes ω again.
+			hop::mat3<hop_scalar> old_R = body->hop_solid->get_orientation();
+			hop::mat3<hop_scalar> new_R = to_hop_orientation(body->transform.basis);
+			hop::vec3<hop_scalar> omega;  // zero unless the body actually rotated
+			hop_scalar angle {};
+			if (new_R != old_R) {
+				// Most kinematic bodies only translate, so skip the quat / axis-angle
+				// (two sqrts) whenever the orientation is unchanged frame-to-frame.
+				hop::mat3<hop_scalar> old_RT;
+				hop::transpose(old_RT, old_R);
+				hop::mat3<hop_scalar> dR;
+				hop::mul(dR, new_R, old_RT);
+				hop::quat<hop_scalar> dq;
+				hop::set_quat_from_mat3(dq, dR);
+				hop::vec3<hop_scalar> axis;
+				angle = hop::get_axis_angle_from_quat(
+				    axis, dq, hop::scalar_traits<hop_scalar>::default_epsilon());
+				hop::mul(omega, axis, angle * inv_dt);
+			}
+
+			// A rotation past this per-frame angle is a placement snap, not a smooth
+			// spin (0.5 rad/frame ≈ 1800°/s — far above any real platform), so it is
+			// treated as discontinuous like a large translation: it would otherwise
+			// impart a one-frame ω spike on the frame a body is placed pre-rotated.
+			const float angular_teleport = 0.5f;
+			bool jump = dx * dx + dy * dy + dz * dz > teleport_dist2 ||
+			            to_godot_float(angle) > angular_teleport;
+
+			// Orientation is committed every frame regardless (hop snapshots it and
+			// never integrates it); only position / velocity / ω differ by branch.
+			body->hop_solid->set_orientation(new_R);
+			if (jump) {
+				// Discontinuous jump: snap and zero velocity and spin.
 				body->hop_solid->set_position(new_pos);
 				body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
+				body->hop_solid->set_angular_velocity(hop::vec3<hop_scalar>{});
 			} else {
-				// Normal frame: set velocity so hop sweeps the body to new_pos.
+				// Normal frame: set velocity so hop sweeps the body to new_pos, and
+				// set ω so the contact solver carries riders tangentially.
 				hop::vec3<hop_scalar> vel;
 				vel.x = delta.x * inv_dt;
 				vel.y = delta.y * inv_dt;
 				vel.z = delta.z * inv_dt;
 				body->hop_solid->set_velocity(vel);
+				body->hop_solid->set_angular_velocity(omega);
 				body->hop_solid->activate();
 			}
 		});
@@ -1734,6 +1779,9 @@ void HopPhysicsServer::_step(float p_step) {
 		if (!body->hop_solid || body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
 		body->hop_solid->set_position(to_hop(body->transform.origin));
 		body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
+		// Orientation is already committed to the frame target (set in the pre-step
+		// loop; hop does not integrate it), so only the carry ω needs clearing.
+		body->hop_solid->set_angular_velocity(hop::vec3<hop_scalar>{});
 	});
 
 	// Sync positions from hop to Godot

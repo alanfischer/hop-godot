@@ -4,6 +4,7 @@
 #include <godot_cpp/classes/object.hpp>
 #include <godot_cpp/godot.hpp>
 #include <hop/fixed16.h>
+#include <hop/fixed32.h>
 #include <hop/math/vec3.h>
 #include <type_traits>
 
@@ -26,7 +27,7 @@ inline godot::Object *get_collider_safe(uint64_t p_id) {
 
 // The scalar type used throughout the GDExtension.
 // Switch between float and hop::fixed16 here.
-using hop_scalar = float;
+using hop_scalar = hop::fixed32;
 
 // --- Scalar conversions ---
 

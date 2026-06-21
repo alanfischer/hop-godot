@@ -43,6 +43,8 @@ inline bool point_in_triangle(const hop::vec3<T> & p, const hop::vec3<T> & a,
 	T eps;
 	if constexpr (std::is_same_v<T, hop::fixed16>)
 		eps = -hop::fixed16::from_raw(1 << 4);
+	else if constexpr (std::is_same_v<T, hop::fixed32>)
+		eps = -hop::fixed32::from_raw(1LL << 20); // ~ -2.4e-4, matching the fixed16 tolerance
 	else
 		eps = T(-1e-4);
 	return u >= eps && v >= eps && (u + v) <= (tr::one() - eps);
@@ -81,6 +83,8 @@ inline T ray_triangle(const hop::segment<T> & seg, const hop::vec3<T> & v0,
 	T eps;
 	if constexpr (std::is_same_v<T, hop::fixed16>)
 		eps = hop::fixed16::from_raw(1);
+	else if constexpr (std::is_same_v<T, hop::fixed32>)
+		eps = hop::fixed32::from_raw(1LL << 9); // ~1.2e-7, matching the float threshold
 	else
 		eps = T(1e-7);
 	if (a > -eps && a < eps)

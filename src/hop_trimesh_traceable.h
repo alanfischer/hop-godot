@@ -211,7 +211,7 @@ private:
 	// path is distance-based and bridges seams up to the capsule radius for free.
 	// ~1cm at the game's scale: bridges sub-cm mesh seams without papering over
 	// real holes.
-	T seam_tol_ = T(1) / T(100);
+	T seam_tol_ = tr::from_int(1) / tr::from_int(100);
 
 	void tri_aabb(int idx, hop::aa_box<T> & box) const {
 		auto & t = tris_[idx];
@@ -221,7 +221,7 @@ private:
 		box.merge(verts_[t.i2]);
 		// Small epsilon expansion so zero-thickness (axis-aligned) triangles
 		// are reliably found by the BVH even when the query box just grazes them.
-		const T eps = T(1e-3f);
+		const T eps = tr::from_milli(1);
 		box.mins.x -= eps; box.mins.y -= eps; box.mins.z -= eps;
 		box.maxs.x += eps; box.maxs.y += eps; box.maxs.z += eps;
 	}

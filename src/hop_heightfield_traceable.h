@@ -32,8 +32,8 @@ public:
 		origin_ = origin;
 		cell_x_ = scale.x;
 		cell_z_ = scale.z;
-		half_x_ = T(width_ - 1) * tr::half();
-		half_z_ = T(depth_ - 1) * tr::half();
+		half_x_ = tr::from_int(width_ - 1) * tr::half();
+		half_z_ = tr::from_int(depth_ - 1) * tr::half();
 
 		heights_.resize(width_ * depth_);
 		min_h_ = max_h_ = T {};
@@ -184,16 +184,16 @@ private:
 	T half_x_ {}, half_z_ {};
 	T min_h_ {}, max_h_ {};
 	// Seam tolerance for the non-capsule support-plane path (matches the trimesh).
-	T seam_tol_ = T(1) / T(100);
+	T seam_tol_ = tr::from_int(1) / tr::from_int(100);
 
 	T height_at(int i, int j) const { return heights_[j * width_ + i]; }
 
 	// Local-space position of grid point (i, j).
 	hop::vec3<T> point_at(int i, int j) const {
 		hop::vec3<T> p;
-		p.x = origin_.x + (T(i) - half_x_) * cell_x_;
+		p.x = origin_.x + (tr::from_int(i) - half_x_) * cell_x_;
 		p.y = origin_.y + height_at(i, j);
-		p.z = origin_.z + (T(j) - half_z_) * cell_z_;
+		p.z = origin_.z + (tr::from_int(j) - half_z_) * cell_z_;
 		return p;
 	}
 
@@ -255,8 +255,8 @@ private:
 		T dj = local.direction.z / cell_z_;
 
 		const T zero {};
-		const T gmax_i = T(width_ - 1);
-		const T gmax_j = T(depth_ - 1);
+		const T gmax_i = tr::from_int(width_ - 1);
+		const T gmax_j = tr::from_int(depth_ - 1);
 
 		// Clip the ray's t-range to the grid rectangle [0,width-1]×[0,depth-1].
 		T t_enter = zero, t_exit = tr::one();
@@ -289,7 +289,7 @@ private:
 				t_delta = t_next;
 				return;
 			}
-			T next_boundary = (step > 0) ? T(idx + 1) : T(idx);
+			T next_boundary = (step > 0) ? tr::from_int(idx + 1) : tr::from_int(idx);
 			t_next = t_enter + (next_boundary - (c + d * t_enter)) / d;
 			T ad = d < zero ? -d : d; // 1 grid cell per |d| units of t
 			t_delta = tr::one() / ad;

@@ -27,7 +27,7 @@ inline godot::Object *get_collider_safe(uint64_t p_id) {
 
 // The scalar type used throughout the GDExtension.
 // Switch between float and hop::fixed16 here.
-using hop_scalar = hop::fixed32;
+using hop_scalar = float;
 
 // --- Scalar conversions ---
 

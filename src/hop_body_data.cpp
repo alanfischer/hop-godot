@@ -79,6 +79,17 @@ void HopBodyData::sync_from_hop() {
 
 	transform.origin = to_godot(hop_solid->get_position());
 	linear_velocity = to_godot(hop_solid->get_velocity());
+	// Phase 8: a body that spins dynamically (inv_inertia != 0) has hop integrate
+	// its orientation — write it back (rotation only; re-apply the existing scale,
+	// which hop bakes into geometry) along with ω. Non-spinning dynamic bodies keep
+	// their Godot-authoritative basis untouched, so this is opt-in and adds no churn.
+	if (hop_solid->rotates_dynamically()) {
+		Vector3 scale = transform.basis.get_scale();
+		Basis rot = to_godot_basis(hop_solid->get_orientation());
+		rot.scale(scale);
+		transform.basis = rot;
+		angular_velocity = to_godot(hop_solid->get_angular_velocity());
+	}
 	sleeping = !hop_solid->active();
 }
 

@@ -91,6 +91,17 @@ inline Vector3 to_godot(const hop::vec3<hop_scalar> &v) {
 		scalar_to_float(v.z));
 }
 
+// hop mat3 (pure rotation) → Godot Basis, element-wise (both row-major, XYZ
+// straight through). Used to write a dynamically-integrated orientation back to a
+// body transform; the caller re-applies scale (hop bakes scale into geometry).
+inline Basis to_godot_basis(const hop::mat3<hop_scalar> &m) {
+	Basis b;
+	for (int i = 0; i < 3; ++i)
+		for (int j = 0; j < 3; ++j)
+			b[i][j] = scalar_to_float(m.at(i, j));
+	return b;
+}
+
 // Godot Basis → hop mat3 (rotation only; pass an orthonormal basis). Both are
 // applied as r[i] = Σⱼ m(i,j)·v[j] and to_hop maps godot XYZ straight through, so
 // element (i,j) copies directly. The hop mat3 ctor is row-major.

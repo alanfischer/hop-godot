@@ -19,6 +19,20 @@ static Transform3D scale_only_xform(const Basis &basis) {
 	return t;
 }
 
+// Phase 8: principal-axis inertia of the body's collision AABB treated as a solid
+// box — I = mass/12 · (eᵧ²+e_z², e_x²+e_z², e_x²+eᵧ²) for full extents e. A sensible
+// default for any shape so a dynamic RigidBody3D tumbles; the game can override via
+// BODY_PARAM_INERTIA. A degenerate (zero-extent) bound yields zero inertia → no spin.
+static hop::vec3<hop_scalar> aabb_box_inertia(const hop::aa_box<hop_scalar> &b, float mass) {
+	hop::vec3<hop_scalar> e;
+	hop::sub(e, b.maxs, b.mins);
+	float ex = to_godot_float(e.x), ey = to_godot_float(e.y), ez = to_godot_float(e.z);
+	float c = mass / 12.0f;
+	return hop::vec3<hop_scalar>(to_hop_scalar(c * (ey * ey + ez * ez)),
+	                             to_hop_scalar(c * (ex * ex + ez * ez)),
+	                             to_hop_scalar(c * (ex * ex + ey * ey)));
+}
+
 // KINEMATIC bodies (the CharacterBody3D player) resolve contacts via sweep-and-slide
 // so they slide along surfaces; dynamic and static bodies use the speculative solve
 // (the space default, set in HopSpaceData). hop-godot is a generic backend with no
@@ -731,6 +745,20 @@ void HopPhysicsServer::_body_set_param(const RID &p_body, PhysicsServer3D::BodyP
 			body->mass = p_value;
 			if (body->hop_solid && !body->is_static_or_kinematic()) {
 				body->hop_solid->set_mass(to_hop_scalar(body->mass));
+				update_body_inertia(body); // Phase 8: keep auto inertia in step with mass
+			}
+		} break;
+		case PhysicsServer3D::BODY_PARAM_INERTIA: {
+			// Explicit inertia from the game (Vector3 principal diagonal). A zero
+			// vector means "let the engine compute it" (Godot's convention), so we
+			// fall back to auto-compute; any non-zero value pins it (custom_inertia).
+			Vector3 I = p_value;
+			body->custom_inertia = I.length_squared() > 0.0f;
+			if (body->hop_solid && !body->is_static_or_kinematic()) {
+				if (body->custom_inertia)
+					body->hop_solid->set_inertia(to_hop(I));
+				else
+					update_body_inertia(body);
 			}
 		} break;
 		case PhysicsServer3D::BODY_PARAM_GRAVITY_SCALE: {
@@ -758,13 +786,30 @@ Variant HopPhysicsServer::_body_get_param(const RID &p_body, PhysicsServer3D::Bo
 		case PhysicsServer3D::BODY_PARAM_GRAVITY_SCALE: return body->gravity_scale;
 		case PhysicsServer3D::BODY_PARAM_LINEAR_DAMP: return body->linear_damp;
 		case PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP: return body->angular_damp;
-		case PhysicsServer3D::BODY_PARAM_INERTIA: return Vector3(); // no rotation
+		case PhysicsServer3D::BODY_PARAM_INERTIA:
+			return body->hop_solid ? to_godot(body->hop_solid->get_inertia()) : Vector3();
 		default: return Variant();
 	}
 }
 
 void HopPhysicsServer::_body_reset_mass_properties(const RID &p_body) {
-	// No-op: hop handles mass directly
+	// Godot's "recompute inertia from shapes+mass". Drop any custom inertia and
+	// re-derive (Phase 8); mass itself is handled directly via BODY_PARAM_MASS.
+	HopBodyData *body = body_owner.get_or_null(p_body);
+	if (!body) return;
+	body->custom_inertia = false;
+	update_body_inertia(body);
+}
+
+void HopPhysicsServer::update_body_inertia(HopBodyData *body) {
+	if (!body || !body->hop_solid || body->is_static_or_kinematic() || body->custom_inertia)
+		return;
+	if (body->mass <= 0.0f)
+		return;
+	// local_bound_ encloses the (scale-baked) collision shapes; treat it as a solid
+	// box. Zero extent (no shapes yet) → zero inertia → no spin until shapes exist;
+	// the per-step lazy init in _step retries once they do.
+	body->hop_solid->set_inertia(aabb_box_inertia(body->hop_solid->get_local_bound(), body->mass));
 }
 
 void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyState p_state, const Variant &p_value) {
@@ -810,11 +855,12 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 				body->hop_solid->set_velocity(to_hop(body->linear_velocity));
 		} break;
 		case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY: {
-			// Stored for query parity. Kinematic carry ω is derived from the
-			// per-frame orientation delta in _step (mirroring how kinematic linear
-			// velocity is derived from the position delta, not this setter); a
-			// directly-set avelocity on a dynamic body awaits Phase 8 integration.
 			body->angular_velocity = p_value;
+			// Phase 8: a directly-set ω on a dynamic body seeds its integrated spin.
+			// Kinematic carry ω is still derived from the per-frame orientation delta
+			// in _step (not this setter), so only push for dynamic bodies.
+			if (body->hop_solid && body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC)
+				body->hop_solid->set_angular_velocity(to_hop(body->angular_velocity));
 		} break;
 		case PhysicsServer3D::BODY_STATE_SLEEPING: {
 			body->sleeping = p_value;
@@ -861,7 +907,15 @@ void HopPhysicsServer::_body_apply_impulse(const RID &p_body, const Vector3 &p_i
 }
 
 void HopPhysicsServer::_body_apply_torque_impulse(const RID &p_body, const Vector3 &p_impulse) {
-	// No-op: hop has no rotation
+	// Phase 8: an angular impulse J changes angular momentum by J, so Δω = I⁻¹·J.
+	// I⁻¹ is diagonal in the body frame, so rotate J in by Rᵀ, divide, rotate back.
+	HopBodyData *body = body_owner.get_or_null(p_body);
+	if (!body || !body->hop_solid || body->is_static_or_kinematic() || !body->hop_solid->rotates_dynamically()) return;
+	hop::vec3<hop_scalar> dw; // Δω = I⁻¹·J (world), via the shared body-frame round-trip
+	hop::apply_inv_inertia_world(body->hop_solid.get(), to_hop(p_impulse), dw);
+	hop::vec3<hop_scalar> w = body->hop_solid->get_angular_velocity();
+	hop::add(w, dw);
+	body->hop_solid->set_angular_velocity(w);
 }
 
 void HopPhysicsServer::_body_apply_central_force(const RID &p_body, const Vector3 &p_force) {
@@ -875,7 +929,11 @@ void HopPhysicsServer::_body_apply_force(const RID &p_body, const Vector3 &p_for
 }
 
 void HopPhysicsServer::_body_apply_torque(const RID &p_body, const Vector3 &p_torque) {
-	// No-op: hop has no rotation
+	// Phase 8: a one-step world-frame torque; hop integrates ω += I⁻¹·τ·dt and
+	// clears it each step (body-frame conversion handled in integrate_angular).
+	HopBodyData *body = body_owner.get_or_null(p_body);
+	if (!body || !body->hop_solid || body->is_static_or_kinematic()) return;
+	body->hop_solid->add_torque(to_hop(p_torque));
 }
 
 void HopPhysicsServer::_body_add_constant_central_force(const RID &p_body, const Vector3 &p_force) {
@@ -1579,6 +1637,15 @@ void HopPhysicsServer::_step(float p_step) {
 		if (!body->hop_solid || body->is_static_or_kinematic()) return;
 		if (body->constant_force.length_squared() > 0.0f) {
 			body->hop_solid->add_force(to_hop(body->constant_force));
+		}
+		// Phase 8: per-step constant torque, and lazy auto-inertia (covers the
+		// shapes-set-after-mass ordering — update_body_inertia is a no-op once set or
+		// when the game pinned a custom inertia).
+		if (body->constant_torque.length_squared() > 0.0f) {
+			body->hop_solid->add_torque(to_hop(body->constant_torque));
+		}
+		if (!body->custom_inertia && body->mass > 0.0f && !body->hop_solid->rotates_dynamically()) {
+			update_body_inertia(body);
 		}
 
 		// Call force integration callback if set

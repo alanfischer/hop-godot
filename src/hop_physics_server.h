@@ -37,6 +37,10 @@ public:
 
 	// Helpers
 	void rebuild_body_shapes(HopBodyData *body);
+	// Phase 8: auto-compute a dynamic body's principal inertia from its collision
+	// AABB + mass (so a RigidBody3D spins without the game setting inertia), unless
+	// the game set BODY_PARAM_INERTIA explicitly (custom_inertia).
+	void update_body_inertia(HopBodyData *body);
 	void add_body_to_space(HopBodyData *body, HopSpaceData *space);
 	void remove_body_from_space(HopBodyData *body);
 

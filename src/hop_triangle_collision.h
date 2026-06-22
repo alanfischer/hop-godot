@@ -456,6 +456,106 @@ inline void capsule_local_vs_triangle(const hop::vec3<T> & p1, const hop::vec3<T
 	}
 }
 
+// --- oriented box (OBB) mover vs triangle, in the target's local frame --------
+//
+// A box mover has no rotation-invariant spine, so the capsule reduction above
+// can't carry it into a rotated traceable's frame. Instead, once transformed into
+// the target's local frame the box is an OBB (center `center_l`, axes = columns of
+// `Q`, half-extents `half`); we run the same winding-agnostic support-plane test
+// the non-rotated box path uses (sweep_support_plane / recover_support_plane), but
+// expressed locally and writing local results that trace_solid_rotated maps back
+// to world — exactly like capsule_local_vs_triangle. Only the triangle face normal
+// is used as the separating axis (same SAT altitude as the AA box path: edge
+// contacts are approximate, by parity, not regression).
+
+// OBB support corner offset from center in direction d: Σ sign(d·qᵢ)·hᵢ·qᵢ.
+template <typename T>
+inline void obb_support(hop::vec3<T> & out, const hop::vec3<T> & q0, const hop::vec3<T> & q1,
+                        const hop::vec3<T> & q2, const hop::vec3<T> & half, const hop::vec3<T> & d) {
+	out.reset();
+	hop::vec3<T> t;
+	hop::mul(t, q0, (hop::dot(d, q0) >= T {} ? half.x : -half.x));
+	hop::add(out, t);
+	hop::mul(t, q1, (hop::dot(d, q1) >= T {} ? half.y : -half.y));
+	hop::add(out, t);
+	hop::mul(t, q2, (hop::dot(d, q2) >= T {} ? half.z : -half.z));
+	hop::add(out, t);
+}
+
+// Per-(OBB, triangle) static-recover + swept test, all in the target's local
+// frame. `local_seg.origin` is the mover solid origin in local space (for
+// result.point), `center_l` the OBB center. Mirrors capsule_local_vs_triangle.
+template <typename T>
+inline void obb_local_vs_triangle(const hop::vec3<T> & center_l, const hop::vec3<T> & q0,
+                                  const hop::vec3<T> & q1, const hop::vec3<T> & q2, const hop::vec3<T> & half,
+                                  const hop::segment<T> & local_seg, bool is_static, T margin, T seam_tol,
+                                  const hop::vec3<T> & a, const hop::vec3<T> & b, const hop::vec3<T> & c,
+                                  const hop::vec3<T> & normal, hop::collision<T> & result,
+                                  bool & found, T & best_depth) {
+	using tr = hop::scalar_traits<T>;
+	// Orient the face normal toward the body (double-sided, like Godot concave).
+	hop::vec3<T> face_n = normal;
+	if (hop::dot(normal, center_l) - hop::dot(normal, a) < T {})
+		hop::neg(face_n, normal);
+	hop::vec3<T> neg_fn;
+	hop::neg(neg_fn, face_n);
+	hop::vec3<T> sup;
+	obb_support(sup, q0, q1, q2, half, neg_fn);
+	T expand = hop::dot(sup, neg_fn);
+	T plane_d = hop::dot(face_n, a);
+
+	if (is_static) {
+		T surface_d = plane_d + expand;
+		T expanded_d = surface_d + margin;
+		T along = hop::dot(face_n, center_l);
+		if (along > expanded_d)
+			return;
+		T dist = along - plane_d;
+		hop::vec3<T> proj, n_scaled;
+		hop::mul(n_scaled, face_n, dist);
+		hop::sub(proj, center_l, n_scaled);
+		if (!point_near_triangle(proj, a, b, c, seam_tol))
+			return;
+		T depth = surface_d - along;
+		if (depth < T {})
+			depth = T {};
+		if (!found || depth < best_depth) {
+			best_depth = depth;
+			result.time = T {};
+			result.depth = depth;
+			result.normal = face_n;
+			result.point = local_seg.origin;
+			result.impact = proj;
+			found = true;
+		}
+		return;
+	}
+
+	T denom = hop::dot(face_n, local_seg.direction);
+	if (denom >= T {})
+		return; // not moving into this (body-facing) surface
+	T expanded_d = plane_d + expand;
+	T t = (expanded_d - hop::dot(face_n, center_l)) / denom;
+	if (t > tr::one() || t >= result.time)
+		return;
+	if (t < T {})
+		t = T {};
+	hop::vec3<T> hit_center, off;
+	hop::mul(off, local_seg.direction, t);
+	hop::add(hit_center, center_l, off);
+	T offset = hop::dot(face_n, hit_center) - plane_d;
+	hop::vec3<T> proj, n_scaled;
+	hop::mul(n_scaled, face_n, offset);
+	hop::sub(proj, hit_center, n_scaled);
+	if (!point_near_triangle(proj, a, b, c, seam_tol))
+		return;
+	result.time = t;
+	hop::mul(result.point, local_seg.direction, t);
+	hop::add(result.point, local_seg.origin);
+	result.normal = face_n;
+	result.impact = proj;
+}
+
 // AABB enclosing the capsule spine p1..p2 grown by `radius`.
 template <typename T>
 inline void spine_aabb(hop::aa_box<T> & box, const hop::vec3<T> & p1,
@@ -478,7 +578,7 @@ inline void spine_aabb(hop::aa_box<T> & box, const hop::vec3<T> & p1,
 template <typename T, typename Enumerate>
 inline void trace_solid_rotated(hop::collision<T> & result, hop::solid<T> * s,
                                 const hop::vec3<T> & position, const hop::mat3<T> & orientation,
-                                const hop::segment<T> & seg, T margin, Enumerate && enumerate) {
+                                const hop::segment<T> & seg, T margin, T seam_tol, Enumerate && enumerate) {
 	hop::mat3<T> Rt;
 	hop::transpose(Rt, orientation);
 	hop::segment<T> local_seg;
@@ -495,29 +595,80 @@ inline void trace_solid_rotated(hop::collision<T> & result, hop::solid<T> * s,
 	T best_depth = T {};
 
 	for (const auto & sh_ptr : s->get_shapes()) {
+		hop::shape<T> * sh = sh_ptr.get();
 		hop::vec3<T> p1w, p2w;
 		T radius;
-		if (!mover_world_capsule(s, sh_ptr.get(), seg.origin, p1w, p2w, radius))
-			continue; // box movers have no rotation-invariant spine (out of scope)
-		hop::vec3<T> p1, p2, t;
-		hop::sub(t, p1w, position); hop::mul(p1, Rt, t);
-		hop::sub(t, p2w, position); hop::mul(p2, Rt, t);
+		if (mover_world_capsule(s, sh, seg.origin, p1w, p2w, radius)) {
+			hop::vec3<T> p1, p2, t;
+			hop::sub(t, p1w, position); hop::mul(p1, Rt, t);
+			hop::sub(t, p2w, position); hop::mul(p2, Rt, t);
 
+			hop::aa_box<T> q;
+			spine_aabb(q, p1, p2, radius);
+			if (!is_static) {
+				hop::vec3<T> e1, e2;
+				hop::add(e1, p1, local_seg.direction);
+				hop::add(e2, p2, local_seg.direction);
+				hop::aa_box<T> qe;
+				spine_aabb(qe, e1, e2, radius);
+				q.merge(qe);
+			}
+
+			enumerate(q, [&](const hop::vec3<T> & a, const hop::vec3<T> & b,
+			                 const hop::vec3<T> & c, const hop::vec3<T> & face_n) {
+				capsule_local_vs_triangle(p1, p2, radius, local_seg, is_static, margin,
+				    a, b, c, face_n, local, found, best_depth);
+			});
+			continue;
+		}
+		if (sh->get_type() != hop::shape_type::box)
+			continue; // only box/capsule/sphere movers carry into a rotated traceable
+
+		// Box mover: reduce to an OBB in the target's local frame. Mover world
+		// rotation Rm = solid_orientation·shape_local_rotation; box axes Q = Rᵀ·Rm;
+		// box center mapped into local by Rᵀ·(world_center − position).
+		const hop::aa_box<T> & box = sh->get_box();
+		hop::vec3<T> bc, half;
+		hop::add(bc, box.mins, box.maxs); hop::mul(bc, hop::scalar_traits<T>::half());
+		hop::sub(half, box.maxs, box.mins); hop::mul(half, hop::scalar_traits<T>::half());
+		hop::mat3<T> Rm, Q;
+		hop::mul(Rm, s->get_orientation(), sh->get_local_rotation());
+		hop::mul(Q, Rt, Rm);
+		hop::vec3<T> q0, q1, q2;
+		hop::mul(q0, Q, hop::constants<T>::x_unit_vec3());
+		hop::mul(q1, Q, hop::constants<T>::y_unit_vec3());
+		hop::mul(q2, Q, hop::constants<T>::z_unit_vec3());
+		// world box center = seg.origin + solid_orientation·local_position + Rm·bc
+		hop::vec3<T> wc, off;
+		hop::mul(off, s->get_orientation(), sh->get_local_position());
+		hop::add(wc, seg.origin, off);
+		hop::mul(off, Rm, bc);
+		hop::add(wc, off);
+		hop::vec3<T> center_l, rel;
+		hop::sub(rel, wc, position); hop::mul(center_l, Rt, rel);
+
+		// Local query AABB: the OBB's local-axis extent (Σ|qᵢ·axis|·hᵢ) around the
+		// center, merged with the swept endpoint.
+		hop::vec3<T> ext(
+		    hop::scalar_traits<T>::abs(q0.x) * half.x + hop::scalar_traits<T>::abs(q1.x) * half.y + hop::scalar_traits<T>::abs(q2.x) * half.z,
+		    hop::scalar_traits<T>::abs(q0.y) * half.x + hop::scalar_traits<T>::abs(q1.y) * half.y + hop::scalar_traits<T>::abs(q2.y) * half.z,
+		    hop::scalar_traits<T>::abs(q0.z) * half.x + hop::scalar_traits<T>::abs(q1.z) * half.y + hop::scalar_traits<T>::abs(q2.z) * half.z);
 		hop::aa_box<T> q;
-		spine_aabb(q, p1, p2, radius);
+		hop::sub(q.mins, center_l, ext);
+		hop::add(q.maxs, center_l, ext);
 		if (!is_static) {
-			hop::vec3<T> e1, e2;
-			hop::add(e1, p1, local_seg.direction);
-			hop::add(e2, p2, local_seg.direction);
+			hop::vec3<T> ec;
+			hop::add(ec, center_l, local_seg.direction);
 			hop::aa_box<T> qe;
-			spine_aabb(qe, e1, e2, radius);
+			hop::sub(qe.mins, ec, ext);
+			hop::add(qe.maxs, ec, ext);
 			q.merge(qe);
 		}
 
 		enumerate(q, [&](const hop::vec3<T> & a, const hop::vec3<T> & b,
 		                 const hop::vec3<T> & c, const hop::vec3<T> & face_n) {
-			capsule_local_vs_triangle(p1, p2, radius, local_seg, is_static, margin,
-			    a, b, c, face_n, local, found, best_depth);
+			obb_local_vs_triangle(center_l, q0, q1, q2, half, local_seg, is_static, margin,
+			    seam_tol, a, b, c, face_n, local, found, best_depth);
 		});
 	}
 

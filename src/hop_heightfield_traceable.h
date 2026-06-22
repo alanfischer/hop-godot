@@ -113,7 +113,7 @@ public:
 		if (orientation != identity) {
 			// Rotated grid: the shared driver handles the frame transform + mover
 			// spine reduction; we supply only the cell broadphase over the local AABB.
-			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin,
+			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin, seam_tol_,
 			    [&](const hop::aa_box<T> & q, auto && visit) {
 				    int i0, i1, j0, j1;
 				    if (!cell_range(q, i0, i1, j0, j1))

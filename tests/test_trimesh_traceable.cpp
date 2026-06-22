@@ -412,6 +412,49 @@ static void test_contact_point_on_surface() {
 	}
 }
 
+// --- Test 12: a BOX mover is honored against a ROTATED trimesh ---------------
+// Before Phase 5 the rotated-traceable driver skipped box movers (no rotation-
+// invariant spine), so a box collided as if the mesh were unrotated. The OBB-vs-
+// triangle path now handles it. Setup: a flat floor (xz-plane, +y normal) rotated
+// 90° about Z becomes a vertical wall at world x=0 facing -x. An axis-aligned box
+// swept in +x must stop at the wall with a world normal pointing -x and the
+// contact point on the wall (x≈0).
+static void test_box_mover_vs_rotated_mesh() {
+	const T hb = 0.4;
+	// Rz(90°): rows (0,-1,0),(1,0,0),(0,0,1) → maps local +y normal to world -x.
+	hop::mat3<T> Rz90(0, -1, 0, 1, 0, 0, 0, 0, 1);
+
+	std::vector<V> verts; std::vector<Tri> tris;
+	flat_quad(verts, tris, true); // UP-facing floor at local y=0
+	auto mesh = make_mesh(verts, tris);
+	auto box = make_box(hb, hb, hb);
+
+	auto probe = [&](const V & center, const V & motion) {
+		box->set_position(center);
+		hop::segment<T> seg;
+		seg.set_start_end(center, vec(center.x + motion.x, center.y + motion.y, center.z + motion.z));
+		hop::collision<T> c; c.reset();
+		mesh->trace_solid(c, box.get(), vec(0, 0, 0), Rz90, seg, T {});
+		return c;
+	};
+
+	// Swept from x=-1 toward +x into the wall at x=0; +x box face hits at center_x=-hb.
+	hop::collision<T> sw = probe(vec(-1, 0, 0), vec(1.2, 0, 0));
+	assert(sw.time < T(1));                          // box honored against the rotated mesh
+	assert(approx(sw.time, (1.0 - hb) / 1.2, 0.03)); // center_x reaches -0.4
+	assert(sw.normal.x < -0.9);                      // world normal faces -x (toward the box)
+	assert(std::fabs(sw.impact.x) < 0.03);           // contact ON the wall plane (x≈0)
+	printf("  box vs rotated mesh (swept): time=%.3f normal.x=%.2f impact.x=%.3f\n",
+	       sw.time, sw.normal.x, sw.impact.x);
+
+	// Static overlap: box straddling the wall reports an -x push-out.
+	hop::collision<T> st = probe(vec(-0.2, 0, 0), vec(0, 0, 0));
+	assert(st.time == T {});
+	assert(st.normal.x < -0.9);
+	assert(st.depth > T {});
+	printf("  box vs rotated mesh (static): normal.x=%.2f depth=%.3f\n", st.normal.x, st.depth);
+}
+
 int main() {
 	printf("test_trimesh_traceable:\n");
 	test_recovery_front_face();
@@ -425,6 +468,7 @@ int main() {
 	test_degenerate_tri_normal();
 	test_step_drop_not_rejected();
 	test_contact_point_on_surface();
+	test_box_mover_vs_rotated_mesh();
 	printf("ALL PASSED\n");
 	return 0;
 }

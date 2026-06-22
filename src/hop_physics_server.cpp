@@ -1407,6 +1407,11 @@ void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, 
 	j->hop_constraint->set_spring_constant(to_hop_scalar(100.0f));
 	j->hop_constraint->set_damping_constant(to_hop_scalar(10.0f));
 	j->hop_constraint->set_rest_length(to_hop_scalar(0.0f));
+	// Pin at the joint's anchor points, not the body centers. Godot's local_A/local_B
+	// are offsets in each body's local frame — exactly hop's local anchors. Off-center
+	// anchors now also torque a dynamic body via their lever arm (hop Phase 10).
+	j->hop_constraint->set_local_anchor_a(to_hop(j->local_a));
+	j->hop_constraint->set_local_anchor_b(to_hop(j->local_b));
 
 	HopSpaceData *space = space_owner.get_or_null(ba->space_rid);
 	if (space) {
@@ -1438,7 +1443,9 @@ float HopPhysicsServer::_pin_joint_get_param(const RID &p_joint, PhysicsServer3D
 
 void HopPhysicsServer::_pin_joint_set_local_a(const RID &p_joint, const Vector3 &p_local_A) {
 	HopJointData *j = joint_owner.get_or_null(p_joint);
-	if (j) j->local_a = p_local_A;
+	if (!j) return;
+	j->local_a = p_local_A;
+	if (j->hop_constraint) j->hop_constraint->set_local_anchor_a(to_hop(p_local_A));
 }
 
 Vector3 HopPhysicsServer::_pin_joint_get_local_a(const RID &p_joint) const {
@@ -1448,7 +1455,9 @@ Vector3 HopPhysicsServer::_pin_joint_get_local_a(const RID &p_joint) const {
 
 void HopPhysicsServer::_pin_joint_set_local_b(const RID &p_joint, const Vector3 &p_local_B) {
 	HopJointData *j = joint_owner.get_or_null(p_joint);
-	if (j) j->local_b = p_local_B;
+	if (!j) return;
+	j->local_b = p_local_B;
+	if (j->hop_constraint) j->hop_constraint->set_local_anchor_b(to_hop(p_local_B));
 }
 
 Vector3 HopPhysicsServer::_pin_joint_get_local_b(const RID &p_joint) const {

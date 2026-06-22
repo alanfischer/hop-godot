@@ -109,7 +109,7 @@ public:
 		if (orientation != identity) {
 			// Rotated mesh: the shared driver handles the frame transform + mover
 			// spine reduction; we supply only the BVH broadphase over the local AABB.
-			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin,
+			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin, seam_tol_,
 			    [&](const hop::aa_box<T> & q, auto && visit) {
 				    bvh_.query_aabb(q, [&](int tri_idx) {
 					    const auto & tri = tris_[tri_idx];

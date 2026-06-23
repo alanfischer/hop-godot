@@ -63,5 +63,13 @@ struct HopSpaceData {
 		if (ProjectSettings *ps = ProjectSettings::get_singleton())
 			accurate = ps->get_setting("physics/hop/accurate_narrowphase", true);
 		simulator->set_accurate_narrowphase(accurate);
+		// Angular substepping (opt-in continuous collision for fast spinners): cap the
+		// number of fixed-orientation sub-traces per frame. "physics/hop/angular_substeps_max"
+		// (int); absent / 1 => off (single snapshot, bit-identical). Raise it for a scene
+		// with fast, thin spinners (a blade trap) that must not be stepped over angularly.
+		int substeps = 1;
+		if (ProjectSettings *ps = ProjectSettings::get_singleton())
+			substeps = (int)ps->get_setting("physics/hop/angular_substeps_max", 1);
+		simulator->set_angular_substeps_max(substeps);
 	}
 };

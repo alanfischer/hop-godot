@@ -579,6 +579,9 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 			body->hop_solid->set_mass(to_hop_scalar(body->mass));
 			body->hop_solid->set_coefficient_of_gravity(to_hop_scalar(body->gravity_scale));
 			body->hop_solid->activate();
+			// Re-derive inertia for the new mode now, so toggling lock_rotation
+			// (RIGID <-> RIGID_LINEAR) takes effect without waiting on a mass re-send.
+			update_body_inertia(body);
 		}
 
 		// KINEMATIC (player) → sweep-and-slide; STATIC/RIGID → speculative solve.
@@ -802,7 +805,18 @@ void HopPhysicsServer::_body_reset_mass_properties(const RID &p_body) {
 }
 
 void HopPhysicsServer::update_body_inertia(HopBodyData *body) {
-	if (!body || !body->hop_solid || body->is_static_or_kinematic() || body->custom_inertia)
+	if (!body || !body->hop_solid || body->is_static_or_kinematic())
+		return;
+	// lock_rotation: Godot maps RigidBody3D.lock_rotation onto BODY_MODE_RIGID_LINEAR
+	// (rigid translation, rotation locked). Zero the inertia so inv_inertia==0 and
+	// rotates_dynamically() stays false — the body is pushed/integrated linearly but
+	// never tumbles, matching GodotPhysics. Overrides custom inertia, as lock_rotation
+	// does in Godot (a locked body never spins regardless of its inertia tensor).
+	if (body->mode == PhysicsServer3D::BODY_MODE_RIGID_LINEAR) {
+		body->hop_solid->set_inertia(hop::vec3<hop_scalar>{}); // zero ⇒ inv_inertia 0 ⇒ never spins
+		return;
+	}
+	if (body->custom_inertia)
 		return;
 	if (body->mass <= 0.0f)
 		return;
@@ -1653,7 +1667,8 @@ void HopPhysicsServer::_step(float p_step) {
 		if (body->constant_torque.length_squared() > 0.0f) {
 			body->hop_solid->add_torque(to_hop(body->constant_torque));
 		}
-		if (!body->custom_inertia && body->mass > 0.0f && !body->hop_solid->rotates_dynamically()) {
+		if (!body->custom_inertia && body->mass > 0.0f && !body->hop_solid->rotates_dynamically()
+				&& body->mode != PhysicsServer3D::BODY_MODE_RIGID_LINEAR) {
 			update_body_inertia(body);
 		}
 

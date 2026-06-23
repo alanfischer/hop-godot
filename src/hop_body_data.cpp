@@ -110,7 +110,10 @@ void HopBodyData::on_collision(const hop::collision<hop_scalar> &c) {
 			ci.collider_id = other->object_instance_id;
 			ci.collider_pos = to_godot(c.impact);
 			ci.collider_shape = 0;
-			ci.collider_velocity = other->linear_velocity;
+			// Surface velocity at the contact (v + ω×r), matching the _body_test_motion
+			// path — so a RigidBody3D rider on a rotating platform reads the full carry
+			// velocity, not just the platform's linear motion (Phase 7 rider carry).
+			ci.collider_velocity = other->velocity_at_local(to_godot(c.impact) - other->transform.origin);
 		}
 	}
 

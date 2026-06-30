@@ -3,5 +3,6 @@ build-*/
 addons/hop-physics/bin/*.dylib
 addons/hop-physics/bin/*.so
 addons/hop-physics/bin/*.dll
+addons/hop-physics/bin/*.pdb
 .DS_Store
 *.o

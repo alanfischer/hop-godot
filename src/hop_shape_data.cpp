@@ -255,26 +255,59 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 				return std::make_shared<hop::shape<hop_scalar>>(box);
 			}
 
-			// Degenerate skewed "slivers" — fat AABB (thin on no axis) yet vertices
-			// at only <=2 opposite corners: near-zero volume, no real surface. The
-			// BSP-leaf decomposition emits several of these; they have no business
-			// colliding (Godot's hull builder discards them too). Drop them.
-			if (thin == 0) {
-				const float tol = 0.15f * ext.length();
-				int occupied = 0;
-				for (int cx = 0; cx < 2; cx++)
-					for (int cy = 0; cy < 2; cy++)
-						for (int cz = 0; cz < 2; cz++) {
-							Vector3 corner(cx ? mx.x : mn.x, cy ? mx.y : mn.y, cz ? mx.z : mn.z);
-							for (int i = 0; i < points.size(); i++) {
-								if ((points[i] + origin).distance_to(corner) < tol) {
-									occupied++;
-									break;
-								}
-							}
+			// Rotation-invariant thickness check (L3) to drop true coplanar 2D slivers
+			// without misclassifying rotated 3D brush solids.
+			if (thin == 0 && points.size() >= 4) {
+				float max_d1_sq = 0.0f;
+				int p0_idx = 0, pa_idx = 0;
+				for (int i = 0; i < points.size(); ++i) {
+					for (int j = i + 1; j < points.size(); ++j) {
+						float d_sq = (points[i] - points[j]).length_squared();
+						if (d_sq > max_d1_sq) {
+							max_d1_sq = d_sq;
+							p0_idx = i;
+							pa_idx = j;
 						}
-				if (occupied <= 2) {
-					return nullptr;
+					}
+				}
+				Vector3 p0 = points[p0_idx] + origin;
+				Vector3 pa = points[pa_idx] + origin;
+				Vector3 v1 = pa - p0;
+				float l1 = std::sqrt(max_d1_sq);
+
+				if (l1 > 1e-4f) {
+					Vector3 u1 = v1 / l1;
+					float max_d2_sq = 0.0f;
+					int pb_idx = p0_idx;
+					for (int i = 0; i < points.size(); ++i) {
+						Vector3 w = (points[i] + origin) - p0;
+						Vector3 perp = w - u1 * w.dot(u1);
+						float d2_sq = perp.length_squared();
+						if (d2_sq > max_d2_sq) {
+							max_d2_sq = d2_sq;
+							pb_idx = i;
+						}
+					}
+					Vector3 pb = points[pb_idx] + origin;
+					Vector3 v2 = pb - p0;
+					Vector3 cross = v1.cross(v2);
+					float c_len = cross.length();
+
+					if (c_len > 1e-4f) {
+						Vector3 norm = cross / c_len;
+						float d3_min = 0.0f, d3_max = 0.0f;
+						for (int i = 0; i < points.size(); ++i) {
+							float dist = ((points[i] + origin) - p0).dot(norm);
+							d3_min = std::min(d3_min, dist);
+							d3_max = std::max(d3_max, dist);
+						}
+						float l3 = d3_max - d3_min;
+
+						// Only drop if 3D thickness is below threshold (< 0.1m)
+						if (l3 < MIN_DIM) {
+							return nullptr;
+						}
+					}
 				}
 			}
 

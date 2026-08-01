@@ -16,16 +16,17 @@
 // _intersect_point and _intersect_shape.  Uses the space's dedicated area_bvh, so
 // far-away areas are pruned in O(log n) and there are no per-query shape rebuilds
 // (area solids are built once; see HopPhysicsServer::rebuild_area_shapes).
-template <typename Overlaps>
+template <typename Overlaps, typename Excluded>
 static int collect_overlapping_areas(HopSpaceData *space, const hop::aa_box<hop_scalar> &query_box,
                                      uint32_t mask, PhysicsServer3DExtensionShapeResult *results,
-                                     int count, int max_results, Overlaps overlaps) {
+                                     int count, int max_results, Overlaps overlaps, Excluded excluded) {
 	hop::solid<hop_scalar> *cand[256];
 	int n = space->area_bvh.find_solids_in_aa_box(query_box, cand, 256);
 	for (int i = 0; i < n && count < max_results; i++) {
 		HopAreaData *area = static_cast<HopAreaData *>(cand[i]->get_user_data());
 		if (!area) continue;
 		if (!(mask & area->collision_layer)) continue;
+		if (excluded(area->self_rid)) continue;
 
 		// Narrow-phase confirm; only then resolve the collider (two engine calls).
 		if (!overlaps(cand[i])) continue;
@@ -51,13 +52,72 @@ static int collect_overlapping_areas(HopSpaceData *space, const hop::aa_box<hop_
 }
 
 bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p_to, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, bool p_hit_from_inside, bool p_hit_back_faces, bool p_pick_ray, PhysicsServer3DExtensionRayResult *p_result) {
-	if (!space || !p_collide_with_bodies) return false;
+	if (!space || (!p_collide_with_bodies && !p_collide_with_areas)) return false;
 
 	hop::segment<hop_scalar> seg;
 	seg.set_start_end(to_hop(p_from), to_hop(p_to));
 
+	hop::vec3<hop_scalar> ep;
+	seg.get_end_point(ep);
+	hop::aa_box<hop_scalar> total;
+	total.set(seg.origin, seg.origin);
+	total.merge(ep);
+
 	hop::collision<hop_scalar> result;
-	space->simulator->trace_segment(result, seg, p_collision_mask);
+	result.reset();
+
+	if (p_collide_with_bodies) {
+		std::vector<hop::solid<hop_scalar> *> candidates(256);
+		int count = space->simulator->find_solids_in_aa_box(total, candidates.data(), (int)candidates.size());
+		if (count > (int)candidates.size()) {
+			candidates.resize(count);
+			space->simulator->find_solids_in_aa_box(total, candidates.data(), count);
+		}
+
+		hop::collision<hop_scalar> col;
+		for (int i = 0; i < count; ++i) {
+			hop::solid<hop_scalar> *s = candidates[i];
+			if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
+
+			HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
+			if (body && is_body_excluded_from_query(body->self_rid)) continue;
+
+			col.time = to_hop_scalar(1.0f);
+			space->simulator->test_segment(col, seg, s);
+			hop::merge_collision(result, col, space->simulator->get_epsilon(), space->simulator->get_average_normals());
+		}
+	}
+
+	// Areas live only in the space's area_bvh — the simulator never sees them, so
+	// the body sweep above can never report one. Trace the same segment against the
+	// area candidates and keep whichever hit is nearer. Without this a raycast with
+	// collide_with_areas passed straight through per-bone hitbox Area3Ds (hitscan
+	// excludes the player capsules and relies on those volumes), so spotbolt and
+	// lightningbolt went through enemies.
+	HopAreaData *hit_area = nullptr;
+	if (p_collide_with_areas) {
+		hop::solid<hop_scalar> *cand[256];
+		int n = space->area_bvh.find_solids_in_aa_box(total, cand, 256);
+		for (int i = 0; i < n; ++i) {
+			HopAreaData *area = static_cast<HopAreaData *>(cand[i]->get_user_data());
+			if (!area) continue;
+			if (!(p_collision_mask & area->collision_layer)) continue;
+			if (is_body_excluded_from_query(area->self_rid)) continue;
+
+			hop::collision<hop_scalar> col;
+			space->simulator->test_segment(col, seg, cand[i]);
+			float t = to_godot_float(col.time);
+			if (t >= to_godot_float(result.time)) continue;
+			// A ray starting inside an area only counts when hit_from_inside is set;
+			// skip it rather than the whole query so a farther hit still reports.
+			if (!p_hit_from_inside && t <= 0.0f) continue;
+			if (!UtilityFunctions::is_instance_id_valid((int64_t)area->object_instance_id)) continue;
+			if (!get_collider_safe(area->object_instance_id)) continue;
+
+			result.set(col);
+			hit_area = area;
+		}
+	}
 
 	if (to_godot_float(result.time) >= 1.0f) return false;
 	if (!p_hit_from_inside && to_godot_float(result.time) <= 0.0f) return false;
@@ -67,6 +127,13 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 		p_result->normal = to_godot(result.normal);
 		p_result->face_index = -1;
 		p_result->shape = 0;
+
+		if (hit_area) {
+			p_result->rid = hit_area->self_rid;
+			p_result->collider_id = ObjectID(hit_area->object_instance_id);
+			p_result->collider = get_collider_safe(hit_area->object_instance_id);
+			return true;
+		}
 
 		// The hit solid is recorded in result.collider (test_segment sets it per
 		// traced solid); result.collidee is null on the segment/trimesh path. Read
@@ -111,7 +178,7 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 			if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
 
 			HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
-			if (!body) continue;
+			if (!body || is_body_excluded_from_query(body->self_rid)) continue;
 
 			hop::collision<hop_scalar> col;
 			space->simulator->trace_segment(col, seg, s->get_collision_scope());
@@ -142,7 +209,8 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 				hop::collision<hop_scalar> col;
 				space->simulator->test_segment(col, zseg, area_solid);
 				return to_godot_float(col.time) < 1.0f;
-			});
+			},
+			[&](const RID &rid) -> bool { return is_body_excluded_from_query(rid); });
 	}
 
 	return result_count;
@@ -267,7 +335,8 @@ int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Tran
 					hop::collision<hop_scalar> col;
 					space->simulator->test_solid(col, query_solid.get(), zseg, area_solid);
 					return to_godot_float(col.time) < 1.0f;
-				});
+				},
+				[&](const RID &rid) -> bool { return is_body_excluded_from_query(rid); });
 		}
 	}
 
@@ -290,8 +359,34 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 		hop::segment<hop_scalar> seg;
 		seg.set_start_end(to_hop(p_transform.origin), to_hop(p_transform.origin + dir));
 
+		hop::vec3<hop_scalar> ep;
+		seg.get_end_point(ep);
+		hop::aa_box<hop_scalar> total;
+		total.set(seg.origin, seg.origin);
+		total.merge(ep);
+
+		std::vector<hop::solid<hop_scalar> *> candidates(256);
+		int count = space->simulator->find_solids_in_aa_box(total, candidates.data(), (int)candidates.size());
+		if (count > (int)candidates.size()) {
+			candidates.resize(count);
+			space->simulator->find_solids_in_aa_box(total, candidates.data(), count);
+		}
+
 		hop::collision<hop_scalar> result;
-		space->simulator->trace_segment(result, seg, p_collision_mask);
+		result.reset();
+
+		hop::collision<hop_scalar> col;
+		for (int i = 0; i < count; ++i) {
+			hop::solid<hop_scalar> *s = candidates[i];
+			if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
+
+			HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
+			if (body && is_body_excluded_from_query(body->self_rid)) continue;
+
+			col.time = to_hop_scalar(1.0f);
+			space->simulator->test_segment(col, seg, s);
+			hop::merge_collision(result, col, space->simulator->get_epsilon(), space->simulator->get_average_normals());
+		}
 
 		float time_f = to_godot_float(result.time);
 		if (p_closest_safe) *p_closest_safe = time_f;
@@ -301,12 +396,13 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 			p_info->point = to_godot(result.point);
 			p_info->normal = to_godot(result.normal);
 			p_info->shape = 0;
-			if (result.collidee) {
-				HopBodyData *hit = static_cast<HopBodyData *>(result.collidee->get_user_data());
-				if (hit) {
-					p_info->rid = hit->self_rid;
-					p_info->collider_id = ObjectID(hit->object_instance_id);
-					p_info->linear_velocity = hit->linear_velocity;
+			hop::solid<hop_scalar> *hit = result.collider ? result.collider : result.collidee;
+			if (hit) {
+				HopBodyData *hit_body = static_cast<HopBodyData *>(hit->get_user_data());
+				if (hit_body) {
+					p_info->rid = hit_body->self_rid;
+					p_info->collider_id = ObjectID(hit_body->object_instance_id);
+					p_info->linear_velocity = hit_body->linear_velocity;
 				}
 			}
 		}
@@ -318,30 +414,72 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 	temp_solid->set_position(to_hop(p_transform.origin));
 	temp_solid->set_collision_scope(0);
 	temp_solid->set_collide_with_scope(p_collision_mask);
+	temp_solid->set_collision_filter([this](hop::solid<hop_scalar> *other) -> bool {
+		auto *body = static_cast<HopBodyData *>(other->get_user_data());
+		return !body || !is_body_excluded_from_query(body->self_rid);
+	});
 
 	auto hs = sd->make_hop_shape(Transform3D());
 	if (!hs) return false;
 	temp_solid->add_shape(hs);
 
-	space->simulator->add_solid(temp_solid);
-
 	hop::segment<hop_scalar> seg;
 	seg.set_start_end(to_hop(p_transform.origin), to_hop(p_transform.origin + p_motion));
 
 	hop::collision<hop_scalar> result;
-	space->simulator->trace_solid(result, temp_solid.get(), seg, p_collision_mask);
+	result.reset();
 
-	space->simulator->remove_solid(temp_solid);
+	if (p_collide_with_bodies) {
+		space->simulator->add_solid(temp_solid);
+		space->simulator->trace_solid(result, temp_solid.get(), seg, p_collision_mask);
+		space->simulator->remove_solid(temp_solid);
+	}
+
+	// Sweep the same shape against the area sensors (simulator-invisible, see
+	// _intersect_ray) and keep the earlier of the two contacts.  hitscan's fattened
+	// corridor sweep runs through here, so without it a bolt's sphere cast never
+	// saw a per-bone hitbox Area3D.
+	HopAreaData *hit_area = nullptr;
+	if (p_collide_with_areas) {
+		hop::aa_box<hop_scalar> swept = temp_solid->get_world_bound();
+		hop::aa_box<hop_scalar> moved;
+		add(moved, swept, to_hop(p_motion));
+		swept.merge(moved);
+
+		hop::solid<hop_scalar> *cand[256];
+		int n = space->area_bvh.find_solids_in_aa_box(swept, cand, 256);
+		for (int i = 0; i < n; ++i) {
+			HopAreaData *area = static_cast<HopAreaData *>(cand[i]->get_user_data());
+			if (!area) continue;
+			if (!(p_collision_mask & area->collision_layer)) continue;
+			if (is_body_excluded_from_query(area->self_rid)) continue;
+
+			hop::collision<hop_scalar> col;
+			space->simulator->test_solid(col, temp_solid.get(), seg, cand[i], to_hop_scalar(p_margin));
+			if (to_godot_float(col.time) >= to_godot_float(result.time)) continue;
+			if (!UtilityFunctions::is_instance_id_valid((int64_t)area->object_instance_id)) continue;
+
+			result.set(col);
+			hit_area = area;
+		}
+	}
 
 	float time_f = to_godot_float(result.time);
 	if (p_closest_safe) *p_closest_safe = time_f;
-	if (p_closest_unsafe) *p_closest_unsafe = time_f;
+	// hop reports a single first-contact time. Nudge the unsafe fraction just past
+	// it so a caller that re-probes at closest_unsafe (the GoldSrc-style hitscan
+	// corridor does) lands inside the contact instead of exactly on its surface.
+	if (p_closest_unsafe) *p_closest_unsafe = MIN(time_f + 0.001f, 1.0f);
 
 	if (time_f < 1.0f && p_info) {
 		p_info->point = to_godot(result.point);
 		p_info->normal = to_godot(result.normal);
 		p_info->shape = 0;
-		if (result.collidee) {
+		if (hit_area) {
+			p_info->rid = hit_area->self_rid;
+			p_info->collider_id = ObjectID(hit_area->object_instance_id);
+			p_info->linear_velocity = Vector3();
+		} else if (result.collidee) {
 			HopBodyData *hit = static_cast<HopBodyData *>(result.collidee->get_user_data());
 			if (hit) {
 				p_info->rid = hit->self_rid;
@@ -349,10 +487,14 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 				p_info->linear_velocity = hit->linear_velocity;
 			}
 		}
-		return true;
 	}
 
-	return false;
+	// Godot's contract: true means "the query ran", not "something was hit" — a
+	// miss is [1, 1]. Returning false here handed GDScript an EMPTY array on every
+	// call (p_info is null from script), so cast_motion looked like a no-op: the
+	// hitscan corridor never ran, the VR head probe never clamped, and the bot
+	// baker's _sweep_clear read every edge as blocked.
+	return true;
 }
 
 bool HopDirectSpaceState::_collide_shape(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, void *p_results, int32_t p_max_results, int32_t *p_result_count) {

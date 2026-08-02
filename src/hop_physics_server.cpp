@@ -281,7 +281,28 @@ uint64_t HopPhysicsServer::_area_get_object_instance_id(const RID &p_area) const
 
 void HopPhysicsServer::_area_set_param(const RID &p_area, PhysicsServer3D::AreaParameter p_param, const Variant &p_value) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
-	if (!area) return;
+	if (!area) {
+		// Not an area RID — Godot addresses a space's DEFAULT area by the SPACE rid
+		// (World3D pushes physics/3d/default_gravity through here at startup, and
+		// again whenever the setting changes). Dropping it left the simulator on its
+		// construction-time 9.81 no matter what the project asked for, so every
+		// dynamic body fell at the wrong rate while CharacterBody3D movement — which
+		// integrates its own gravity in script — looked correct.
+		if (HopSpaceData *space = space_owner.get_or_null(p_area)) {
+			switch (p_param) {
+				case PhysicsServer3D::AREA_PARAM_GRAVITY:
+					space->default_gravity = p_value;
+					space->apply_default_gravity();
+					break;
+				case PhysicsServer3D::AREA_PARAM_GRAVITY_VECTOR:
+					space->default_gravity_direction = p_value;
+					space->apply_default_gravity();
+					break;
+				default: break;  // the rest have no space-wide analogue in hop
+			}
+		}
+		return;
+	}
 	switch (p_param) {
 		case PhysicsServer3D::AREA_PARAM_GRAVITY: area->gravity = p_value; break;
 		case PhysicsServer3D::AREA_PARAM_GRAVITY_VECTOR: area->gravity_direction = p_value; break;

@@ -45,13 +45,23 @@ struct HopSpaceData {
 	// Cached direct state (created lazily, owned by this space)
 	HopDirectSpaceState *direct_state = nullptr;
 
+	// The space's DEFAULT area, which Godot addresses by the space RID rather than an
+	// area RID — that is how physics/3d/default_gravity reaches a PhysicsServer3D.
+	// Magnitude and direction arrive as separate calls, so both are kept and the
+	// simulator is re-pushed whenever either changes.
+	float default_gravity = 9.81f;
+	Vector3 default_gravity_direction = Vector3(0.0f, -1.0f, 0.0f);
+
+	void apply_default_gravity() {
+		Vector3 g = default_gravity_direction.normalized() * default_gravity;
+		simulator->set_gravity(hop::vec3<hop_scalar>(
+			to_hop_scalar(g.x), to_hop_scalar(g.y), to_hop_scalar(g.z)));
+	}
+
 	HopSpaceData() {
 		simulator = std::make_unique<hop::simulator<hop_scalar>>();
 		simulator->set_manager(&bvh_manager);
-		simulator->set_gravity(hop::vec3<hop_scalar>(
-			scalar_from_int<hop_scalar>(0),
-			scalar_from_milli<hop_scalar>(-9810),
-			scalar_from_int<hop_scalar>(0)));
+		apply_default_gravity();
 		simulator->set_integrator(hop::integrator_type::improved);
 		// Default every body to the speculative solve (matches the old global
 		// set_speculative_contacts(true); per-body overridable via set_contact_mode).

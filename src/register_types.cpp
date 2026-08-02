@@ -37,7 +37,11 @@ void initialize_hop_physics_module(ModuleInitializationLevel p_level) {
 
 	ClassDB::register_class<HopDirectBodyState>(true);
 	ClassDB::register_class<HopDirectSpaceState>(true);
-	ClassDB::register_class<HopPhysicsServer>();
+	// Abstract on purpose: the server is created by the factory below, never by
+	// ClassDB. A second instance is fatal — ~PhysicsServer3D nulls the engine's
+	// PhysicsServer3D singleton, so anything that instantiates (and frees) one
+	// crashes Godot on the next physics frame.
+	ClassDB::register_abstract_class<HopPhysicsServer>();
 	ClassDB::register_class<HopPhysicsServerFactory>();
 
 	hop_factory = memnew(HopPhysicsServerFactory);

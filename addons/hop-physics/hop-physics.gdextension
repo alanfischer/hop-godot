@@ -2,7 +2,10 @@
 
 entry_symbol = "hop_physics_library_init"
 compatibility_minimum = "4.1"
-reloadable = true
+# NOT reloadable: hot-reloading recreates the live HopPhysicsServer, and the old
+# instance's ~PhysicsServer3D nulls Godot's PhysicsServer3D singleton — the engine
+# then crashes on the next physics frame. Rebuilds need an editor restart.
+reloadable = false
 
 [libraries]
 

@@ -1957,6 +1957,11 @@ void HopPhysicsServer::_flush_queries() {
 		hop::solid<hop_scalar> *found[64];
 		int count = space->simulator->find_solids_in_aa_box(area_aabb, found, 64);
 
+		// Zero-length sweep of the area's own sensor solid, for the narrow-phase
+		// confirm below.
+		hop::segment<hop_scalar> zseg;
+		zseg.set_start_end(area->hop_solid->get_position(), area->hop_solid->get_position());
+
 		std::map<uint64_t, RID> current_overlaps;
 		for (int i = 0; i < count; i++) {
 			hop::solid<hop_scalar> *s = found[i];
@@ -1967,6 +1972,17 @@ void HopPhysicsServer::_flush_queries() {
 
 			HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
 			if (!body) continue;
+
+			// Narrow-phase confirm — the broadphase only compared bounding boxes, and
+			// the shapes inside them usually don't touch.  A CharacterBody3D resting
+			// against a wall sits exactly its safe_margin (1mm) away, and a capsule
+			// standing clear of a box's corner still has crossing AABBs: both read as
+			// "inside" without this, so e.g. a func_door's blocked-detector treats a
+			// player merely standing against the door as a rider and carries them up
+			// with it.  Matches _intersect_shape, which confirms the same way.
+			hop::collision<hop_scalar> col;
+			space->simulator->test_solid(col, area->hop_solid.get(), zseg, s);
+			if (to_godot_float(col.time) >= 1.0f) continue;
 
 			current_overlaps[body->object_instance_id] = body->self_rid;
 		}
@@ -2009,12 +2025,19 @@ void HopPhysicsServer::_flush_queries() {
 		hop::solid<hop_scalar> *cand[256];
 		int n = space->area_bvh.find_solids_in_aa_box(det_aabb, cand, 256);
 
+		hop::segment<hop_scalar> zseg;
+		zseg.set_start_end(detector->hop_solid->get_position(), detector->hop_solid->get_position());
+
 		std::map<uint64_t, RID> current_area_overlaps;
 		for (int i = 0; i < n; i++) {
 			HopAreaData *target = static_cast<HopAreaData *>(cand[i]->get_user_data());
 			if (!target || target == detector) continue;
 			if (!target->monitorable) continue;
 			if (!(detector->collision_mask & target->collision_layer)) continue;
+			// Narrow-phase confirm, as in the body pass above.
+			hop::collision<hop_scalar> col;
+			space->simulator->test_solid(col, detector->hop_solid.get(), zseg, cand[i]);
+			if (to_godot_float(col.time) >= 1.0f) continue;
 			current_area_overlaps[target->object_instance_id] = target->self_rid;
 		}
 

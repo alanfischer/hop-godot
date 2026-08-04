@@ -31,6 +31,24 @@ struct HopShapeData {
 	void set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_data);
 	std::shared_ptr<hop::shape<hop_scalar>> make_hop_shape(const Transform3D &p_local_xform);
 
+	// Drop the built geometry, keeping `data` — the next make_hop_shape rebuilds it
+	// from scratch, which is what that function does on every call anyway.
+	//
+	// For a trimesh that geometry is verts + per-triangle normals + a BVH, several
+	// times the size of the source triangle soup. A shape whose only users have
+	// switched to BSP hull collision is holding all of it for nothing, so the
+	// hull toggle releases it (see HopPhysicsServer::set_bsp_hulls_enabled).
+	//
+	// Only safe once no live hop::shape points here: hop::shape holds the traceable
+	// as a RAW pointer, so freeing one out from under a shape still in a solid
+	// dangles it. The caller is responsible for establishing that.
+	void release_derived() {
+		hop_shape.reset();
+		trimesh_traceable.reset();
+		plane_traceable.reset();
+		heightfield_traceable.reset();
+	}
+
 	// Builds the shape geometry from a rotation-stripped (scale + translation)
 	// transform. make_hop_shape splits the local transform into rotation (carried
 	// as the shape's static local_rotation, honored by the narrowphase) and the

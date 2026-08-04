@@ -3,6 +3,7 @@
 #include <hop/hop.h>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "hop_bsp_format.h"
@@ -104,14 +105,23 @@ struct hull_trace {
 	int start_contents = hop_bsp::CONTENTS_EMPTY;
 };
 
+// Signed distance of `p` from a plane, with the whole hull inflated outward by
+// `margin`. Solid is the back side (d < 0), so pushing `dist` out by the margin
+// grows the solid region — exact on faces, rounding the convex corners off. That
+// bias is applied at read time rather than by copying the plane array: a map has
+// tens of thousands of planes and hundreds of brush entities.
+inline double plane_dist(const hop_bsp::BSPPlane &pl, const double p[3], double margin) {
+	double d = (pl.type < 3)
+		? p[pl.type] - pl.dist
+		: pl.normal[0] * p[0] + pl.normal[1] * p[1] + pl.normal[2] * p[2] - pl.dist;
+	return d - margin;
+}
+
 // Contents at point `p` (GoldSrc space), descending from node `num`.
-inline int hull_point_contents(const hull &h, int num, const double p[3]) {
+inline int hull_point_contents(const hull &h, int num, const double p[3], double margin = 0) {
 	while (num >= 0) {
 		if (num >= h.node_count) return hop_bsp::CONTENTS_SOLID;
-		const hop_bsp::BSPPlane &pl = h.planes[h.planenum(num)];
-		double d = (pl.type < 3)
-			? p[pl.type] - pl.dist
-			: pl.normal[0] * p[0] + pl.normal[1] * p[1] + pl.normal[2] * p[2] - pl.dist;
+		double d = plane_dist(h.planes[h.planenum(num)], p, margin);
 		num = h.child(num, d < 0 ? 1 : 0);
 	}
 	return num;
@@ -122,15 +132,13 @@ inline int hull_point_contents(const hull &h, int num, const double p[3]) {
 // the smallest margin during the descent IS the closest surface. Returns false if
 // `p` isn't inside blocking contents.
 inline bool hull_push_out(const hull &h, int num, const double p[3], int blocking,
-                          double normal[3], double &depth) {
+                          double normal[3], double &depth, double margin = 0) {
 	double best = 1e30;
 	double best_n[3] = { 0, 0, 1 };
 	while (num >= 0) {
 		if (num >= h.node_count) return false;
 		const hop_bsp::BSPPlane &pl = h.planes[h.planenum(num)];
-		double d = (pl.type < 3)
-			? p[pl.type] - pl.dist
-			: pl.normal[0] * p[0] + pl.normal[1] * p[1] + pl.normal[2] * p[2] - pl.dist;
+		double d = plane_dist(pl, p, margin);
 		// best_n is the way OUT through this plane: descending to the back means
 		// the plane bounds the cell from above, so out is +normal; to the front
 		// means it bounds from below, so out is -normal.
@@ -157,7 +165,7 @@ inline bool hull_push_out(const hull &h, int num, const double p[3], int blockin
 // trace has been stopped.
 inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
                                  const double p1[3], const double p2[3],
-                                 int blocking, hull_trace &tr) {
+                                 int blocking, hull_trace &tr, double margin = 0) {
 	if (num < 0) {
 		if ((blocking & blocking_bit(num)) == 0) {
 			tr.allsolid = false;
@@ -169,17 +177,11 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 	if (num >= h.node_count) return false;
 
 	const hop_bsp::BSPPlane &pl = h.planes[h.planenum(num)];
-	double t1, t2;
-	if (pl.type < 3) {
-		t1 = p1[pl.type] - pl.dist;
-		t2 = p2[pl.type] - pl.dist;
-	} else {
-		t1 = pl.normal[0] * p1[0] + pl.normal[1] * p1[1] + pl.normal[2] * p1[2] - pl.dist;
-		t2 = pl.normal[0] * p2[0] + pl.normal[1] * p2[1] + pl.normal[2] * p2[2] - pl.dist;
-	}
+	const double t1 = plane_dist(pl, p1, margin);
+	const double t2 = plane_dist(pl, p2, margin);
 
-	if (t1 >= 0 && t2 >= 0) return recursive_hull_check(h, h.child(num, 0), p1f, p2f, p1, p2, blocking, tr);
-	if (t1 < 0 && t2 < 0)   return recursive_hull_check(h, h.child(num, 1), p1f, p2f, p1, p2, blocking, tr);
+	if (t1 >= 0 && t2 >= 0) return recursive_hull_check(h, h.child(num, 0), p1f, p2f, p1, p2, blocking, tr, margin);
+	if (t1 < 0 && t2 < 0)   return recursive_hull_check(h, h.child(num, 1), p1f, p2f, p1, p2, blocking, tr, margin);
 
 	// Split, keeping the crosspoint DIST_EPSILON on the near side of the plane.
 	double frac = (t1 < 0) ? (t1 + DIST_EPSILON) / (t1 - t2)
@@ -193,12 +195,12 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 
 	int side = (t1 < 0) ? 1 : 0;
 
-	if (!recursive_hull_check(h, h.child(num, side), p1f, midf, p1, mid, blocking, tr))
+	if (!recursive_hull_check(h, h.child(num, side), p1f, midf, p1, mid, blocking, tr, margin))
 		return false;
 
-	int far_contents = hull_point_contents(h, h.child(num, side ^ 1), mid);
+	int far_contents = hull_point_contents(h, h.child(num, side ^ 1), mid, margin);
 	if ((blocking & blocking_bit(far_contents)) == 0)
-		return recursive_hull_check(h, h.child(num, side ^ 1), midf, p2f, mid, p2, blocking, tr);
+		return recursive_hull_check(h, h.child(num, side ^ 1), midf, p2f, mid, p2, blocking, tr, margin);
 
 	if (tr.allsolid) return false;  // never got out of the solid area
 
@@ -215,7 +217,7 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 
 	// Back up if the crosspoint still landed inside solid — rare, but the epsilon
 	// nudge can't save every degenerate plane pair.
-	while ((blocking & blocking_bit(hull_point_contents(h, h.root, mid))) != 0) {
+	while ((blocking & blocking_bit(hull_point_contents(h, h.root, mid, margin))) != 0) {
 		frac -= 0.1;
 		if (frac < 0) {
 			tr.fraction = midf;
@@ -233,15 +235,31 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 
 // Full point sweep through one hull, GoldSrc space in and out.
 inline hull_trace hull_sweep(const hull &h, const double start[3], const double end[3],
-                             int blocking = BLOCK_SOLID) {
+                             int blocking = BLOCK_SOLID, double margin = 0) {
 	hull_trace tr;
 	for (int i = 0; i < 3; ++i) tr.endpos[i] = end[i];
 	if (!h.valid()) { tr.allsolid = false; return tr; }
-	tr.start_contents = hull_point_contents(h, h.root, start);
-	recursive_hull_check(h, h.root, 0.0, 1.0, start, end, blocking, tr);
+	tr.start_contents = hull_point_contents(h, h.root, start, margin);
+	recursive_hull_check(h, h.root, 0.0, 1.0, start, end, blocking, tr, margin);
 	if (tr.fraction == 1.0) for (int i = 0; i < 3; ++i) tr.endpos[i] = end[i];
 	return tr;
 }
+
+// One map's stripped BSP, owned once and shared by every traceable built from it.
+// A map has hundreds of brush entities and the blob runs to megabytes, so this is
+// never copied per body. hop owns the bytes — it never points into another
+// extension's parse, which could be freed underneath it.
+struct map_data {
+	std::vector<uint8_t> bytes;
+	hop_bsp::BlobView view;
+
+	bool load(const uint8_t *blob, size_t size) {
+		bytes.assign(blob, blob + size);
+		if (!hop_bsp::parse_blob(bytes.data(), bytes.size(), view)) { bytes.clear(); return false; }
+		return true;
+	}
+	bool valid() const { return view.valid(); }
+};
 
 } // namespace hopbsp
 
@@ -252,16 +270,16 @@ class HopBspTraceable : public hop::traceable<T> {
 	using tr = hop::scalar_traits<T>;
 
 public:
-	// `blob` is a stripped BSP30 file (goldsrc-godot's get_bsp_blob). It is COPIED:
-	// hop owns its bytes and never points into another extension's parse.
 	// `scale` is the importer's GoldSrc-units → metres factor.
-	bool build(const uint8_t *blob, size_t size, int model_index, T scale, int blocking = hopbsp::BLOCK_SOLID) {
-		bytes_.assign(blob, blob + size);
+	bool build(std::shared_ptr<hopbsp::map_data> map, int model_index, T scale,
+	           int blocking = hopbsp::BLOCK_SOLID) {
+		map_ = std::move(map);
 		blocking_ = blocking;
 		scale_ = (double)scale;
 		inv_scale_ = scale_ != 0.0 ? 1.0 / scale_ : 0.0;
-		if (!hop_bsp::parse_blob(bytes_.data(), bytes_.size(), view_)) { bytes_.clear(); return false; }
-		if (model_index < 0 || model_index >= view_.model_count) { bytes_.clear(); return false; }
+		if (!map_ || !map_->valid()) { map_.reset(); return false; }
+		view_ = map_->view;
+		if (model_index < 0 || model_index >= view_.model_count) { map_.reset(); return false; }
 		model_ = &view_.models[model_index];
 
 		for (int i = 0; i < 4; ++i) {
@@ -287,6 +305,14 @@ public:
 		bound_.mins.set(tr::min_val(a.x, b.x), tr::min_val(a.y, b.y), tr::min_val(a.z, b.z));
 		bound_.maxs.set(tr::max_val(a.x, b.x), tr::max_val(a.y, b.y), tr::max_val(a.z, b.z));
 		return true;
+	}
+
+	// Convenience for callers holding raw bytes (tests): loads a private copy.
+	bool build(const uint8_t *blob, size_t size, int model_index, T scale,
+	           int blocking = hopbsp::BLOCK_SOLID) {
+		auto map = std::make_shared<hopbsp::map_data>();
+		if (!map->load(blob, size)) return false;
+		return build(std::move(map), model_index, scale, blocking);
 	}
 
 	bool is_built() const { return model_ != nullptr; }
@@ -376,9 +402,7 @@ public:
 			return;
 		}
 
-		hopbsp::hull_trace ht = margin_gs > 0
-			? hull_sweep_inflated(h, start, end, margin_gs)
-			: hopbsp::hull_sweep(h, start, end, blocking_);
+		hopbsp::hull_trace ht = hopbsp::hull_sweep(h, start, end, blocking_, margin_gs);
 		if (!ht.hit || (T)ht.fraction >= result.time) return;
 
 		result.time = (T)ht.fraction;
@@ -485,24 +509,6 @@ private:
 		for (int i = 0; i < 3; ++i) { mins[i] = lo[i]; maxs[i] = hi[i]; }
 	}
 
-	// Sweep with every plane pushed out by `m`. Implemented as a sweep against a
-	// temporarily biased plane set rather than copying the tree: the descent reads
-	// `dist`, so bias it through a shadow array.
-	hopbsp::hull_trace hull_sweep_inflated(const hopbsp::hull &h, const double start[3],
-	                                       const double end[3], double m) {
-		if (inflated_planes_.size() != (size_t)view_.plane_count || inflated_margin_ != m) {
-			inflated_planes_.resize(view_.plane_count);
-			for (int i = 0; i < view_.plane_count; ++i) {
-				inflated_planes_[i] = view_.planes[i];
-				inflated_planes_[i].dist += (float)m;
-			}
-			inflated_margin_ = m;
-		}
-		hopbsp::hull ih = h;
-		ih.planes = inflated_planes_.data();
-		return hopbsp::hull_sweep(ih, start, end, blocking_);
-	}
-
 	// Nearest blocking surface within `limit` of `p`, by six axis probes. Only used
 	// for the speculative (margin, not penetrating) contact case.
 	bool nearest_surface(const hopbsp::hull &h, const double p[3], double limit,
@@ -526,7 +532,7 @@ private:
 		return found;
 	}
 
-	std::vector<uint8_t> bytes_;
+	std::shared_ptr<hopbsp::map_data> map_;  // keeps the shared bytes alive
 	hop_bsp::BlobView view_;
 	const hop_bsp::BSPModel *model_ = nullptr;
 	hopbsp::hull hulls_[4];
@@ -534,6 +540,4 @@ private:
 	int blocking_ = hopbsp::BLOCK_SOLID;
 	double scale_ = 1.0;
 	double inv_scale_ = 1.0;
-	std::vector<hop_bsp::BSPPlane> inflated_planes_;
-	double inflated_margin_ = -1.0;
 };

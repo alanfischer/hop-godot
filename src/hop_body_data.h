@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 #include <set>
+#include "hop_bsp_traceable.h"
 #include "hop_conversions.h"
 
 using namespace godot;
@@ -78,6 +79,13 @@ struct HopBodyData {
 
 	// hop backing
 	std::shared_ptr<hop::solid<hop_scalar>> hop_solid;
+
+	// GoldSrc BSP hull collision. When this body's node is a hull carrier (see
+	// HopPhysicsServer::try_build_bsp_hull) the real BSP tree is traced instead of
+	// the trimesh/convex shapes the node carries for default physics. Owned here
+	// because hop::shape holds the traceable as a raw pointer.
+	std::shared_ptr<HopBspTraceable<hop_scalar>> bsp_traceable;
+	int bsp_checked = 0;  // 0 = not looked at yet, 1 = not a carrier, 2 = hull in use
 
 	// Contact info from last step
 	struct ContactInfo {

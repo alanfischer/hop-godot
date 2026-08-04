@@ -6,6 +6,8 @@
 #include <godot_cpp/classes/physics_direct_body_state3d.hpp>
 #include <godot_cpp/classes/physics_direct_space_state3d.hpp>
 
+#include <unordered_map>
+
 #include "hop_rid.h"
 #include "hop_shape_data.h"
 #include "hop_body_data.h"
@@ -37,6 +39,15 @@ public:
 
 	// Helpers
 	void rebuild_body_shapes(HopBodyData *body);
+	// GoldSrc BSP hull collision. A body whose node carries goldsrc-godot's
+	// "bsp_model" metadata is a carrier: its trimesh/convex shapes stand in for a
+	// real BSP hull, and we trace the hull instead. Returns false (leaving the
+	// carrier shapes to be built as usual) when there is no hull to be had —
+	// which is also the whole fallback story for default Godot physics.
+	bool try_build_bsp_hull(HopBodyData *body);
+	// One shared blob per loaded map, keyed by the instance id of the node that
+	// carries it. Weak, so unloading a map frees it.
+	std::unordered_map<uint64_t, std::weak_ptr<hopbsp::map_data>> bsp_maps;
 	// Phase 8: auto-compute a dynamic body's principal inertia from its collision
 	// AABB + mass (so a RigidBody3D spins without the game setting inertia), unless
 	// the game set BODY_PARAM_INERTIA explicitly (custom_inertia).

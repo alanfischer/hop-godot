@@ -402,6 +402,31 @@ static void test_solid_margin_finds_resting_contact() {
 	printf("  solid_margin_finds_resting_contact ok\n");
 }
 
+static void test_solid_starting_stuck_defers_to_recovery() {
+	auto t = load(make_floor_map());
+	auto s = make_box_solid(0.4, 0.9, 0.4);
+	// Mappers routinely sink a spawn a hair into the floor (ww_countryside puts
+	// ten of them at z=351.9 where the hull surface is 352). A sweep from inside
+	// solid must NOT fabricate an impact plane — Quake reports startsolid and no
+	// normal, because a made-up normal shoves a stuck body in a garbage direction.
+	hop::collision<T> swept;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 0.8975, 0), vec(0, -4, 0));  // 0.1 GoldSrc units low
+	t->trace_solid(swept, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	assert(swept.time == 1.0);
+
+	// The zero-direction query is what resolves it: push straight up, by exactly
+	// the 0.1 units it is buried.
+	hop::collision<T> rec;
+	hop::segment<T> still;
+	still.set_start_dir(vec(0, 0.8975, 0), vec(0, 0, 0));
+	t->trace_solid(rec, s.get(), vec(0, 0, 0), hop::mat3<T>(), still, T {});
+	assert(rec.time == 0.0);
+	assert(approx_v(rec.normal, 0, 1, 0));
+	assert(approx(rec.depth / SCALE, 0.1, 0.01));  // in GoldSrc units
+	printf("  solid_starting_stuck_defers_to_recovery ok\n");
+}
+
 // --- contents filtering ---------------------------------------------------
 
 static void test_sky_is_passable_but_maskable() {
@@ -481,6 +506,7 @@ int main() {
 	test_solid_misses();
 	test_solid_overlap_pushes_out();
 	test_solid_margin_finds_resting_contact();
+	test_solid_starting_stuck_defers_to_recovery();
 	test_sky_is_passable_but_maskable();
 	test_float_instantiation();
 	printf("all bsp traceable tests passed\n");

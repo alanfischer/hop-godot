@@ -358,8 +358,18 @@ public:
 		const int hi = hopbsp::hull_for_size(maxs[0] - mins[0], maxs[2] - mins[2]);
 		const hopbsp::hull &h = hulls_[hi];
 		if (!h.valid()) return;
+		// Reduce the mover to the point the hull was expanded around. GoldSrc traces
+		// (origin + mins - clip_mins): the hull is built for a box whose origin sits
+		// at clip_mins from its low corner, so a mover whose origin sits elsewhere in
+		// its own box has to be shifted by the difference.
+		//
+		// This is ZERO for a centre-origin box, which is what makes it easy to get
+		// backwards and never notice — GoldSrc's own player is centre-origin. Godot
+		// bodies are not: WizardWars offsets the player's collider upward so the
+		// origin is at the feet, and with the sign flipped the trace point lands a
+		// full half-height BELOW the feet, i.e. inside the floor, every frame.
 		double offset[3];
-		for (int i = 0; i < 3; ++i) offset[i] = hopbsp::HULL_SIZES[hi].mins[i] - mins[i];
+		for (int i = 0; i < 3; ++i) offset[i] = mins[i] - hopbsp::HULL_SIZES[hi].mins[i];
 
 		hop::vec3<T> lo, ld;
 		to_local(seg.origin, seg.direction, position, orientation, lo, ld);
@@ -377,20 +387,35 @@ public:
 		const double margin_gs = (double)margin * inv_scale_;
 
 		const bool zero_dir = hop::length_squared(ld) == T {};
-		if (zero_dir) {
-			// Static overlap. Report t=0 with a push-out, or nothing at all.
-			double n[3], depth = 0;
-			double probe[3] = { start[0], start[1], start[2] };
-			if (!hopbsp::hull_push_out(h, h.root, probe, blocking_, n, depth)) {
+
+		// A mover that STARTS inside solid is reported as an overlap, whatever its
+		// direction. Quake instead reports startsolid and leaves the trace clear,
+		// because its callers check that flag and refuse the move — hop's caller has
+		// no such flag, so "clear" reads as "the whole path is free" and the mover
+		// sails through the wall it is embedded in. Standing on a floor and sinking
+		// a hair into the expanded hull is enough to start it: each frame gravity
+		// sweeps freely, sinking it deeper, until it drops out of the world. That is
+		// exactly what happened to bots on ww_2fort's ramps.
+		//
+		// Resting exactly ON the surface is not inside it (contents test is d < 0),
+		// so this costs the normal standing case nothing.
+		double n[3], depth = 0;
+		double probe[3] = { start[0], start[1], start[2] };
+		// Margin 0 on purpose: only REAL penetration counts as stuck. Testing
+		// against the inflated hull would call a mover merely within `margin` of a
+		// wall stuck and stall it dead.
+		const bool inside = hopbsp::hull_push_out(h, h.root, probe, blocking_, n, depth);
+		if (inside || zero_dir) {
+			if (inside) {
+				depth += margin_gs;
+			} else {
 				if (margin_gs <= 0) return;
 				// Not inside, but a face within `margin` still counts as a contact:
-				// sweep a margin-long probe along -normal candidates is overkill, so
-				// use the six axes and take the nearest surface.
+				// sweeping a probe along every candidate normal is overkill, so use
+				// the six axes and take the nearest surface.
 				if (!nearest_surface(h, probe, margin_gs, n, depth)) return;
 				depth = margin_gs - depth;
 				if (depth <= 0) return;
-			} else {
-				depth += margin_gs;
 			}
 			if (T {} >= result.time) return;
 			result.time = T {};

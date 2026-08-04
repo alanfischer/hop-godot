@@ -330,6 +330,56 @@ static void test_solid_lands_on_floor() {
 	printf("  solid_lands_on_floor ok\n");
 }
 
+// A mover whose origin is NOT the centre of its own box — Godot's convention for a
+// character body, and WizardWars' actual player: the collider is offset upward so
+// the origin sits at the feet.
+static std::shared_ptr<hop::solid<T>> make_feet_box_solid(T hx, T height, T hz) {
+	hop::aa_box<T> b;
+	b.mins = vec(-hx, 0, -hz);
+	b.maxs = vec(hx, height, hz);
+	auto s = std::make_shared<hop::solid<T>>();
+	s->add_shape(std::make_shared<hop::shape<T>>(b));
+	return s;
+}
+
+static void test_feet_origin_mover_lands_on_the_floor() {
+	auto t = load(make_floor_map());
+	// Same 32x32x72 player, but with its origin at the feet. It must come to rest
+	// with its ORIGIN on the floor (y=0), not its centre.
+	auto s = make_feet_box_solid(0.4, 1.8, 0.4);
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 3, 0), vec(0, -4, 0));
+	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	assert(c.time < 1.0);
+	assert(approx(c.point.y, 0.0, 0.02));
+	assert(approx_v(c.normal, 0, 1, 0));
+	printf("  feet_origin_mover_lands_on_the_floor ok\n");
+}
+
+// The regression that dropped bots through ww_2fort: with the hull offset applied
+// backwards, a feet-origin mover standing ON the floor traces from half a body
+// BELOW its feet, reads as deeply embedded, and gets a downward push-out that
+// shoves it through the world. A body resting on the floor must be in the clear.
+static void test_feet_origin_mover_resting_is_not_stuck() {
+	auto t = load(make_floor_map());
+	auto s = make_feet_box_solid(0.4, 1.8, 0.4);
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 0.001, 0), vec(0, 0, 0));  // standing on the floor
+	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	assert(c.time == 1.0 && "a body resting on the floor must not report as overlapping");
+
+	// And a downward sweep from there must not be waved through.
+	hop::collision<T> down;
+	hop::segment<T> ds;
+	ds.set_start_dir(vec(0, 0.001, 0), vec(0, -2, 0));
+	t->trace_solid(down, s.get(), vec(0, 0, 0), hop::mat3<T>(), ds, T {});
+	assert(down.time < 1.0);
+	assert(down.normal.y > 0.5 && "the floor must push UP, never down");
+	printf("  feet_origin_mover_resting_is_not_stuck ok\n");
+}
+
 static void test_solid_crouched_uses_short_hull() {
 	auto t = load(make_floor_map());
 	// 32x32x36 GoldSrc → half-extents (0.4, 0.45, 0.4). Hull 3 stops the centre
@@ -402,21 +452,29 @@ static void test_solid_margin_finds_resting_contact() {
 	printf("  solid_margin_finds_resting_contact ok\n");
 }
 
-static void test_solid_starting_stuck_defers_to_recovery() {
+static void test_solid_starting_stuck_reports_overlap() {
 	auto t = load(make_floor_map());
 	auto s = make_box_solid(0.4, 0.9, 0.4);
 	// Mappers routinely sink a spawn a hair into the floor (ww_countryside puts
-	// ten of them at z=351.9 where the hull surface is 352). A sweep from inside
-	// solid must NOT fabricate an impact plane — Quake reports startsolid and no
-	// normal, because a made-up normal shoves a stuck body in a garbage direction.
+	// ten of them at z=351.9 where the hull surface is 352). A SWEPT trace from
+	// inside solid must report the overlap, not a clear path.
+	//
+	// Quake reports startsolid and leaves the trace clear, because its callers
+	// check that flag and refuse the move. hop's caller has no such flag, so a
+	// clear trace reads as "the whole path is free" — and a body standing a hair
+	// inside the floor then sweeps freely downward under gravity, sinking further
+	// every frame until it drops out of the world. That is exactly what dropped
+	// bots through ww_2fort's ramps to y=-103.
 	hop::collision<T> swept;
 	hop::segment<T> seg;
 	seg.set_start_dir(vec(0, 0.8975, 0), vec(0, -4, 0));  // 0.1 GoldSrc units low
 	t->trace_solid(swept, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
-	assert(swept.time == 1.0);
+	assert(swept.time == 0.0);
+	assert(approx_v(swept.normal, 0, 1, 0));
+	assert(approx(swept.depth / SCALE, 0.1, 0.01));
 
-	// The zero-direction query is what resolves it: push straight up, by exactly
-	// the 0.1 units it is buried.
+	// The zero-direction query reports the same thing: push straight up, by
+	// exactly the 0.1 units it is buried.
 	hop::collision<T> rec;
 	hop::segment<T> still;
 	still.set_start_dir(vec(0, 0.8975, 0), vec(0, 0, 0));
@@ -424,7 +482,7 @@ static void test_solid_starting_stuck_defers_to_recovery() {
 	assert(rec.time == 0.0);
 	assert(approx_v(rec.normal, 0, 1, 0));
 	assert(approx(rec.depth / SCALE, 0.1, 0.01));  // in GoldSrc units
-	printf("  solid_starting_stuck_defers_to_recovery ok\n");
+	printf("  solid_starting_stuck_reports_overlap ok\n");
 }
 
 // --- contents filtering ---------------------------------------------------
@@ -501,12 +559,14 @@ int main() {
 	test_ray_respects_orientation();
 	test_hull_selection();
 	test_solid_lands_on_floor();
+	test_feet_origin_mover_lands_on_the_floor();
+	test_feet_origin_mover_resting_is_not_stuck();
 	test_solid_crouched_uses_short_hull();
 	test_solid_impact_is_on_the_surface();
 	test_solid_misses();
 	test_solid_overlap_pushes_out();
 	test_solid_margin_finds_resting_contact();
-	test_solid_starting_stuck_defers_to_recovery();
+	test_solid_starting_stuck_reports_overlap();
 	test_sky_is_passable_but_maskable();
 	test_float_instantiation();
 	printf("all bsp traceable tests passed\n");

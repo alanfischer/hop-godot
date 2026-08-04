@@ -445,15 +445,10 @@ void HopPhysicsServer::set_bsp_hulls_enabled(bool p_enabled) {
 	int rebuilt = 0;
 	int released = 0;
 	body_owner.for_each([&](HopBodyData *body) {
-		const bool was_carrier = body->bsp_traceable != nullptr;
+		const bool was_carrier = body->bsp_checked == 2;
 		if (!was_carrier && body->bsp_checked == 1 && !p_enabled) return;
-
-		// Order matters. The solid's shapes point at bsp_traceable, so drop every
-		// shape BEFORE releasing it — otherwise the solid briefly (or, on the
-		// early-out path below, permanently) holds a shape aimed at freed memory.
-		if (body->hop_solid) body->hop_solid->remove_all_shapes();
-		body->bsp_traceable.reset();
-		body->bsp_checked = 0;
+		body->bsp_checked = 0;  // re-resolve; a map may have loaded while off
+		if (!p_enabled) body->bsp_map.reset();  // stop pinning the tree while off
 		if (!body->hop_solid || !body->space_rid.is_valid()) return;
 
 		rebuild_body_shapes(body);
@@ -465,7 +460,7 @@ void HopPhysicsServer::set_bsp_hulls_enabled(bool p_enabled) {
 			space->bvh_manager.add_solid(body->hop_solid.get(),
 				body->mode == PhysicsServer3D::BODY_MODE_STATIC);
 		}
-		if (body->bsp_traceable) {
+		if (body->bsp_checked == 2) {
 			// Now tracing the hull, so this body's carrier shapes are dead weight.
 			// Dropping the entry frees the shape and with it the built geometry
 			// (verts, normals and BVH for a trimesh) — a hop::shape owns its
@@ -475,10 +470,11 @@ void HopPhysicsServer::set_bsp_hulls_enabled(bool p_enabled) {
 				entry.hop_shape.reset();
 			}
 		}
-		if (was_carrier || body->bsp_traceable) rebuilt++;
+		if (was_carrier || body->bsp_checked == 2) rebuilt++;
 	});
 
-	if (!bsp_maps.empty() && !p_enabled) bsp_maps.clear();
+	// bsp_maps is a weak cache — entries expire on their own once the last body
+	// holding the map is gone, so there is nothing to clear here.
 	UtilityFunctions::print("[Hop] BSP hull collision ", p_enabled ? "ON" : "OFF",
 		" — rebuilt ", rebuilt, " carrier body/bodies, released ", released,
 		" unused shape geometr", released == 1 ? "y" : "ies");
@@ -495,20 +491,19 @@ void HopPhysicsServer::set_bsp_hulls_enabled(bool p_enabled) {
 //
 // Returns false whenever there is no hull to be had, leaving the carrier shapes
 // to be built exactly as before — which is the entire fallback story.
-bool HopPhysicsServer::try_build_bsp_hull(HopBodyData *body) {
-	if (!bsp_hulls_enabled) return false;
-	if (body->bsp_checked == 1) return false;
-	if (body->bsp_traceable) return true;
+std::unique_ptr<HopBspTraceable<hop_scalar>> HopPhysicsServer::try_build_bsp_hull(HopBodyData *body) {
+	if (!bsp_hulls_enabled) return nullptr;
+	if (body->bsp_checked == 1) return nullptr;  // known not to be a carrier
 
 	body->bsp_checked = 1;
-	if (body->object_instance_id == 0) return false;
+	if (body->object_instance_id == 0) return nullptr;
 	Node *node = Object::cast_to<Node>(
 		UtilityFunctions::instance_from_id((int64_t)body->object_instance_id));
-	if (!node || !node->has_meta("bsp_model")) return false;
+	if (!node || !node->has_meta("bsp_model")) return nullptr;
 
 	Node *root = node;
 	while (root && !root->has_meta("bsp_data")) root = root->get_parent();
-	if (!root) return false;
+	if (!root) return nullptr;
 
 	const uint64_t key = root->get_instance_id();
 	std::shared_ptr<hopbsp::map_data> map;
@@ -516,26 +511,24 @@ bool HopPhysicsServer::try_build_bsp_hull(HopBodyData *body) {
 	if (it != bsp_maps.end()) map = it->second.lock();
 	if (!map) {
 		PackedByteArray blob = root->get_meta("bsp_data");
-		if (blob.is_empty()) return false;
+		if (blob.is_empty()) return nullptr;
 		map = std::make_shared<hopbsp::map_data>();
-		if (!map->load(blob.ptr(), (size_t)blob.size())) return false;
+		if (!map->load(blob.ptr(), (size_t)blob.size())) return nullptr;
 		bsp_maps[key] = map;
+		// Once per map: the tree is loaded once and shared by every body on it.
+		UtilityFunctions::print("[Hop] BSP hull collision active for ", root->get_name(),
+			" (", (int64_t)blob.size(), " byte tree, shared by all its bodies)");
 	}
 
-	auto traceable = std::make_shared<HopBspTraceable<hop_scalar>>();
+	auto traceable = std::make_unique<HopBspTraceable<hop_scalar>>();
 	const int model = (int)node->get_meta("bsp_model");
 	const float scale = (float)node->get_meta("bsp_scale", 0.025f);
 	const int blocking = (int)node->get_meta("bsp_blocking", hopbsp::BLOCK_SOLID);
-	if (!traceable->build(map, model, scalar_from_float<hop_scalar>(scale), blocking)) return false;
+	if (!traceable->build(map, model, scalar_from_float<hop_scalar>(scale), blocking)) return nullptr;
 
-	body->bsp_traceable = traceable;
-	body->bsp_checked = 2;
-	// Worldspawn only — one line per map load, not one per brush entity.
-	if (model == 0) {
-		UtilityFunctions::print("[Hop] BSP hull collision: ", node->get_name(),
-			" model 0, blocking mask ", blocking, ", scale ", scale);
-	}
-	return true;
+	body->bsp_map = map;    // pin the shared tree for as long as this body lives
+	body->bsp_checked = 2;  // a carrier; the traceable itself is the shape's business
+	return traceable;
 }
 
 void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
@@ -545,9 +538,9 @@ void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 	// The hull replaces the carrier shapes outright — one traceable for the whole
 	// model, at the body's own origin (BSP geometry is authored in exactly the
 	// space the importer gives the node).
-	if (try_build_bsp_hull(body)) {
+	if (auto hull = try_build_bsp_hull(body)) {
 		body->hop_solid->add_shape(
-			std::make_shared<hop::shape<hop_scalar>>(body->bsp_traceable.get()));
+			std::make_shared<hop::shape<hop_scalar>>(std::move(hull)));
 		if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) body->hop_solid->deactivate();
 		return;
 	}

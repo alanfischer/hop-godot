@@ -13,6 +13,7 @@
 #include "hop_rid.h"
 #include "hop_shape_data.h"
 #include "hop_body_data.h"
+#include "hop_bsp_traceable.h"
 #include "hop_area_data.h"
 #include "hop_space_data.h"
 #include "hop_joint_data.h"
@@ -54,7 +55,10 @@ public:
 	// real BSP hull, and we trace the hull instead. Returns false (leaving the
 	// carrier shapes to be built as usual) when there is no hull to be had —
 	// which is also the whole fallback story for default Godot physics.
-	bool try_build_bsp_hull(HopBodyData *body);
+	// Returns the hull traceable for a carrier body, or null. Ownership goes to
+	// the caller (and from there to the hop::shape), so nothing outlives the shape
+	// pointing at it.
+	std::unique_ptr<HopBspTraceable<hop_scalar>> try_build_bsp_hull(HopBodyData *body);
 	// Runtime toggle. Rebuilds every carrier body already in the world, so the
 	// switch is immediate — the game replicates this and both ends must agree.
 	// HOP_NO_BSP_HULLS=1 only sets the boot default (for CI / dedicated servers

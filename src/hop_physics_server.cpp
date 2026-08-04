@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <unordered_map>
-#include <unordered_set>
 
 // Scale-only transform from a Godot basis: hop has no scale, so a body/area's
 // scale is baked into the shape geometry (composed in front of each shape's local
@@ -444,16 +443,19 @@ void HopPhysicsServer::set_bsp_hulls_enabled(bool p_enabled) {
 	bsp_hulls_enabled = p_enabled;
 
 	int rebuilt = 0;
-	// Shapes whose owning body just switched to a hull. Their built geometry is
-	// now dead weight — but only if nothing else still points at it (see below).
-	std::unordered_set<uint64_t> orphaned;
-	std::vector<RID> orphan_rids;
+	int released = 0;
 	body_owner.for_each([&](HopBodyData *body) {
 		const bool was_carrier = body->bsp_traceable != nullptr;
 		if (!was_carrier && body->bsp_checked == 1 && !p_enabled) return;
+
+		// Order matters. The solid's shapes point at bsp_traceable, so drop every
+		// shape BEFORE releasing it — otherwise the solid briefly (or, on the
+		// early-out path below, permanently) holds a shape aimed at freed memory.
+		if (body->hop_solid) body->hop_solid->remove_all_shapes();
 		body->bsp_traceable.reset();
 		body->bsp_checked = 0;
 		if (!body->hop_solid || !body->space_rid.is_valid()) return;
+
 		rebuild_body_shapes(body);
 		// The solid's bound changes wholesale (a map-sized hull vs. per-brush
 		// shapes), so re-register it with the broadphase as _body_set_mode does.
@@ -464,39 +466,17 @@ void HopPhysicsServer::set_bsp_hulls_enabled(bool p_enabled) {
 				body->mode == PhysicsServer3D::BODY_MODE_STATIC);
 		}
 		if (body->bsp_traceable) {
-			// Now tracing the hull: nothing of this body's carrier shapes is live,
-			// so drop the per-body hop::shape and nominate the shape for release.
+			// Now tracing the hull, so this body's carrier shapes are dead weight.
+			// Dropping the entry frees the shape and with it the built geometry
+			// (verts, normals and BVH for a trimesh) — a hop::shape owns its
+			// traceable, so there is nothing to work out about who else uses it.
 			for (auto &entry : body->shapes) {
+				if (entry.hop_shape) released++;
 				entry.hop_shape.reset();
-				if (entry.shape_rid.is_valid() && orphaned.insert(entry.shape_rid.get_id()).second)
-					orphan_rids.push_back(entry.shape_rid);
 			}
 		}
 		if (was_carrier || body->bsp_traceable) rebuilt++;
 	});
-
-	// A shape RID can be shared — goldsrc-godot hands a brush entity's shapes to a
-	// Volume Area3D for containment. hop::shape holds its traceable as a raw
-	// pointer, so releasing one that another body or area is still using would
-	// dangle it. Un-nominate anything still referenced.
-	body_owner.for_each([&](HopBodyData *body) {
-		if (body->bsp_traceable) return;  // this body is on the hull; not a user
-		for (auto &entry : body->shapes)
-			if (entry.shape_rid.is_valid()) orphaned.erase(entry.shape_rid.get_id());
-	});
-	area_owner.for_each([&](HopAreaData *area) {
-		for (auto &entry : area->shapes)
-			if (entry.shape_rid.is_valid()) orphaned.erase(entry.shape_rid.get_id());
-	});
-
-	int released = 0;
-	for (const RID &rid : orphan_rids) {
-		if (!orphaned.count(rid.get_id())) continue;  // un-nominated above
-		HopShapeData *sd = shape_owner.get_or_null(rid);
-		if (!sd) continue;
-		sd->release_derived();
-		released++;
-	}
 
 	if (!bsp_maps.empty() && !p_enabled) bsp_maps.clear();
 	UtilityFunctions::print("[Hop] BSP hull collision ", p_enabled ? "ON" : "OFF",

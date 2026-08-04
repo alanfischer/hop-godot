@@ -171,7 +171,6 @@ static bool build_convex_solid_from_points(
 void HopShapeData::set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_data) {
 	type = p_type;
 	data = p_data;
-	hop_shape.reset();
 }
 
 std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Transform3D &p_local_xform) {
@@ -349,9 +348,9 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 
 		case PhysicsServer3D::SHAPE_WORLD_BOUNDARY: {
 			Plane p = data;
-			plane_traceable = std::make_shared<HopPlaneTraceable<hop_scalar>>();
-			plane_traceable->set_plane(to_hop(p.normal), to_hop_scalar(p.d));
-			return std::make_shared<hop::shape<hop_scalar>>(plane_traceable.get());
+			auto plane = std::make_unique<HopPlaneTraceable<hop_scalar>>();
+			plane->set_plane(to_hop(p.normal), to_hop_scalar(p.d));
+			return std::make_shared<hop::shape<hop_scalar>>(std::move(plane));
 		}
 
 		case PhysicsServer3D::SHAPE_CONCAVE_POLYGON: {
@@ -402,11 +401,11 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			if (tris.empty())
 				return nullptr;
 
-			trimesh_traceable = std::make_shared<HopTrimeshTraceable<hop_scalar>>();
-			trimesh_traceable->build(verts.data(), (int)verts.size(),
+			auto trimesh = std::make_unique<HopTrimeshTraceable<hop_scalar>>();
+			trimesh->build(verts.data(), (int)verts.size(),
 			                         tris.data(), (int)tris.size(),
 			                         backface_collision);
-			return std::make_shared<hop::shape<hop_scalar>>(trimesh_traceable.get());
+			return std::make_shared<hop::shape<hop_scalar>>(std::move(trimesh));
 		}
 
 		case PhysicsServer3D::SHAPE_HEIGHTMAP: {
@@ -424,9 +423,9 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			// scale, so bake it into the traceable). to_hop is identity, so godot
 			// X/Z/Y map straight through.
 			Vector3 gscale = p_local_xform.basis.get_scale();
-			heightfield_traceable = std::make_shared<HopHeightfieldTraceable<hop_scalar>>();
-			heightfield_traceable->build(w, dp, heights.ptr(), to_hop(gscale), to_hop(origin));
-			return std::make_shared<hop::shape<hop_scalar>>(heightfield_traceable.get());
+			auto heightfield = std::make_unique<HopHeightfieldTraceable<hop_scalar>>();
+			heightfield->build(w, dp, heights.ptr(), to_hop(gscale), to_hop(origin));
+			return std::make_shared<hop::shape<hop_scalar>>(std::move(heightfield));
 		}
 
 		default:

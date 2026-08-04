@@ -16,9 +16,14 @@ enable_testing()
 # Tests rely on assert() — keep it live regardless of build type.
 add_compile_options(-UNDEBUG)
 
-add_executable(test_trimesh_traceable test_trimesh_traceable.cpp)
-# hop core headers + the hop-godot source dir (for hop_trimesh_traceable.h).
-target_include_directories(test_trimesh_traceable PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../extern/hop/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-add_test(NAME test_trimesh_traceable COMMAND test_trimesh_traceable)
+# hop core headers + the hop-godot source dir (for the traceable headers).
+function(add_hop_godot_test name)
+    add_executable(${name} ${name}.cpp)
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../extern/hop/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+add_hop_godot_test(test_trimesh_traceable)
+add_hop_godot_test(test_bsp_traceable)

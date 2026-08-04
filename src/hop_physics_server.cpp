@@ -431,6 +431,40 @@ RID HopPhysicsServer::_body_create() {
 	return rid;
 }
 
+// Flip BSP hull collision for every body already in the world, not just ones
+// built from here on. Toggling has to be immediate and symmetric — the game
+// replicates this flag, and a client whose collision lags the server's by even a
+// map's worth of bodies mispredicts every step against the wrong geometry.
+//
+// Bodies are re-resolved from scratch (bsp_checked = 0) rather than remembered,
+// so turning it back on picks up maps loaded while it was off.
+void HopPhysicsServer::set_bsp_hulls_enabled(bool p_enabled) {
+	if (bsp_hulls_enabled == p_enabled) return;
+	bsp_hulls_enabled = p_enabled;
+
+	int rebuilt = 0;
+	body_owner.for_each([&](HopBodyData *body) {
+		const bool was_carrier = body->bsp_traceable != nullptr;
+		if (!was_carrier && body->bsp_checked == 1 && !p_enabled) return;
+		body->bsp_traceable.reset();
+		body->bsp_checked = 0;
+		if (!body->hop_solid || !body->space_rid.is_valid()) return;
+		rebuild_body_shapes(body);
+		// The solid's bound changes wholesale (a map-sized hull vs. per-brush
+		// shapes), so re-register it with the broadphase as _body_set_mode does.
+		HopSpaceData *space = space_owner.get_or_null(body->space_rid);
+		if (space) {
+			space->bvh_manager.remove_solid(body->hop_solid.get());
+			space->bvh_manager.add_solid(body->hop_solid.get(),
+				body->mode == PhysicsServer3D::BODY_MODE_STATIC);
+		}
+		if (was_carrier || body->bsp_traceable) rebuilt++;
+	});
+	if (!bsp_maps.empty() && !p_enabled) bsp_maps.clear();
+	UtilityFunctions::print("[Hop] BSP hull collision ", p_enabled ? "ON" : "OFF",
+		" — rebuilt ", rebuilt, " carrier body/bodies");
+}
+
 // A body whose node carries goldsrc-godot's "bsp_model" metadata stands in for a
 // real GoldSrc BSP hull: the trimesh/convex shapes on it exist so default Godot
 // physics has something to collide with, but we can trace the compiler's own
@@ -443,13 +477,9 @@ RID HopPhysicsServer::_body_create() {
 // Returns false whenever there is no hull to be had, leaving the carrier shapes
 // to be built exactly as before — which is the entire fallback story.
 bool HopPhysicsServer::try_build_bsp_hull(HopBodyData *body) {
+	if (!bsp_hulls_enabled) return false;
 	if (body->bsp_checked == 1) return false;
 	if (body->bsp_traceable) return true;
-
-	// Escape hatch for A/B-ing hull collision against the carrier shapes without
-	// switching physics engines wholesale.
-	static const bool disabled = OS::get_singleton()->get_environment("HOP_NO_BSP_HULLS") == "1";
-	if (disabled) { body->bsp_checked = 1; return false; }
 
 	body->bsp_checked = 1;
 	if (body->object_instance_id == 0) return false;

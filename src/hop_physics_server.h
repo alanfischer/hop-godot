@@ -5,6 +5,8 @@
 #include <godot_cpp/classes/physics_server3d_rendering_server_handler.hpp>
 #include <godot_cpp/classes/physics_direct_body_state3d.hpp>
 #include <godot_cpp/classes/physics_direct_space_state3d.hpp>
+#include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/core/class_db.hpp>
 
 #include <unordered_map>
 
@@ -24,7 +26,15 @@ class HopPhysicsServer : public PhysicsServer3DExtension {
 	GDCLASS(HopPhysicsServer, PhysicsServer3DExtension);
 
 protected:
-	static void _bind_methods() {}
+	// The BSP-hull toggle is the one piece of server state the game drives
+	// directly (WizardWars replicates it as a server var), so it is bound for
+	// GDScript: PhysicsServer3D.set_bsp_hulls_enabled(...).
+	static void _bind_methods() {
+		ClassDB::bind_method(D_METHOD("set_bsp_hulls_enabled", "enabled"),
+			&HopPhysicsServer::set_bsp_hulls_enabled);
+		ClassDB::bind_method(D_METHOD("get_bsp_hulls_enabled"),
+			&HopPhysicsServer::get_bsp_hulls_enabled);
+	}
 
 public:
 	mutable HopRIDOwner<HopShapeData> shape_owner;
@@ -45,6 +55,13 @@ public:
 	// carrier shapes to be built as usual) when there is no hull to be had —
 	// which is also the whole fallback story for default Godot physics.
 	bool try_build_bsp_hull(HopBodyData *body);
+	// Runtime toggle. Rebuilds every carrier body already in the world, so the
+	// switch is immediate — the game replicates this and both ends must agree.
+	// HOP_NO_BSP_HULLS=1 only sets the boot default (for CI / dedicated servers
+	// with no console); the game is free to turn it back on.
+	void set_bsp_hulls_enabled(bool p_enabled);
+	bool get_bsp_hulls_enabled() const { return bsp_hulls_enabled; }
+	bool bsp_hulls_enabled = OS::get_singleton()->get_environment("HOP_NO_BSP_HULLS") != "1";
 	// One shared blob per loaded map, keyed by the instance id of the node that
 	// carries it. Weak, so unloading a map frees it.
 	std::unordered_map<uint64_t, std::weak_ptr<hopbsp::map_data>> bsp_maps;

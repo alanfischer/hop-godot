@@ -20,14 +20,10 @@ struct HopShapeData {
 	float margin = 0.0f;
 	float custom_solver_bias = 0.0f;
 
-	// Cached hop shape — rebuilt when data changes
-	std::shared_ptr<hop::shape<hop_scalar>> hop_shape;
-
-	// Owned traceables (raw ptr passed to hop, so we must outlive the shape)
-	std::shared_ptr<HopTrimeshTraceable<hop_scalar>> trimesh_traceable;
-	std::shared_ptr<HopPlaneTraceable<hop_scalar>> plane_traceable;
-	std::shared_ptr<HopHeightfieldTraceable<hop_scalar>> heightfield_traceable;
-
+	// No traceables are cached here. Each make_hop_shape builds its own and hands
+	// ownership to the hop::shape it returns, so the geometry lives exactly as long
+	// as the shape pointing at it — even when several collision objects share this
+	// RID, and even though they may bake different local transforms into it.
 	void set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_data);
 	std::shared_ptr<hop::shape<hop_scalar>> make_hop_shape(const Transform3D &p_local_xform);
 

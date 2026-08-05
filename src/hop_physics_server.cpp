@@ -4,6 +4,8 @@
 #include "hop_conversions.h"
 #include <hop/math/mat3.h>
 #include <hop/math/quat.h>
+#include <godot_cpp/classes/node.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
@@ -429,9 +431,134 @@ RID HopPhysicsServer::_body_create() {
 	return rid;
 }
 
+// Flip BSP hull collision for every body already in the world, not just ones
+// built from here on. Toggling has to be immediate and symmetric — the game
+// replicates this flag, and a client whose collision lags the server's by even a
+// map's worth of bodies mispredicts every step against the wrong geometry.
+//
+// Bodies are re-resolved from scratch (bsp_checked = 0) rather than remembered,
+// so turning it back on picks up maps loaded while it was off.
+void HopPhysicsServer::set_bsp_hulls_enabled(bool p_enabled) {
+	if (bsp_hulls_enabled == p_enabled) return;
+	bsp_hulls_enabled = p_enabled;
+
+	int rebuilt = 0;
+	int released = 0;
+	body_owner.for_each([&](HopBodyData *body) {
+		const bool was_carrier = body->bsp_checked == 2;
+		if (!was_carrier && body->bsp_checked == 1 && !p_enabled) return;
+		body->bsp_checked = 0;  // re-resolve; a map may have loaded while off
+		if (!p_enabled) body->bsp_map.reset();  // stop pinning the tree while off
+		if (!body->hop_solid || !body->space_rid.is_valid()) return;
+
+		rebuild_body_shapes(body);
+		// The solid's bound changes wholesale (a map-sized hull vs. per-brush
+		// shapes), so re-register it with the broadphase as _body_set_mode does.
+		HopSpaceData *space = space_owner.get_or_null(body->space_rid);
+		if (space) {
+			space->bvh_manager.remove_solid(body->hop_solid.get());
+			space->bvh_manager.add_solid(body->hop_solid.get(),
+				body->mode == PhysicsServer3D::BODY_MODE_STATIC);
+		}
+		if (body->bsp_checked == 2) {
+			// Now tracing the hull, so this body's carrier shapes are dead weight.
+			// Dropping the entry frees the shape and with it the built geometry
+			// (verts, normals and BVH for a trimesh) — a hop::shape owns its
+			// traceable, so there is nothing to work out about who else uses it.
+			for (auto &entry : body->shapes) {
+				if (entry.hop_shape) released++;
+				entry.hop_shape.reset();
+			}
+		}
+		if (was_carrier || body->bsp_checked == 2) rebuilt++;
+	});
+
+	// bsp_maps is a weak cache — entries expire on their own once the last body
+	// holding the map is gone, so there is nothing to clear here.
+	UtilityFunctions::print("[Hop] BSP hull collision ", p_enabled ? "ON" : "OFF",
+		" — rebuilt ", rebuilt, " carrier body/bodies, released ", released,
+		" unused shape geometr", released == 1 ? "y" : "ies");
+}
+
+// A body whose node carries goldsrc-godot's "bsp_model" metadata stands in for a
+// real GoldSrc BSP hull: the trimesh/convex shapes on it exist so default Godot
+// physics has something to collide with, but we can trace the compiler's own
+// clipnode trees instead and get exact plane normals and true 18-unit steps.
+//
+// The blob itself lives once on the scene root under "bsp_data" (it runs to
+// megabytes and a map has hundreds of brush entities), so walk up to find it and
+// share one copy across every body of that map.
+//
+// Returns false whenever there is no hull to be had, leaving the carrier shapes
+// to be built exactly as before — which is the entire fallback story.
+std::unique_ptr<HopBspTraceable<hop_scalar>> HopPhysicsServer::try_build_bsp_hull(HopBodyData *body) {
+	if (!bsp_hulls_enabled) return nullptr;
+	if (body->bsp_checked == 1) return nullptr;  // known not to be a carrier
+
+	body->bsp_checked = 1;
+	if (body->object_instance_id == 0) return nullptr;
+	Node *node = Object::cast_to<Node>(
+		UtilityFunctions::instance_from_id((int64_t)body->object_instance_id));
+	if (!node || !node->has_meta("bsp_model")) return nullptr;
+
+	Node *root = node;
+	while (root && !root->has_meta("bsp_data")) root = root->get_parent();
+	if (!root) return nullptr;
+
+	const uint64_t key = root->get_instance_id();
+	std::shared_ptr<hopbsp::map_data> map;
+	auto it = bsp_maps.find(key);
+	if (it != bsp_maps.end()) map = it->second.lock();
+	if (!map) {
+		PackedByteArray blob = root->get_meta("bsp_data");
+		if (blob.is_empty()) return nullptr;
+		map = std::make_shared<hopbsp::map_data>();
+		if (!map->load(blob.ptr(), (size_t)blob.size())) return nullptr;
+		bsp_maps[key] = map;
+		// Once per map: the tree is loaded once and shared by every body on it.
+		UtilityFunctions::print("[Hop] BSP hull collision active for ", root->get_name(),
+			" (", (int64_t)blob.size(), " byte tree, shared by all its bodies)");
+	}
+
+	auto traceable = std::make_unique<HopBspTraceable<hop_scalar>>();
+	const int model = (int)node->get_meta("bsp_model");
+	// No default: the scale is half the contract (it converts every query into the
+	// map's units). A missing one means the tagging side and this side disagree,
+	// and guessing WizardWars' 0.025 would silently trace a map at the wrong size.
+	if (!node->has_meta("bsp_scale")) return nullptr;
+	const float scale = (float)node->get_meta("bsp_scale");
+	const int blocking = (int)node->get_meta("bsp_blocking", hopbsp::BLOCK_SOLID);
+	if (!traceable->build(map, model, scalar_from_float<hop_scalar>(scale), blocking)) return nullptr;
+
+	body->bsp_map = map;    // pin the shared tree for as long as this body lives
+	body->bsp_checked = 2;  // a carrier; the traceable itself is the shape's business
+	return traceable;
+}
+
 void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 	if (!body || !body->hop_solid) return;
 	body->hop_solid->remove_all_shapes();
+
+	// The game turns a brush entity intangible by disabling its CollisionShape3Ds
+	// (EntityBase._apply_active_state does this for toggle-walls, opened doors and
+	// anything out of PVS on a client). The hull stands in for those shapes, so it
+	// has to answer to the same switch — otherwise a door that opened by going
+	// non-solid stays solid under hulls.
+	bool any_enabled = false;
+	for (const auto &entry : body->shapes)
+		if (!entry.disabled) { any_enabled = true; break; }
+
+	// The hull replaces the carrier shapes outright — one traceable for the whole
+	// model, at the body's own origin (BSP geometry is authored in exactly the
+	// space the importer gives the node).
+	if (any_enabled) {
+		if (auto hull = try_build_bsp_hull(body)) {
+			body->hop_solid->add_shape(
+				std::make_shared<hop::shape<hop_scalar>>(std::move(hull)));
+			if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) body->hop_solid->deactivate();
+			return;
+		}
+	}
 
 	// Static rotation: the body's ROTATION is carried as the solid's orientation
 	// (set in sync_to_hop / _body_set_state), not baked. hop has no scale, so the

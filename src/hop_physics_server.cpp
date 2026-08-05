@@ -539,14 +539,25 @@ void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 	if (!body || !body->hop_solid) return;
 	body->hop_solid->remove_all_shapes();
 
+	// The game turns a brush entity intangible by disabling its CollisionShape3Ds
+	// (EntityBase._apply_active_state does this for toggle-walls, opened doors and
+	// anything out of PVS on a client). The hull stands in for those shapes, so it
+	// has to answer to the same switch — otherwise a door that opened by going
+	// non-solid stays solid under hulls.
+	bool any_enabled = false;
+	for (const auto &entry : body->shapes)
+		if (!entry.disabled) { any_enabled = true; break; }
+
 	// The hull replaces the carrier shapes outright — one traceable for the whole
 	// model, at the body's own origin (BSP geometry is authored in exactly the
 	// space the importer gives the node).
-	if (auto hull = try_build_bsp_hull(body)) {
-		body->hop_solid->add_shape(
-			std::make_shared<hop::shape<hop_scalar>>(std::move(hull)));
-		if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) body->hop_solid->deactivate();
-		return;
+	if (any_enabled) {
+		if (auto hull = try_build_bsp_hull(body)) {
+			body->hop_solid->add_shape(
+				std::make_shared<hop::shape<hop_scalar>>(std::move(hull)));
+			if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) body->hop_solid->deactivate();
+			return;
+		}
 	}
 
 	// Static rotation: the body's ROTATION is carried as the solid's orientation

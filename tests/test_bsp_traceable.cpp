@@ -456,6 +456,31 @@ static void test_solid_starting_stuck_reports_overlap() {
 	printf("  solid_starting_stuck_reports_overlap ok\n");
 }
 
+// Depenetration must nudge, never launch. hull_push_out reports the nearest plane
+// of the LEAF a point landed in, and a leaf can be enormous, so a body placed deep
+// inside solid would be ejected metres in one query — with hop iterating recovery
+// on top. That is reachable in practice wherever the clip hull disagrees with the
+// render geometry, i.e. any CLIP brush, since those exist only in hulls 1..3.
+static void test_deep_overlap_is_nudged_not_launched() {
+	// A thick slab: 512 units deep, so its interior leaf is far from any face.
+	const double mins[3] = { -512, -512, -512 };
+	const double maxs[3] = { 512, 512, 0 };
+	auto t = load(make_box_map(mins, maxs));
+	auto s = make_feet_box_solid(0.4, 1.8, 0.4);
+
+	// Sitting 200 units (5m) inside it — the ejection must stay bounded by the
+	// hull's own half-width, not the distance to the far side of the leaf.
+	hop::collision<T> c = sweep(*t, s, vec(0, -5.0, 0), vec(0, 0, 0));
+	assert(c.time == 0.0);
+	// Pushed straight up, so the bound is the hull's height: 72 units, not the
+	// 200 units to the nearest face of the leaf it is sitting in.
+	const double hull_height_m = 72.0 * SCALE;
+	assert(c.depth > 0.0);
+	assert(c.depth <= hull_height_m + 1e-6 && "one recovery step must not teleport the body");
+	assert(c.depth < 5.0 && "the raw leaf-plane distance would be metres");
+	printf("  deep_overlap_is_nudged_not_launched ok\n");
+}
+
 // --- contents filtering ---------------------------------------------------
 
 static void test_sky_is_passable_but_maskable() {
@@ -468,6 +493,43 @@ static void test_sky_is_passable_but_maskable() {
 	{
 		auto t = load(blob);
 		assert(ray(*t, vec(0, 2, 0), vec(0, -4, 0)).time == 1.0);
+	}
+	// And with the VOID behind the sky, as a real map has: outside the world is
+	// CONTENTS_SOLID, so a naive trace stops just past the sky brush and the
+	// projectile detonates in mid-air. It has to pass through both.
+	{
+		BlobBuilder b;
+		BSPModel m {};
+		const double smins[3] = { -512, -512, -64 }, smaxs[3] = { 512, 512, 0 };
+		for (int i = 0; i < 3; ++i) { m.mins[i] = (float)smins[i]; m.maxs[i] = (float)smaxs[i]; }
+		m.headnode[0] = 0;
+		add_box_brush(b, smins, smaxs, /*as_nodes=*/true, CONTENTS_SKY);
+		// The solid void immediately below the sky slab.
+		const double vmins[3] = { -512, -512, -256 }, vmaxs[3] = { 512, 512, -64 };
+		BSPLeaf solid_void {}; solid_void.contents = CONTENTS_SOLID;
+		b.leafs.push_back(solid_void);                 // leaf 2
+		const int p0 = add_box_planes(b, vmins, vmaxs);
+		const int base = (int)b.nodes.size();
+		for (int i = 0; i < 6; ++i) {
+			const bool upper = (i % 2) == 1;
+			const int inward = (i == 5) ? -3 : (base + i + 1);   // -3 => leaf 2, solid
+			BSPNode n {};
+			n.planenum = p0 + i;
+			n.children[0] = (int16_t)(upper ? -2 : inward);
+			n.children[1] = (int16_t)(upper ? inward : -2);
+			b.nodes.push_back(n);
+		}
+		// Chain the sky tree's "outside" exits into the void tree.
+		for (int i = 0; i < 6; ++i)
+			for (int c = 0; c < 2; ++c)
+				if (b.nodes[i].children[c] == -2) b.nodes[i].children[c] = (int16_t)base;
+		for (int h = 1; h < 4; ++h) m.headnode[h] = 0;
+		b.models.push_back(m);
+		auto t = load(b.build());
+		assert(t->contents_at_godot(vec(0, -0.8, 0)) == CONTENTS_SKY);
+		assert(t->contents_at_godot(vec(0, -3.0, 0)) == CONTENTS_SOLID);
+		assert(ray(*t, vec(0, 2, 0), vec(0, -8, 0)).time == 1.0
+			&& "a ray through sky must not stop on the void behind it");
 	}
 	// The same map viewed with sky blocking — how player movement sees it.
 	{
@@ -531,6 +593,7 @@ int main() {
 	test_solid_overlap_pushes_out();
 	test_solid_margin_finds_resting_contact();
 	test_solid_starting_stuck_reports_overlap();
+	test_deep_overlap_is_nudged_not_launched();
 	test_sky_is_passable_but_maskable();
 	test_float_instantiation();
 	printf("all bsp traceable tests passed\n");

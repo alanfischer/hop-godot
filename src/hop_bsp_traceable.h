@@ -248,6 +248,21 @@ struct map_data {
 	bool valid() const { return view.valid(); }
 };
 
+// True when a trace stopped on the far side of a sky brush — it left the world
+// through the sky and struck the void beyond, which is CONTENTS_SOLID like
+// everything outside the map. The endpoint sits DIST_EPSILON short of that plane,
+// i.e. still inside the sky volume, so its contents is what tells us.
+//
+// GoldSrc removes a projectile that reaches sky rather than detonating it, which
+// is the same statement as "the world does not block you on the way out". Only
+// meaningful for a hull that treats sky as passable: for a view that blocks sky
+// (the layer-9 body) this is never true, and hulls 1..3 have no sky at all — the
+// compiler bakes it solid there, so players still collide with it.
+inline bool stopped_against_sky(const hull &h, const hull_trace &tr, int blocking) {
+	if (!tr.hit || (blocking & blocking_bit(hop_bsp::CONTENTS_SKY)) != 0) return false;
+	return hull_point_contents(h, h.root, tr.endpos) == hop_bsp::CONTENTS_SKY;
+}
+
 } // namespace hopbsp
 
 // ---------------------------------------------------------------------------
@@ -319,6 +334,7 @@ public:
 		// A ray is a point mover: hull 0, no offset.
 		hopbsp::hull_trace ht = hopbsp::hull_sweep(hulls_[0], s, e, blocking_);
 		if (!ht.hit || (T)ht.fraction >= result.time) return;
+		if (hopbsp::stopped_against_sky(hulls_[0], ht, blocking_)) return;
 
 		result.time = (T)ht.fraction;
 		hop::vec3<T> hit_local = gs_to_godot(ht.endpos[0], ht.endpos[1], ht.endpos[2]);
@@ -395,6 +411,22 @@ public:
 			&& hopbsp::hull_push_out(h, h.root, start, blocking_, n, depth);
 		if (inside || zero_dir) {
 			if (inside) {
+				// Bound how far one query may eject a mover, by the mover's own extent
+				// along the push. hull_push_out reports the nearest plane of the LEAF
+				// the point landed in, which for a big leaf is nowhere near the real
+				// penetration — up to 125 units (3.1m) on ww_golem. Past its own size a
+				// body is not overlapping a surface, it is buried, and the honest
+				// response is to walk it out over a few frames rather than launch it.
+				//
+				// This is reachable in play: CLIP brushes exist only in hulls 1..3, so
+				// a spot a player stands on quite happily under the trimesh colliders
+				// can be solid here, and everyone inside one gets ejected the moment
+				// hulls come on. Launching them is how you end up through a wall.
+				double cap = 0;
+				for (int i = 0; i < 3; ++i)
+					cap += (n[i] < 0 ? -n[i] : n[i])
+					     * (hopbsp::HULL_SIZES[hi].maxs[i] - hopbsp::HULL_SIZES[hi].mins[i]);
+				if (cap > 0 && depth > cap) depth = cap;
 				depth += margin_gs;
 			} else {
 				if (margin_gs <= 0) return;
@@ -417,6 +449,7 @@ public:
 
 		hopbsp::hull_trace ht = hopbsp::hull_sweep(h, start, end, blocking_, margin_gs);
 		if (!ht.hit || (T)ht.fraction >= result.time) return;
+		if (hopbsp::stopped_against_sky(h, ht, blocking_)) return;
 
 		result.time = (T)ht.fraction;
 		result.depth = T {};

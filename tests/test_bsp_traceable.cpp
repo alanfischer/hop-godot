@@ -172,6 +172,28 @@ static std::shared_ptr<hop::solid<T>> make_box_solid(T hx, T hy, T hz) {
 	return s;
 }
 
+// Sweep `s` from `from` along `motion` and return what it hit. Every solid test
+// below is one of these plus its assertions; a zero `motion` is the static
+// overlap query.
+static hop::collision<T> sweep(HopBspTraceable<T> &t, std::shared_ptr<hop::solid<T>> s,
+                               V from, V motion, T margin = T {}, V at = V {}) {
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(from, motion);
+	t.trace_solid(c, s.get(), at, hop::mat3<T>(), seg, margin);
+	return c;
+}
+
+// Same, for a point ray against hull 0.
+static hop::collision<T> ray(HopBspTraceable<T> &t, V from, V dir, V at = V {},
+                             hop::mat3<T> rot = hop::mat3<T>()) {
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(from, dir);
+	t.trace_segment(c, at, rot, seg);
+	return c;
+}
+
 // --- blob / format --------------------------------------------------------
 
 static void test_blob_roundtrip() {
@@ -212,10 +234,7 @@ static void test_point_contents() {
 
 static void test_ray_hits_floor() {
 	auto t = load(make_floor_map());
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 2, 0), vec(0, -4, 0));  // straight down through y=0
-	t->trace_segment(c, vec(0, 0, 0), hop::mat3<T>(), seg);
+	hop::collision<T> c = ray(*t, vec(0, 2, 0), vec(0, -4, 0));  // straight down through y=0
 
 	assert(c.time < 1.0);
 	// Fraction 0.5 puts the hit at y=0; the epsilon backoff keeps it a hair above.
@@ -233,10 +252,7 @@ static void test_ray_hits_wall() {
 
 	// GoldSrc +x is Godot -x, so approach from Godot -x moving +x and we hit the
 	// GoldSrc x=64 face, whose Godot-space normal is -x.
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(-4, 0, 0), vec(8, 0, 0));
-	t->trace_segment(c, vec(0, 0, 0), hop::mat3<T>(), seg);
+	hop::collision<T> c = ray(*t, vec(-4, 0, 0), vec(8, 0, 0));
 	assert(c.time < 1.0);
 	assert(approx(c.point.x, -1.6, 0.01));  // GoldSrc x=64 → Godot x=-1.6
 	assert(approx_v(c.normal, -1, 0, 0));
@@ -245,20 +261,14 @@ static void test_ray_hits_wall() {
 
 static void test_ray_misses() {
 	auto t = load(make_floor_map());
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 2, 0), vec(0, 1, 0));  // upward, away from the floor
-	t->trace_segment(c, vec(0, 0, 0), hop::mat3<T>(), seg);
+	hop::collision<T> c = ray(*t, vec(0, 2, 0), vec(0, 1, 0));  // upward, away from the floor
 	assert(c.time == 1.0);
 	printf("  ray_misses ok\n");
 }
 
 static void test_ray_from_inside_solid() {
 	auto t = load(make_floor_map());
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, -0.8, 0), vec(0, 4, 0));  // starts inside the slab
-	t->trace_segment(c, vec(0, 0, 0), hop::mat3<T>(), seg);
+	hop::collision<T> c = ray(*t, vec(0, -0.8, 0), vec(0, 4, 0));  // starts inside the slab
 	// Quake semantics: a trace that starts solid reports no impact plane — it must
 	// not fabricate one, or a stuck body gets shoved by a garbage normal.
 	assert(c.time == 1.0);
@@ -268,10 +278,7 @@ static void test_ray_from_inside_solid() {
 static void test_ray_respects_body_position() {
 	auto t = load(make_floor_map());
 	// Same floor, but the body sits 10m up: the hit must ride with it.
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 12, 0), vec(0, -4, 0));
-	t->trace_segment(c, vec(0, 10, 0), hop::mat3<T>(), seg);
+	hop::collision<T> c = ray(*t, vec(0, 12, 0), vec(0, -4, 0), vec(0, 10, 0), hop::mat3<T>());
 	assert(c.time < 1.0);
 	assert(approx(c.point.y, 10.0, 0.01));
 	assert(approx_v(c.normal, 0, 1, 0));
@@ -287,12 +294,9 @@ static void test_ray_respects_orientation() {
 	hop::mat3<T> rot;
 	hop::set_mat3_from_axis_angle(rot, vec(0, 1, 0), (T)(M_PI / 2));
 
-	hop::collision<T> c;
-	hop::segment<T> seg;
 	// Un-rotated this ray (along -x, from +x) misses the solid side entirely;
 	// rotated, the same wall now blocks a ray travelling along z.
-	seg.set_start_dir(vec(0, 0, 4), vec(0, 0, -8));
-	t->trace_segment(c, vec(0, 0, 0), rot, seg);
+	hop::collision<T> c = ray(*t, vec(0, 0, 4), vec(0, 0, -8), vec(0, 0, 0), rot);
 	assert(c.time < 1.0);
 	assert(approx(hop::length(c.normal), 1.0));
 	// The face normal was Godot -x before the yaw; a +90° yaw about y sends it to +z.
@@ -319,10 +323,7 @@ static void test_solid_lands_on_floor() {
 	// half-extents (0.4, 0.9, 0.4). It must pick hull 1 and stop with its CENTRE
 	// 36 units (0.9m) above the floor — not with its centre on the floor.
 	auto s = make_box_solid(0.4, 0.9, 0.4);
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 3, 0), vec(0, -4, 0));
-	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	hop::collision<T> c = sweep(*t, s, vec(0, 3, 0), vec(0, -4, 0));
 
 	assert(c.time < 1.0);
 	assert(approx(c.point.y, 0.9, 0.02));
@@ -347,10 +348,7 @@ static void test_feet_origin_mover_lands_on_the_floor() {
 	// Same 32x32x72 player, but with its origin at the feet. It must come to rest
 	// with its ORIGIN on the floor (y=0), not its centre.
 	auto s = make_feet_box_solid(0.4, 1.8, 0.4);
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 3, 0), vec(0, -4, 0));
-	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	hop::collision<T> c = sweep(*t, s, vec(0, 3, 0), vec(0, -4, 0));
 	assert(c.time < 1.0);
 	assert(approx(c.point.y, 0.0, 0.02));
 	assert(approx_v(c.normal, 0, 1, 0));
@@ -364,17 +362,11 @@ static void test_feet_origin_mover_lands_on_the_floor() {
 static void test_feet_origin_mover_resting_is_not_stuck() {
 	auto t = load(make_floor_map());
 	auto s = make_feet_box_solid(0.4, 1.8, 0.4);
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 0.001, 0), vec(0, 0, 0));  // standing on the floor
-	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	hop::collision<T> c = sweep(*t, s, vec(0, 0.001, 0), vec(0, 0, 0));  // standing on the floor
 	assert(c.time == 1.0 && "a body resting on the floor must not report as overlapping");
 
 	// And a downward sweep from there must not be waved through.
-	hop::collision<T> down;
-	hop::segment<T> ds;
-	ds.set_start_dir(vec(0, 0.001, 0), vec(0, -2, 0));
-	t->trace_solid(down, s.get(), vec(0, 0, 0), hop::mat3<T>(), ds, T {});
+	hop::collision<T> down = sweep(*t, s, vec(0, 0.001, 0), vec(0, -2, 0));
 	assert(down.time < 1.0);
 	assert(down.normal.y > 0.5 && "the floor must push UP, never down");
 	printf("  feet_origin_mover_resting_is_not_stuck ok\n");
@@ -385,10 +377,7 @@ static void test_solid_crouched_uses_short_hull() {
 	// 32x32x36 GoldSrc → half-extents (0.4, 0.45, 0.4). Hull 3 stops the centre
 	// 18 units (0.45m) up.
 	auto s = make_box_solid(0.4, 0.45, 0.4);
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 3, 0), vec(0, -4, 0));
-	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	hop::collision<T> c = sweep(*t, s, vec(0, 3, 0), vec(0, -4, 0));
 	assert(c.time < 1.0);
 	assert(approx(c.point.y, 0.45, 0.02));
 	printf("  solid_crouched_uses_short_hull ok\n");
@@ -397,10 +386,7 @@ static void test_solid_crouched_uses_short_hull() {
 static void test_solid_impact_is_on_the_surface() {
 	auto t = load(make_floor_map());
 	auto s = make_box_solid(0.4, 0.9, 0.4);
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 3, 0), vec(0, -4, 0));
-	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	hop::collision<T> c = sweep(*t, s, vec(0, 3, 0), vec(0, -4, 0));
 	// `point` is the mover's origin at impact; `impact` is the witness point on the
 	// hull surface, which the lever-arm math needs. They must not be the same.
 	assert(approx(c.point.y, 0.9, 0.02));
@@ -411,10 +397,7 @@ static void test_solid_impact_is_on_the_surface() {
 static void test_solid_misses() {
 	auto t = load(make_floor_map());
 	auto s = make_box_solid(0.4, 0.9, 0.4);
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 3, 0), vec(0, 1, 0));
-	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	hop::collision<T> c = sweep(*t, s, vec(0, 3, 0), vec(0, 1, 0));
 	assert(c.time == 1.0);
 	printf("  solid_misses ok\n");
 }
@@ -424,10 +407,7 @@ static void test_solid_overlap_pushes_out() {
 	auto s = make_box_solid(0.4, 0.9, 0.4);
 	// Zero direction = static overlap query, with the box centre 0.4m up: hull 1
 	// wants 0.9m, so it is 0.5m deep in the expanded hull and must be pushed UP.
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 0.4, 0), vec(0, 0, 0));
-	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	hop::collision<T> c = sweep(*t, s, vec(0, 0.4, 0), vec(0, 0, 0));
 
 	assert(c.time == 0.0);
 	assert(approx_v(c.normal, 0, 1, 0));
@@ -441,10 +421,7 @@ static void test_solid_margin_finds_resting_contact() {
 	// Resting exactly on the floor with a 4cm speculative margin: not penetrating,
 	// but the contact must still be reported, with depth measured against the
 	// INFLATED surface (depth = margin - true_gap; here the gap is ~0).
-	hop::collision<T> c;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 0.92, 0), vec(0, 0, 0));
-	t->trace_solid(c, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, (T)0.04);
+	hop::collision<T> c = sweep(*t, s, vec(0, 0.92, 0), vec(0, 0, 0), (T)0.04);
 
 	assert(c.time == 0.0);
 	assert(approx_v(c.normal, 0, 1, 0));
@@ -465,20 +442,14 @@ static void test_solid_starting_stuck_reports_overlap() {
 	// inside the floor then sweeps freely downward under gravity, sinking further
 	// every frame until it drops out of the world. That is exactly what dropped
 	// bots through ww_2fort's ramps to y=-103.
-	hop::collision<T> swept;
-	hop::segment<T> seg;
-	seg.set_start_dir(vec(0, 0.8975, 0), vec(0, -4, 0));  // 0.1 GoldSrc units low
-	t->trace_solid(swept, s.get(), vec(0, 0, 0), hop::mat3<T>(), seg, T {});
+	hop::collision<T> swept = sweep(*t, s, vec(0, 0.8975, 0), vec(0, -4, 0));  // 0.1 GoldSrc units low
 	assert(swept.time == 0.0);
 	assert(approx_v(swept.normal, 0, 1, 0));
 	assert(approx(swept.depth / SCALE, 0.1, 0.01));
 
 	// The zero-direction query reports the same thing: push straight up, by
 	// exactly the 0.1 units it is buried.
-	hop::collision<T> rec;
-	hop::segment<T> still;
-	still.set_start_dir(vec(0, 0.8975, 0), vec(0, 0, 0));
-	t->trace_solid(rec, s.get(), vec(0, 0, 0), hop::mat3<T>(), still, T {});
+	hop::collision<T> rec = sweep(*t, s, vec(0, 0.8975, 0), vec(0, 0, 0));
 	assert(rec.time == 0.0);
 	assert(approx_v(rec.normal, 0, 1, 0));
 	assert(approx(rec.depth / SCALE, 0.1, 0.01));  // in GoldSrc units
@@ -496,19 +467,12 @@ static void test_sky_is_passable_but_maskable() {
 	// is exactly how a projectile leaves the map in GoldSrc.
 	{
 		auto t = load(blob);
-		hop::collision<T> c;
-		hop::segment<T> seg;
-		seg.set_start_dir(vec(0, 2, 0), vec(0, -4, 0));
-		t->trace_segment(c, vec(0, 0, 0), hop::mat3<T>(), seg);
-		assert(c.time == 1.0);
+		assert(ray(*t, vec(0, 2, 0), vec(0, -4, 0)).time == 1.0);
 	}
 	// The same map viewed with sky blocking — how player movement sees it.
 	{
 		auto t = load(blob, hopbsp::blocking_bit(CONTENTS_SKY));
-		hop::collision<T> c;
-		hop::segment<T> seg;
-		seg.set_start_dir(vec(0, 2, 0), vec(0, -4, 0));
-		t->trace_segment(c, vec(0, 0, 0), hop::mat3<T>(), seg);
+		hop::collision<T> c = ray(*t, vec(0, 2, 0), vec(0, -4, 0));
 		assert(c.time < 1.0);
 		assert(approx_v(c.normal, 0, 1, 0));
 	}

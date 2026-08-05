@@ -522,7 +522,11 @@ std::unique_ptr<HopBspTraceable<hop_scalar>> HopPhysicsServer::try_build_bsp_hul
 
 	auto traceable = std::make_unique<HopBspTraceable<hop_scalar>>();
 	const int model = (int)node->get_meta("bsp_model");
-	const float scale = (float)node->get_meta("bsp_scale", 0.025f);
+	// No default: the scale is half the contract (it converts every query into the
+	// map's units). A missing one means the tagging side and this side disagree,
+	// and guessing WizardWars' 0.025 would silently trace a map at the wrong size.
+	if (!node->has_meta("bsp_scale")) return nullptr;
+	const float scale = (float)node->get_meta("bsp_scale");
 	const int blocking = (int)node->get_meta("bsp_blocking", hopbsp::BLOCK_SOLID);
 	if (!traceable->build(map, model, scalar_from_float<hop_scalar>(scale), blocking)) return nullptr;
 

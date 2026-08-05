@@ -60,9 +60,7 @@ struct hull {
 	const hop_bsp::BSPClipNode *clipnodes = nullptr;
 	int node_count = 0;   // entries in whichever tree array is live
 	int leaf_count = 0;
-	int plane_count = 0;
 	int root = 0;
-	int index = 0;        // 0..3, selects HULL_SIZES
 
 	bool valid() const { return planes != nullptr && (nodes != nullptr || clipnodes != nullptr); }
 
@@ -98,11 +96,8 @@ struct hull_trace {
 	double fraction = 1.0;
 	double endpos[3] = { 0, 0, 0 };
 	double normal[3] = { 0, 0, 0 };
-	double dist = 0.0;
-	bool allsolid = true;    // every point along the trace was inside blocking contents
-	bool startsolid = false; // the trace started inside blocking contents
-	bool hit = false;        // fraction < 1 and `normal` is meaningful
-	int start_contents = hop_bsp::CONTENTS_EMPTY;
+	bool allsolid = true;  // every point along the trace was inside blocking contents
+	bool hit = false;      // fraction < 1 and `normal` is meaningful
 };
 
 // Signed distance of `p` from a plane, with the whole hull inflated outward by
@@ -167,11 +162,7 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
                                  const double p1[3], const double p2[3],
                                  int blocking, hull_trace &tr, double margin = 0) {
 	if (num < 0) {
-		if ((blocking & blocking_bit(num)) == 0) {
-			tr.allsolid = false;
-		} else {
-			tr.startsolid = true;
-		}
+		if ((blocking & blocking_bit(num)) == 0) tr.allsolid = false;
 		return true;
 	}
 	if (num >= h.node_count) return false;
@@ -208,10 +199,8 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 	// the side we approached from.
 	if (side == 0) {
 		tr.normal[0] = pl.normal[0]; tr.normal[1] = pl.normal[1]; tr.normal[2] = pl.normal[2];
-		tr.dist = pl.dist;
 	} else {
 		tr.normal[0] = -pl.normal[0]; tr.normal[1] = -pl.normal[1]; tr.normal[2] = -pl.normal[2];
-		tr.dist = -pl.dist;
 	}
 	tr.hit = true;
 
@@ -239,9 +228,7 @@ inline hull_trace hull_sweep(const hull &h, const double start[3], const double 
 	hull_trace tr;
 	for (int i = 0; i < 3; ++i) tr.endpos[i] = end[i];
 	if (!h.valid()) { tr.allsolid = false; return tr; }
-	tr.start_contents = hull_point_contents(h, h.root, start, margin);
 	recursive_hull_check(h, h.root, 0.0, 1.0, start, end, blocking, tr, margin);
-	if (tr.fraction == 1.0) for (int i = 0; i < 3; ++i) tr.endpos[i] = end[i];
 	return tr;
 }
 
@@ -284,11 +271,9 @@ public:
 
 		for (int i = 0; i < 4; ++i) {
 			hulls_[i].planes = view_.planes;
-			hulls_[i].plane_count = view_.plane_count;
 			hulls_[i].leafs = view_.leafs;
 			hulls_[i].leaf_count = view_.leaf_count;
 			hulls_[i].root = model_->headnode[i];
-			hulls_[i].index = i;
 			if (i == 0) {
 				hulls_[i].nodes = view_.nodes;
 				hulls_[i].node_count = view_.node_count;
@@ -302,8 +287,8 @@ public:
 		// so a mover reduced to a point is still inside the bound where it matters.
 		hop::vec3<T> a = gs_to_godot(model_->mins[0] - 32, model_->mins[1] - 32, model_->mins[2] - 36);
 		hop::vec3<T> b = gs_to_godot(model_->maxs[0] + 32, model_->maxs[1] + 32, model_->maxs[2] + 36);
-		bound_.mins.set(tr::min_val(a.x, b.x), tr::min_val(a.y, b.y), tr::min_val(a.z, b.z));
-		bound_.maxs.set(tr::max_val(a.x, b.x), tr::max_val(a.y, b.y), tr::max_val(a.z, b.z));
+		bound_.set(a, a);
+		bound_.merge(b);
 		return true;
 	}
 
@@ -314,8 +299,6 @@ public:
 		if (!map->load(blob, size)) return false;
 		return build(std::move(map), model_index, scale, blocking);
 	}
-
-	bool is_built() const { return model_ != nullptr; }
 
 	void get_bound(hop::aa_box<T> &result) override { result = bound_; }
 
@@ -399,12 +382,17 @@ public:
 		//
 		// Resting exactly ON the surface is not inside it (contents test is d < 0),
 		// so this costs the normal standing case nothing.
-		double n[3], depth = 0;
-		double probe[3] = { start[0], start[1], start[2] };
 		// Margin 0 on purpose: only REAL penetration counts as stuck. Testing
 		// against the inflated hull would call a mover merely within `margin` of a
 		// wall stuck and stall it dead.
-		const bool inside = hopbsp::hull_push_out(h, h.root, probe, blocking_, n, depth);
+		//
+		// The contents test comes first because it is the cheap half: hull_push_out
+		// walks the same tree but tracks a nearest-plane candidate at every node,
+		// and the mover is in open air on the overwhelming majority of queries.
+		double n[3], depth = 0;
+		const bool inside =
+			(blocking_ & hopbsp::blocking_bit(hopbsp::hull_point_contents(h, h.root, start))) != 0
+			&& hopbsp::hull_push_out(h, h.root, start, blocking_, n, depth);
 		if (inside || zero_dir) {
 			if (inside) {
 				depth += margin_gs;
@@ -413,7 +401,7 @@ public:
 				// Not inside, but a face within `margin` still counts as a contact:
 				// sweeping a probe along every candidate normal is overkill, so use
 				// the six axes and take the nearest surface.
-				if (!nearest_surface(h, probe, margin_gs, n, depth)) return;
+				if (!nearest_surface(h, start, margin_gs, n, depth)) return;
 				depth = margin_gs - depth;
 				if (depth <= 0) return;
 			}
@@ -421,7 +409,7 @@ public:
 			result.time = T {};
 			result.depth = (T)(depth * scale_);
 			hop::vec3<T> n_local = gs_dir_to_godot(n[0], n[1], n[2]);
-			hop::vec3<T> p_local = gs_to_godot(probe[0] - offset[0], probe[1] - offset[1], probe[2] - offset[2]);
+			hop::vec3<T> p_local = gs_to_godot(start[0] - offset[0], start[1] - offset[1], start[2] - offset[2]);
 			to_world(p_local, n_local, position, orientation, result.point, result.normal);
 			result.impact = result.point;
 			return;
@@ -452,9 +440,8 @@ public:
 		to_world(impact_local, n_local, position, orientation, result.impact, ignored);
 	}
 
-	// --- helpers exposed for tests -----------------------------------------
-
-	const hopbsp::hull &get_hull(int i) const { return hulls_[i]; }
+	// Contents at a Godot-space point, for tests and callers that want the raw
+	// CONTENTS_* value rather than a trace.
 	int contents_at_godot(const hop::vec3<T> &p) const {
 		double gs[3];
 		godot_to_gs(p, gs);
@@ -512,20 +499,13 @@ private:
 		}
 	}
 
-	// Union of the mover's shape bounds, converted to a GoldSrc-space box.
+	// The mover's own box, in GoldSrc units. hop maintains this union for us and
+	// folds in each shape's local position/rotation, which a hand-rolled loop over
+	// the intrinsic shape bounds would miss — and the box is what picks the hull.
 	void solid_box_gs(hop::solid<T> *s, double mins[3], double maxs[3]) const {
 		hop::aa_box<T> box;
-		box.mins.set(T {}, T {}, T {});
-		box.maxs.set(T {}, T {}, T {});
-		bool first = true;
-		if (s != nullptr) {
-			for (const auto &sh : s->get_shapes()) {
-				hop::aa_box<T> b;
-				sh->get_bound(b);
-				if (first) { box = b; first = false; }
-				else box.merge(b);
-			}
-		}
+		if (s != nullptr) box = s->get_local_bound();
+		else { box.mins.set(T {}, T {}, T {}); box.maxs.set(T {}, T {}, T {}); }
 		// Axis swap maps godot X to -gs X, so the box ends swap on that axis.
 		double lo[3], hi[3];
 		lo[0] = -(double)box.maxs.x * inv_scale_; hi[0] = -(double)box.mins.x * inv_scale_;

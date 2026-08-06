@@ -20,8 +20,8 @@ template <typename Overlaps, typename Excluded>
 static int collect_overlapping_areas(HopSpaceData *space, const hop::aa_box<hop_scalar> &query_box,
                                      uint32_t mask, PhysicsServer3DExtensionShapeResult *results,
                                      int count, int max_results, Overlaps overlaps, Excluded excluded) {
-	hop::solid<hop_scalar> *cand[256];
-	int n = space->area_bvh.find_solids_in_aa_box(query_box, cand, 256);
+	auto &cand = space->size_for_areas(space->query_area_buffer);
+	int n = space->area_bvh.find_solids_in_aa_box(query_box, cand.data(), (int)cand.size(), (int)mask);
 	for (int i = 0; i < n && count < max_results; i++) {
 		HopAreaData *area = static_cast<HopAreaData *>(cand[i]->get_user_data());
 		if (!area) continue;
@@ -67,12 +67,9 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 	result.reset();
 
 	if (p_collide_with_bodies) {
-		std::vector<hop::solid<hop_scalar> *> candidates(256);
-		int count = space->simulator->find_solids_in_aa_box(total, candidates.data(), (int)candidates.size());
-		if (count > (int)candidates.size()) {
-			candidates.resize(count);
-			space->simulator->find_solids_in_aa_box(total, candidates.data(), count);
-		}
+		auto &candidates = space->size_for_bodies(space->query_body_buffer);
+		int count = space->simulator->find_solids_in_aa_box(total, candidates.data(), (int)candidates.size(),
+			(int)p_collision_mask);
 
 		hop::collision<hop_scalar> col;
 		for (int i = 0; i < count; ++i) {
@@ -96,8 +93,9 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 	// lightningbolt went through enemies.
 	HopAreaData *hit_area = nullptr;
 	if (p_collide_with_areas) {
-		hop::solid<hop_scalar> *cand[256];
-		int n = space->area_bvh.find_solids_in_aa_box(total, cand, 256);
+		auto &cand = space->size_for_areas(space->query_area_buffer);
+		int n = space->area_bvh.find_solids_in_aa_box(total, cand.data(), (int)cand.size(),
+			(int)p_collision_mask);
 		for (int i = 0; i < n; ++i) {
 			HopAreaData *area = static_cast<HopAreaData *>(cand[i]->get_user_data());
 			if (!area) continue;
@@ -167,8 +165,12 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 	int result_count = 0;
 
 	if (p_collide_with_bodies) {
-		std::vector<hop::solid<hop_scalar> *> found(p_max_results * 2);
-		int count = space->simulator->find_solids_in_aa_box(box, found.data(), (int)found.size());
+		// Sized to the whole space, not p_max_results: the broadphase returns statics and
+		// dynamics alike and the mask filter below rejects most of them, so a buffer scaled
+		// to the *output* cap would drop matching bodies before they were ever tested.
+		auto &found = space->size_for_bodies(space->query_body_buffer);
+		int count = space->simulator->find_solids_in_aa_box(box, found.data(), (int)found.size(),
+			(int)p_collision_mask);
 
 		hop::segment<hop_scalar> seg;
 		seg.set_start_end(hp, hp);
@@ -365,12 +367,9 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 		total.set(seg.origin, seg.origin);
 		total.merge(ep);
 
-		std::vector<hop::solid<hop_scalar> *> candidates(256);
-		int count = space->simulator->find_solids_in_aa_box(total, candidates.data(), (int)candidates.size());
-		if (count > (int)candidates.size()) {
-			candidates.resize(count);
-			space->simulator->find_solids_in_aa_box(total, candidates.data(), count);
-		}
+		auto &candidates = space->size_for_bodies(space->query_body_buffer);
+		int count = space->simulator->find_solids_in_aa_box(total, candidates.data(), (int)candidates.size(),
+			(int)p_collision_mask);
 
 		hop::collision<hop_scalar> result;
 		result.reset();
@@ -446,8 +445,9 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 		add(moved, swept, to_hop(p_motion));
 		swept.merge(moved);
 
-		hop::solid<hop_scalar> *cand[256];
-		int n = space->area_bvh.find_solids_in_aa_box(swept, cand, 256);
+		auto &cand = space->size_for_areas(space->query_area_buffer);
+		int n = space->area_bvh.find_solids_in_aa_box(swept, cand.data(), (int)cand.size(),
+			(int)p_collision_mask);
 		for (int i = 0; i < n; ++i) {
 			HopAreaData *area = static_cast<HopAreaData *>(cand[i]->get_user_data());
 			if (!area) continue;

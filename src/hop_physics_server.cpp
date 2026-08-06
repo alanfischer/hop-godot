@@ -2080,9 +2080,11 @@ void HopPhysicsServer::_flush_queries() {
 		if (!area->hop_solid || area->hop_solid->get_shapes().empty()) return;
 		hop::aa_box<hop_scalar> area_aabb = area->hop_solid->get_world_bound();
 
-		// Find bodies overlapping the area's AABB
-		hop::solid<hop_scalar> *found[64];
-		int count = space->simulator->find_solids_in_aa_box(area_aabb, found, 64);
+		// Find bodies overlapping the area's AABB. The buffer holds every solid in the
+		// space, so a body can never be crowded out of the result (see HopSpaceData).
+		auto &found = space->size_for_bodies(space->monitor_body_buffer);
+		int count = space->simulator->find_solids_in_aa_box(area_aabb, found.data(), (int)found.size(),
+			(int)area->collision_mask);
 
 		// Zero-length sweep of the area's own sensor solid, for the narrow-phase
 		// confirm below.
@@ -2149,8 +2151,9 @@ void HopPhysicsServer::_flush_queries() {
 		// Broadphase the area index instead of scanning every area: the candidates
 		// it returns already passed the AABB-overlap test against det_aabb, and are
 		// all in this space (area_bvh is per-space).
-		hop::solid<hop_scalar> *cand[256];
-		int n = space->area_bvh.find_solids_in_aa_box(det_aabb, cand, 256);
+		auto &cand = space->size_for_areas(space->monitor_area_buffer);
+		int n = space->area_bvh.find_solids_in_aa_box(det_aabb, cand.data(), (int)cand.size(),
+			(int)detector->collision_mask);
 
 		hop::segment<hop_scalar> zseg;
 		zseg.set_start_end(detector->hop_solid->get_position(), detector->hop_solid->get_position());

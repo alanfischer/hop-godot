@@ -45,6 +45,7 @@ struct HopSpaceData {
 	// Cached direct state (created lazily, owned by this space)
 	HopDirectSpaceState *direct_state = nullptr;
 
+
 	// The space's DEFAULT area, which Godot addresses by the space RID rather than an
 	// area RID — that is how physics/3d/default_gravity reaches a PhysicsServer3D.
 	// Magnitude and direction arrive as separate calls, so both are kept and the
@@ -56,6 +57,43 @@ struct HopSpaceData {
 		Vector3 g = default_gravity_direction.normalized() * default_gravity;
 		simulator->set_gravity(hop::vec3<hop_scalar>(
 			to_hop_scalar(g.x), to_hop_scalar(g.y), to_hop_scalar(g.z)));
+	}
+
+
+	// --- Broad-phase result buffers ---
+	//
+	// find_solids_in_aa_box fills at most max_solids and clamps its return to it, so a
+	// fixed-size array truncates *silently*. That is not a capacity nuisance: the static
+	// bucket is scanned before the dynamic one (bvh_manager::find_solids_in_aa_box), so
+	// the hits a short buffer drops are exactly the moving bodies callers care about — an
+	// area overlapping enough static geometry would stop detecting players entirely.
+	//
+	// Sizing each buffer to the live solid/area count removes the failure mode by
+	// construction, which is what hop's own simulator does internally (spacial_collection_
+	// is resized to solids_.size()). The vectors keep their capacity between queries, so
+	// steady state allocates nothing.
+	//
+	// One buffer per call site, not one shared: an area monitor callback runs GDScript,
+	// which can re-enter the server and issue its own query on this same space. Separate
+	// buffers mean such a re-entrant query can never overwrite results a caller is still
+	// walking.
+	std::vector<hop::solid<hop_scalar> *> monitor_body_buffer; // _flush_queries: area→body
+	std::vector<hop::solid<hop_scalar> *> monitor_area_buffer; // _flush_queries: area→area
+	std::vector<hop::solid<hop_scalar> *> query_body_buffer;   // space-state body queries
+	std::vector<hop::solid<hop_scalar> *> query_area_buffer;   // space-state area queries
+
+	// Resize `buf` to hold every solid the simulator could return. get_solids() covers the
+	// manager-accelerated path and the linear-scan fallback alike, since both draw from it.
+	std::vector<hop::solid<hop_scalar> *> &size_for_bodies(std::vector<hop::solid<hop_scalar> *> &buf) {
+		buf.resize(simulator->get_solids().size());
+		return buf;
+	}
+
+	// Same for the area index. Areas are registered static (add_area_to_space), but count
+	// both buckets so this stays correct if that ever changes.
+	std::vector<hop::solid<hop_scalar> *> &size_for_areas(std::vector<hop::solid<hop_scalar> *> &buf) {
+		buf.resize(area_bvh.get_static_count() + area_bvh.get_dynamic_count());
+		return buf;
 	}
 
 	HopSpaceData() {

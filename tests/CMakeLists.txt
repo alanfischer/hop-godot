@@ -27,3 +27,4 @@ endfunction()
 
 add_hop_godot_test(test_trimesh_traceable)
 add_hop_godot_test(test_bsp_traceable)
+add_hop_godot_test(test_broadphase_capacity)

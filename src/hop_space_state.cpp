@@ -81,6 +81,14 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 
 			col.time = to_hop_scalar(1.0f);
 			space->simulator->test_segment(col, seg, s);
+			// A ray starting inside this solid only counts when hit_from_inside is set. Skip the
+			// SOLID, not the query: merged in, its t<=0 wins as the nearest hit, and the tail guard
+			// below then throws the whole ray away — losing a legitimate farther hit. That is what
+			// killed +use on a listen host, where the ray starts inside the presser's own
+			// server-side puppet (co-located with the local player and not in the exclude list):
+			// every use press came back empty, so no dragon, door or button could be triggered.
+			// Same rule the area loop below already applies.
+			if (!p_hit_from_inside && to_godot_float(col.time) <= 0.0f) continue;
 			hop::merge_collision(result, col, space->simulator->get_epsilon(), space->simulator->get_average_normals());
 		}
 	}

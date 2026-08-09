@@ -12,15 +12,6 @@
 #include <cstdlib>
 #include <unordered_map>
 
-// Scale-only transform from a Godot basis: hop has no scale, so a body/area's
-// scale is baked into the shape geometry (composed in front of each shape's local
-// transform), while its rotation rides on the solid's orientation.
-static Transform3D scale_only_xform(const Basis &basis) {
-	Transform3D t;
-	t.basis.scale(basis.get_scale());
-	return t;
-}
-
 // Phase 8: principal-axis inertia of the body's collision AABB treated as a solid
 // box — I = mass/12 · (eᵧ²+e_z², e_x²+e_z², e_x²+eᵧ²) for full extents e. A sensible
 // default for any shape so a dynamic RigidBody3D tumbles; the game can override via
@@ -1219,16 +1210,6 @@ void HopPhysicsServer::_body_set_ray_pickable(const RID &p_body, bool p_enable) 
 	if (body) body->ray_pickable = p_enable;
 }
 
-// Resolve the HopBodyData behind a collision (preferring the hit collider, falling
-// back to the collidee), excluding the moving body itself. Centralizing this keeps
-// every contact report carrying its collider — a null collider silently zeroes the
-// reported collider_velocity, which once broke moving-platform carry.
-static HopBodyData *body_of(hop::solid<hop_scalar> *collider, hop::solid<hop_scalar> *collidee,
-                            const hop::solid<hop_scalar> *self) {
-	hop::solid<hop_scalar> *hit = (collider != nullptr && collider != self) ? collider : collidee;
-	return (hit != nullptr && hit != self) ? static_cast<HopBodyData *>(hit->get_user_data()) : nullptr;
-}
-
 bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p_from, const Vector3 &p_motion, float p_margin, int32_t p_max_collisions, bool p_collide_separation_ray, bool p_recovery_as_collision, PhysicsServer3DExtensionMotionResult *p_result) const {
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body || !body->hop_solid) return false;
@@ -1243,6 +1224,21 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	// flush and immediately re-collide at t=0), and (3) report distinct
 	// safe/unsafe fractions plus the recovery depth.
 	hop::vec3<hop_scalar> orig_pos = body->hop_solid->get_position();
+
+	// p_from is the full transform to test from, not just a position: move_and_slide
+	// can probe a rotation the body's committed transform doesn't have yet. Pose the
+	// solid to match for the duration of the query (it is restored with the position
+	// below, since this is a const query). Scale is deliberately not applied — that
+	// lives in the shape geometry and would mean a rebuild.
+	// The quaternion, not the mat3, is what gets restored: set_orientation re-derives
+	// orientation_q_ from the matrix, and under fixed-point that mat3→quat round trip
+	// loses precision off a spinning body's integrated orientation — once per
+	// move_and_slide, which accumulates.
+	hop::quat<hop_scalar> orig_orient_q = body->hop_solid->get_orientation_quat();
+	hop::mat3<hop_scalar> from_orient = to_hop_orientation(p_from.basis);
+	const bool repose = from_orient != body->hop_solid->get_orientation();
+	if (repose)
+		body->hop_solid->set_orientation(from_orient);
 
 	float margin = std::max(p_margin, 0.0f);
 	// How far past a contact surface we shove the body during recovery: enough to
@@ -1349,8 +1345,10 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		}
 	}
 
-	// Restore the authoritative position (this is a const query).
+	// Restore the authoritative pose (this is a const query).
 	body->hop_solid->set_position(orig_pos);
+	if (repose)
+		body->hop_solid->set_orientation_from_quat(orig_orient_q);
 
 	// result.time is a fraction of the (possibly extended) probe.  Convert to a
 	// hit distance, then back to a fraction of the *real* motion for Godot's

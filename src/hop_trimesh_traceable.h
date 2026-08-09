@@ -135,15 +135,13 @@ public:
 		// Non-capsule shapes (boxes/spheres, e.g. area queries) keep the older
 		// winding-agnostic support-plane approximation.
 
-		// Compute swept AABB of the other solid along the segment for BVH query
+		// Bound of the other solid's shapes about its position, for the BVH query. Not a
+		// merge of raw shape bounds: get_bound() is INTRINSIC (the shape's own frame), so
+		// that silently drops every shape's local_position and local_rotation and the
+		// solid's orientation with them, and an under-sized query box means missed
+		// triangles.
 		hop::aa_box<T> swept_box;
-		const auto & shapes = s->get_shapes();
-		shapes[0]->get_bound(swept_box);
-		for (size_t i = 1; i < shapes.size(); ++i) {
-			hop::aa_box<T> sb;
-			shapes[i]->get_bound(sb);
-			swept_box.merge(sb);
-		}
+		s->get_bound_about_position(swept_box);
 
 		// swept_box is in solid-local space; expand to cover the full sweep path
 		// Work in mesh-local space (subtract traceable position)

@@ -25,4 +25,13 @@ public:
 	bool _collide_shape(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, void *p_results, int32_t p_max_results, int32_t *p_result_count) override;
 	bool _rest_info(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, PhysicsServer3DExtensionShapeRestInfo *p_rest_info) override;
 	Vector3 _get_closest_point_to_object_volume(const RID &p_object, const Vector3 &p_point) const override;
+
+private:
+	// Narrow-phase every body/area the posed query shape overlaps, handing each contact
+	// to `report(collision, rid, object_instance_id, body_or_null)`. Returning false from
+	// `report` stops the walk (a full result buffer). Shared by _collide_shape/_rest_info.
+	template <typename Report>
+	bool for_each_overlap(const RID &p_shape_rid, const Transform3D &p_transform, float p_margin,
+	                      uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas,
+	                      Report report);
 };

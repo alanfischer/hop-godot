@@ -1,6 +1,7 @@
 #pragma once
 
 #include <godot_cpp/variant/vector3.hpp>
+#include <godot_cpp/variant/transform3d.hpp>
 #include <godot_cpp/classes/object.hpp>
 #include <godot_cpp/godot.hpp>
 #include <hop/fixed16.h>
@@ -116,4 +117,14 @@ inline hop::mat3<hop_scalar> to_hop_mat3(const Basis &b) {
 // basis's scale (which hop bakes into geometry) and keeps the pure rotation.
 inline hop::mat3<hop_scalar> to_hop_orientation(const Basis &b) {
 	return to_hop_mat3(Basis(b.get_rotation_quaternion()));
+}
+
+// Scale-only transform from a Godot basis: hop has no scale, so a body/area/query
+// shape's scale is baked into the geometry (composed in front of each shape's local
+// transform), while its rotation rides on the solid's orientation. The two are the
+// halves of one split, so they live together.
+inline Transform3D scale_only_xform(const Basis &basis) {
+	Transform3D t;
+	t.basis.scale(basis.get_scale());
+	return t;
 }

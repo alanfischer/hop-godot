@@ -59,7 +59,9 @@ public:
 		T deepest = T {};
 		for (const auto &shape : s->get_shapes()) {
 			hop::vec3<T> sup;
-			hop::support(sup, *shape, neg_n);
+			// Composed, not intrinsic — the extent is from the solid's origin, so the
+			// shape's local_position/local_rotation have to be in it.
+			hop::support_in_solid(sup, *shape, neg_n);
 			T extent = hop::dot(sup, neg_n);
 			if (extent > deepest)
 				deepest = extent;

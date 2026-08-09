@@ -207,7 +207,10 @@ inline void recover_support_plane(hop::shape<T> * sh, const hop::vec3<T> & local
 	hop::vec3<T> neg_fn;
 	hop::neg(neg_fn, face_n);
 	hop::vec3<T> sup;
-	hop::support(sup, *sh, neg_fn);
+	// support_in_solid, not support: the intrinsic support ignores the shape's
+	// local_position/local_rotation, and this extent is measured from the SOLID's
+	// origin. (The capsule arms below already compose local_position by hand.)
+	hop::support_in_solid(sup, *sh, neg_fn);
 	T expand = hop::dot(sup, neg_fn);
 	T plane_d = hop::dot(face_n, a);
 	T surface_d = plane_d + expand;
@@ -255,7 +258,10 @@ inline void sweep_support_plane(hop::shape<T> * sh, const hop::vec3<T> & local_o
 	hop::vec3<T> neg_fn;
 	hop::neg(neg_fn, face_n);
 	hop::vec3<T> sup;
-	hop::support(sup, *sh, neg_fn);
+	// support_in_solid, not support: the intrinsic support ignores the shape's
+	// local_position/local_rotation, and this extent is measured from the SOLID's
+	// origin. (The capsule arms below already compose local_position by hand.)
+	hop::support_in_solid(sup, *sh, neg_fn);
 	T expand = hop::dot(sup, neg_fn);
 	T plane_d = hop::dot(face_n, a);
 	T expanded_d = plane_d + expand;

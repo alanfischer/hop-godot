@@ -129,15 +129,11 @@ public:
 			    });
 			return;
 		}
-		// Swept query AABB in heightfield-local space (mirrors the trimesh path).
+		// Swept query AABB in heightfield-local space (mirrors the trimesh path — see
+		// there for why this is the solid's oriented bound and not a merge of raw shape
+		// bounds, which are intrinsic and omit local_position/local_rotation).
 		hop::aa_box<T> swept_box;
-		const auto & shapes = s->get_shapes();
-		shapes[0]->get_bound(swept_box);
-		for (size_t i = 1; i < shapes.size(); ++i) {
-			hop::aa_box<T> sb;
-			shapes[i]->get_bound(sb);
-			swept_box.merge(sb);
-		}
+		s->get_bound_about_position(swept_box);
 
 		hop::vec3<T> local_origin;
 		hop::sub(local_origin, seg.origin, position);

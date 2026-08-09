@@ -46,7 +46,7 @@ inline VertKey quantize_vert(const Vector3 &p) {
 // compute the plane and check that every other vertex is on the inside (or on
 // the plane).  Duplicate / near-duplicate planes are merged.
 static bool build_convex_solid_from_points(
-		const Vector3 *points, int count, const Vector3 &origin,
+		const Vector3 *points, int count,
 		hop::convex_solid<hop_scalar> &out) {
 
 	if (count < 4) return false;
@@ -61,9 +61,9 @@ static bool build_convex_solid_from_points(
 	for (int i = 0; i < count - 2; ++i) {
 		for (int j = i + 1; j < count - 1; ++j) {
 			for (int k = j + 1; k < count; ++k) {
-				Vector3 a = points[i] + origin;
-				Vector3 b = points[j] + origin;
-				Vector3 c = points[k] + origin;
+				Vector3 a = points[i];
+				Vector3 b = points[j];
+				Vector3 c = points[k];
 
 				Vector3 edge1 = b - a;
 				Vector3 edge2 = c - a;
@@ -78,7 +78,7 @@ static bool build_convex_solid_from_points(
 				bool has_inside = false;
 				for (int l = 0; l < count; ++l) {
 					if (l == i || l == j || l == k) continue;
-					Vector3 p = points[l] + origin;
+					Vector3 p = points[l];
 					float side = n.dot(p) - d;
 					if (side > PLANE_EPS) {
 						valid = false;
@@ -96,7 +96,7 @@ static bool build_convex_solid_from_points(
 					has_inside = false;
 					for (int l = 0; l < count; ++l) {
 						if (l == i || l == j || l == k) continue;
-						Vector3 p = points[l] + origin;
+						Vector3 p = points[l];
 						float side = n.dot(p) - d;
 						if (side > PLANE_EPS) {
 							valid = false;
@@ -135,10 +135,10 @@ static bool build_convex_solid_from_points(
 	// can never clip the true hull (every vertex is inside its own AABB), so they
 	// only remove the spurious unbounded extension. (Slivers are dropped earlier in
 	// make_hop_shape; this clamp is what keeps legitimately-kept thin cells bounded.)
-	Vector3 mn = points[0] + origin;
+	Vector3 mn = points[0];
 	Vector3 mx = mn;
 	for (int i = 1; i < count; ++i) {
-		Vector3 p = points[i] + origin;
+		Vector3 p = points[i];
 		mn = mn.min(p);
 		mx = mx.max(p);
 	}
@@ -163,7 +163,7 @@ static bool build_convex_solid_from_points(
 	// guide-post phantom-walled the lift approach). Seeding vertices with the real
 	// points makes collision use the true, bounded hull regardless of plane health.
 	for (int i = 0; i < count; ++i) {
-		out.vertices.push_back(to_hop(points[i] + origin));
+		out.vertices.push_back(to_hop(points[i]));
 	}
 	return true;
 }
@@ -174,37 +174,51 @@ void HopShapeData::set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_
 }
 
 std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Transform3D &p_local_xform) {
-	// Split the local transform into a pure rotation (carried as the shape's static
-	// local_rotation, which the narrowphase composes with the solid's orientation)
-	// and the scale + translation, which is baked into the geometry (hop shapes
-	// have no orientation of their own). Identity rotation is an exact no-op, so
-	// existing axis-aligned content is unchanged.
+	// Decompose the shape's transform-within-its-body into the three things hop
+	// composes a shape from:
+	//
+	//   world = solid_position + solid_orientation · (local_rotation · geometry + local_position)
+	//
+	//   - rotation  → local_rotation (the narrowphase composes it with the solid's)
+	//   - scale     → baked into the geometry (hop shapes carry no scale)
+	//   - translation → local_position
+	//
+	// The geometry itself is authored about its own origin, which is what hop's
+	// get_bound()/support() assume ("intrinsic; callers apply local_position"). This
+	// wrapper used to bake the translation into the geometry and leave local_position
+	// at zero, which worked only while local_rotation was identity — otherwise the
+	// rotation spun that baked-in offset about the body origin as well, and a shape
+	// both offset and rotated (the golem's per-leg ladder box, out at the foot and
+	// yawed with the golem) orbited away from where Godot puts it.
 	Basis rot_basis = Basis(p_local_xform.basis.get_rotation_quaternion());
-	Transform3D geom_xform;
 	// rot_basis is orthonormal, so its inverse is its transpose (exact + cheaper).
-	geom_xform.basis = rot_basis.transposed() * p_local_xform.basis; // scale, rotation stripped
-	geom_xform.origin = p_local_xform.origin;
+	Basis scale_basis = rot_basis.transposed() * p_local_xform.basis; // scale, rotation stripped
 
-	auto shape = build_shape_geometry(geom_xform);
-	if (shape)
+	auto shape = build_shape_geometry(scale_basis);
+	if (shape) {
 		shape->set_local_rotation(to_hop_mat3(rot_basis));
+		shape->set_local_position(to_hop(p_local_xform.origin));
+	}
 	return shape;
 }
 
-std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const Transform3D &p_local_xform) {
-	Vector3 origin = p_local_xform.origin;
+// Geometry is authored about the shape's OWN origin: hop's get_bound()/support() are
+// intrinsic, and the shape's offset within its body rides on local_position (applied by
+// make_hop_shape). Taking a scale-only Basis rather than a Transform3D is what keeps that
+// true — there is no origin here to accidentally bake in.
+std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const Basis &p_scale) {
 
 	switch (type) {
 		case PhysicsServer3D::SHAPE_SPHERE: {
 			float radius = (float)data;
-			hop::sphere<hop_scalar> s(to_hop(origin), to_hop_scalar(radius));
+			hop::sphere<hop_scalar> s(hop::vec3<hop_scalar>(), to_hop_scalar(radius));
 			return std::make_shared<hop::shape<hop_scalar>>(s);
 		}
 
 		case PhysicsServer3D::SHAPE_BOX: {
 			Vector3 half_extents = data;
-			Vector3 mn = origin - half_extents;
-			Vector3 mx = origin + half_extents;
+			Vector3 mn = -half_extents;
+			Vector3 mx = half_extents;
 			hop::aa_box<hop_scalar> box(to_hop(mn), to_hop(mx));
 			return std::make_shared<hop::shape<hop_scalar>>(box);
 		}
@@ -214,7 +228,7 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			float radius = d.get("radius", 0.5f);
 			float height = d.get("height", 2.0f);
 			float half_height = height * 0.5f - radius;
-			Vector3 cap_bottom = origin + Vector3(0, -half_height, 0);
+			Vector3 cap_bottom = Vector3(0, -half_height, 0);
 			Vector3 cap_dir = Vector3(0, half_height * 2.0f, 0);
 			hop::capsule<hop_scalar> c(
 				to_hop(cap_bottom),
@@ -231,10 +245,10 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			}
 
 			// AABB of the hull (in the shape's local+offset frame).
-			Vector3 mn = points[0] + origin;
+			Vector3 mn = points[0];
 			Vector3 mx = mn;
 			for (int i = 1; i < points.size(); i++) {
-				Vector3 p = points[i] + origin;
+				Vector3 p = points[i];
 				mn = mn.min(p);
 				mx = mx.max(p);
 			}
@@ -256,6 +270,19 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 
 			// Rotation-invariant thickness check (L3) to drop true coplanar 2D slivers
 			// without misclassifying rotated 3D brush solids.
+			//
+			// The threshold is a DEGENERACY epsilon, deliberately far below MIN_DIM: a
+			// solid only gets here when it is fat on all three axes, so a small L3 means
+			// a rotated slab, and rotation is no reason to delete a brush. MIN_DIM (8
+			// units) is thicker than plenty of real level geometry — ww_golem's func_ladder
+			// brushes are 8 units thick and yawed, which measures 7.84 units along their
+			// own normal, so they were dropped entirely (no collision shape, and the
+			// Volume Area3D that shares the shape resource went with them: the ladders
+			// became unclimbable, while ww_ravine's axis-aligned 4-unit ladders survived
+			// because thin==1 skips this check). A real brush is at least 1 unit thick;
+			// anything under a fraction of that is the zero-volume BSP-leaf sliver this
+			// test exists to reject.
+			const float SLIVER_L3 = 0.02f; // 0.8 game units
 			if (thin == 0 && points.size() >= 4) {
 				float max_d1_sq = 0.0f;
 				int p0_idx = 0, pa_idx = 0;
@@ -269,8 +296,8 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 						}
 					}
 				}
-				Vector3 p0 = points[p0_idx] + origin;
-				Vector3 pa = points[pa_idx] + origin;
+				Vector3 p0 = points[p0_idx];
+				Vector3 pa = points[pa_idx];
 				Vector3 v1 = pa - p0;
 				float l1 = std::sqrt(max_d1_sq);
 
@@ -279,7 +306,7 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 					float max_d2_sq = 0.0f;
 					int pb_idx = p0_idx;
 					for (int i = 0; i < points.size(); ++i) {
-						Vector3 w = (points[i] + origin) - p0;
+						Vector3 w = points[i] - p0;
 						Vector3 perp = w - u1 * w.dot(u1);
 						float d2_sq = perp.length_squared();
 						if (d2_sq > max_d2_sq) {
@@ -287,7 +314,7 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 							pb_idx = i;
 						}
 					}
-					Vector3 pb = points[pb_idx] + origin;
+					Vector3 pb = points[pb_idx];
 					Vector3 v2 = pb - p0;
 					Vector3 cross = v1.cross(v2);
 					float c_len = cross.length();
@@ -296,14 +323,14 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 						Vector3 norm = cross / c_len;
 						float d3_min = 0.0f, d3_max = 0.0f;
 						for (int i = 0; i < points.size(); ++i) {
-							float dist = ((points[i] + origin) - p0).dot(norm);
+							float dist = (points[i] - p0).dot(norm);
 							d3_min = std::min(d3_min, dist);
 							d3_max = std::max(d3_max, dist);
 						}
 						float l3 = d3_max - d3_min;
 
-						// Only drop if 3D thickness is below threshold (< 0.1m)
-						if (l3 < MIN_DIM) {
+						// Only drop a genuinely flat, zero-volume sliver.
+						if (l3 < SLIVER_L3) {
 							return nullptr;
 						}
 					}
@@ -311,7 +338,7 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			}
 
 			hop::convex_solid<hop_scalar> cs;
-			if (build_convex_solid_from_points(points.ptr(), points.size(), origin, cs)) {
+			if (build_convex_solid_from_points(points.ptr(), points.size(), cs)) {
 				return std::make_shared<hop::shape<hop_scalar>>(cs);
 			}
 			// Fallback to AABB if plane extraction fails.
@@ -324,22 +351,21 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			float radius = d.get("radius", 0.5f);
 			float height = d.get("height", 2.0f);
 			float half_h = height * 0.5f;
-			Vector3 ho_v = origin;
 
 			// Approximate cylinder as convex solid: N side planes + top/bottom caps
 			const int SIDES = 12;
 			hop::convex_solid<hop_scalar> cs;
 			// Top and bottom cap planes
 			cs.planes.push_back(hop::plane<hop_scalar>(
-				to_hop(Vector3(0, 1, 0)), to_hop_scalar(ho_v.y + half_h)));
+				to_hop(Vector3(0, 1, 0)), to_hop_scalar(half_h)));
 			cs.planes.push_back(hop::plane<hop_scalar>(
-				to_hop(Vector3(0, -1, 0)), to_hop_scalar(-(ho_v.y - half_h))));
+				to_hop(Vector3(0, -1, 0)), to_hop_scalar(half_h)));
 			// Side planes
 			for (int i = 0; i < SIDES; ++i) {
 				float angle = (float)i / (float)SIDES * 2.0f * 3.14159265f;
 				float nx = std::cos(angle);
 				float nz = std::sin(angle);
-				float d_val = nx * (ho_v.x + radius * nx) + nz * (ho_v.z + radius * nz);
+				float d_val = nx * (radius * nx) + nz * (radius * nz);
 				cs.planes.push_back(hop::plane<hop_scalar>(
 					to_hop(Vector3(nx, 0, nz)), to_hop_scalar(d_val)));
 			}
@@ -377,8 +403,7 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			vert_index.reserve(face_count);
 
 			auto find_or_add = [&](const Vector3 &p) -> int {
-				// Apply full transform (basis + origin) to vertices
-				Vector3 wp = p_local_xform.xform(p);
+				Vector3 wp = p_scale.xform(p);
 				VertKey key = quantize_vert(wp);
 				auto it = vert_index.find(key);
 				if (it != vert_index.end())
@@ -422,9 +447,9 @@ std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::build_shape_geometry(const
 			// real spacing/scale lives in the transform basis (hop solids carry no
 			// scale, so bake it into the traceable). to_hop is identity, so godot
 			// X/Z/Y map straight through.
-			Vector3 gscale = p_local_xform.basis.get_scale();
+			Vector3 gscale = p_scale.get_scale();
 			auto heightfield = std::make_unique<HopHeightfieldTraceable<hop_scalar>>();
-			heightfield->build(w, dp, heights.ptr(), to_hop(gscale), to_hop(origin));
+			heightfield->build(w, dp, heights.ptr(), to_hop(gscale), hop::vec3<hop_scalar>());
 			return std::make_shared<hop::shape<hop_scalar>>(std::move(heightfield));
 		}
 

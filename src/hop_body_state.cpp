@@ -24,24 +24,12 @@ Vector3 HopDirectBodyState::_get_total_gravity() const {
 		if (area->space_override_mode == PhysicsServer3D::AREA_SPACE_OVERRIDE_DISABLED) return;
 		if (!area->space_rid.is_valid() || area->space_rid != body->space_rid) return;
 
-		// Build area world AABB from its shapes
-		bool has_box = false;
-		hop::aa_box<hop_scalar> area_wb;
-		for (auto &se : area->shapes) {
-			if (se.disabled) continue;
-			HopShapeData *sd = server->shape_owner.get_or_null(se.shape_rid);
-			if (!sd) continue;
-			auto hs = sd->make_hop_shape(se.local_xform);
-			if (!hs) continue;
-			hop::aa_box<hop_scalar> sb;
-			hs->get_bound(sb);
-			hop::vec3<hop_scalar> p = to_hop(area->transform.origin);
-			hop::add(sb.mins, p);
-			hop::add(sb.maxs, p);
-			if (!has_box) { area_wb = sb; has_box = true; }
-			else { area_wb.merge(sb.mins); area_wb.merge(sb.maxs); }
-		}
-		if (!has_box) return;
+		// The area's solid already maintains this — orientation, per-shape rotation and
+		// per-shape offset all folded in (solid::update_local_bound). Rebuilding every
+		// shape here to bound them by hand re-derived it wrong the moment a shape carried
+		// a local_position or rotation, and cost a shape build per area per query besides.
+		if (!area->hop_solid || area->hop_solid->get_shapes().empty()) return;
+		hop::aa_box<hop_scalar> area_wb = area->hop_solid->get_world_bound();
 		if (!hop::test_intersection(body_wb, area_wb)) return;
 		if (!(area->collision_mask & body->hop_solid->get_collision_scope())) return;
 

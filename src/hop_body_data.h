@@ -120,3 +120,15 @@ struct HopBodyData {
 			   mode == PhysicsServer3D::BODY_MODE_KINEMATIC;
 	}
 };
+
+// The body a collision hit, from hop's two partner slots. The swept-query path records
+// it in `collider` and leaves `collidee` null; other paths use the opposite convention;
+// trimesh hits fill neither. Centralizing this keeps every contact report carrying its
+// collider — a null collider silently zeroes the reported collider_velocity, which once
+// broke moving-platform carry, and once handed script an intersect_shape hit with a null
+// .collider.
+inline HopBodyData *body_of(hop::solid<hop_scalar> *collider, hop::solid<hop_scalar> *collidee,
+                            const hop::solid<hop_scalar> *self) {
+	hop::solid<hop_scalar> *hit = (collider != nullptr && collider != self) ? collider : collidee;
+	return (hit != nullptr && hit != self) ? static_cast<HopBodyData *>(hit->get_user_data()) : nullptr;
+}

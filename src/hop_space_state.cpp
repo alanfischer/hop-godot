@@ -10,6 +10,24 @@
 #include <godot_cpp/godot.hpp>
 
 
+// A temporary solid carrying the caller's query shape, posed from a Godot shape
+// transform. The split is the same one bodies and areas use — scale baked into the
+// geometry, rotation onto the solid — and having it in one place is what keeps a new
+// query entry point from being rotation-blind by default (all four of them had to be
+// fixed by hand once already). Null when the shape can't be built.
+static std::shared_ptr<hop::solid<hop_scalar>> make_query_solid(HopShapeData *sd,
+                                                                const Transform3D &p_transform) {
+	auto hs = sd->make_hop_shape(scale_only_xform(p_transform.basis));
+	if (!hs) return nullptr;
+	auto s = std::make_shared<hop::solid<hop_scalar>>();
+	s->set_infinite_mass();
+	s->set_position(to_hop(p_transform.origin));
+	s->set_orientation(to_hop_orientation(p_transform.basis));
+	s->set_collision_scope(0);
+	s->add_shape(hs);
+	return s;
+}
+
 // Find areas in `space` overlapping `query_box` (broadphase) whose collision_layer
 // matches `mask`, confirm with overlaps(area_solid), and record one result per
 // overlapping area (capped at max_results); returns the updated count.  Shared by
@@ -267,23 +285,20 @@ int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Tran
 
 	// --- Bodies ---
 	if (p_collide_with_bodies) {
-		auto hs = sd->make_hop_shape(Transform3D());
-		if (hs) {
-			// Build a temporary solid carrying the test shape.
-			// Only collide with static bodies — kinematic and dynamic bodies (e.g. the
-			// crouched player capsule) must not be counted as blockers.  _intersect_shape
-			// does not receive the caller's exclude list, so without this filter the
-			// player's own body would always register as an overlap and can_uncrouch()
-			// would permanently return false.
-			auto temp_solid = std::make_shared<hop::solid<hop_scalar>>();
-			temp_solid->set_infinite_mass();
-			temp_solid->set_position(pos);
-			temp_solid->set_collision_scope(0);
+		auto temp_solid = make_query_solid(sd, p_transform);
+		if (temp_solid) {
+			// The caller's exclude list is what keeps a query from hitting the body
+			// that issued it — e.g. can_uncrouch() excludes the player's own capsule,
+			// which would otherwise always register as an overlap. It reaches an
+			// extension through is_body_excluded_from_query(), not through the
+			// arguments, which is easy to miss: filtering to STATIC bodies instead
+			// happens to hide the querying body too, and silently hides every
+			// kinematic brush entity with it (moving golem limbs, doors, platforms),
+			// none of which Godot Physics omits.
 			temp_solid->set_collide_with_scope(p_collision_mask);
-			temp_solid->add_shape(hs);
-			temp_solid->set_collision_filter([](hop::solid<hop_scalar> *other) -> bool {
+			temp_solid->set_collision_filter([this](hop::solid<hop_scalar> *other) -> bool {
 				auto *body = static_cast<HopBodyData *>(other->get_user_data());
-				return body && body->mode == PhysicsServer3D::BODY_MODE_STATIC;
+				return !body || !is_body_excluded_from_query(body->self_rid);
 			});
 
 			space->simulator->add_solid(temp_solid);
@@ -307,10 +322,15 @@ int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Tran
 					p_results[result_count].collider_id = ObjectID();
 					p_results[result_count].collider = nullptr;
 					p_results[result_count].shape = 0;
-					// result.collidee is null for trimesh hits — that's fine; the
-					// only current body caller (can_uncrouch) checks is_empty().
-					if (result.collidee) {
-						HopBodyData *hit = static_cast<HopBodyData *>(result.collidee->get_user_data());
+					// The swept-query path records the hit partner in `collider` and
+					// leaves `collidee` null (same convention _body_test_motion reads),
+					// so check both — reading only collidee handed script callers a hit
+					// whose .collider was null. Still null for trimesh hits, where hop
+					// reports no partner solid at all.
+					hop::solid<hop_scalar> *partner = result.collider;
+					if (!partner || partner == temp_solid.get()) partner = result.collidee;
+					if (partner && partner != temp_solid.get()) {
+						HopBodyData *hit = static_cast<HopBodyData *>(partner->get_user_data());
 						if (hit) {
 							p_results[result_count].rid = hit->self_rid;
 							p_results[result_count].collider_id = ObjectID(hit->object_instance_id);
@@ -329,13 +349,8 @@ int32_t HopDirectSpaceState::_intersect_shape(const RID &p_shape_rid, const Tran
 	// the narrow phase — no per-query geometry rebuilds.  The player probes these
 	// with collide_with_areas = true, collide_with_bodies = false.
 	if (p_collide_with_areas && result_count < p_max_results) {
-		auto query_shape = sd->make_hop_shape(Transform3D());
-		if (query_shape) {
-			auto query_solid = std::make_shared<hop::solid<hop_scalar>>();
-			query_solid->set_infinite_mass();
-			query_solid->set_position(pos);
-			query_solid->add_shape(query_shape);
-
+		auto query_solid = make_query_solid(sd, p_transform);
+		if (query_solid) {
 			hop::segment<hop_scalar> zseg;
 			zseg.set_start_end(pos, pos);
 
@@ -416,19 +431,13 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 		return time_f < 1.0f;
 	}
 
-	auto temp_solid = std::make_shared<hop::solid<hop_scalar>>();
-	temp_solid->set_infinite_mass();
-	temp_solid->set_position(to_hop(p_transform.origin));
-	temp_solid->set_collision_scope(0);
+	auto temp_solid = make_query_solid(sd, p_transform);
+	if (!temp_solid) return false;
 	temp_solid->set_collide_with_scope(p_collision_mask);
 	temp_solid->set_collision_filter([this](hop::solid<hop_scalar> *other) -> bool {
 		auto *body = static_cast<HopBodyData *>(other->get_user_data());
 		return !body || !is_body_excluded_from_query(body->self_rid);
 	});
-
-	auto hs = sd->make_hop_shape(Transform3D());
-	if (!hs) return false;
-	temp_solid->add_shape(hs);
 
 	hop::segment<hop_scalar> seg;
 	seg.set_start_end(to_hop(p_transform.origin), to_hop(p_transform.origin + p_motion));
@@ -505,15 +514,150 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 	return true;
 }
 
+// Shared walk behind _collide_shape and _rest_info: pose a temporary solid from the
+// caller's shape + transform, then narrow-phase it against every body and area its
+// bound reaches, handing each overlap to `report`.
+//
+// hop returns ONE contact per solid pair (point, normal, depth), not a manifold, so
+// both callers see one contact per overlapping collider rather than a full contact
+// set. That is what the swept narrow phase computes and what everything else in this
+// wrapper already consumes; a real manifold would have to come from hop.
+template <typename Report>
+bool HopDirectSpaceState::for_each_overlap(const RID &p_shape_rid, const Transform3D &p_transform,
+                                           float p_margin, uint32_t p_collision_mask,
+                                           bool p_collide_with_bodies, bool p_collide_with_areas,
+                                           Report report) {
+	if (!space || !server) return false;
+	if (!p_collide_with_bodies && !p_collide_with_areas) return false;
+
+	HopShapeData *sd = server->shape_owner.get_or_null(p_shape_rid);
+	if (!sd) return false;
+
+	auto query_solid = make_query_solid(sd, p_transform);
+	if (!query_solid) return false;
+
+	hop::segment<hop_scalar> zseg;
+	zseg.set_start_end(query_solid->get_position(), query_solid->get_position());
+	hop::aa_box<hop_scalar> query_box = query_solid->get_world_bound();
+	const hop_scalar margin = to_hop_scalar(p_margin);
+
+	bool any = false;
+
+	// Narrow-phase confirm + liveness check + report, shared by the two candidate walks.
+	// Returns false to stop the walk. A collider whose backing node is gone must never be
+	// reported: callers dereference result.collider.
+	auto emit = [&](hop::solid<hop_scalar> *other, const RID &rid, uint64_t oid,
+	                HopBodyData *body, bool &keep_going) -> bool {
+		hop::collision<hop_scalar> col;
+		space->simulator->test_solid(col, query_solid.get(), zseg, other, margin);
+		if (to_godot_float(col.time) >= 1.0f) return true;
+		if (!UtilityFunctions::is_instance_id_valid((int64_t)oid)) return true;
+		if (!get_collider_safe(oid)) return true;
+		any = true;
+		keep_going = report(col, rid, oid, body);
+		return keep_going;
+	};
+
+	bool keep_going = true;
+
+	if (p_collide_with_bodies) {
+		auto &found = space->size_for_bodies(space->query_body_buffer);
+		int count = space->simulator->find_solids_in_aa_box(query_box, found.data(), (int)found.size(),
+			(int)p_collision_mask);
+		for (int i = 0; i < count && keep_going; ++i) {
+			auto *body = found[i] ? static_cast<HopBodyData *>(found[i]->get_user_data()) : nullptr;
+			if (!body) continue;
+			if (!(p_collision_mask & body->collision_layer)) continue;
+			if (is_body_excluded_from_query(body->self_rid)) continue;
+			emit(found[i], body->self_rid, body->object_instance_id, body, keep_going);
+		}
+	}
+
+	if (p_collide_with_areas) {
+		auto &cand = space->size_for_areas(space->query_area_buffer);
+		int n = space->area_bvh.find_solids_in_aa_box(query_box, cand.data(), (int)cand.size(),
+			(int)p_collision_mask);
+		for (int i = 0; i < n && keep_going; ++i) {
+			auto *area = static_cast<HopAreaData *>(cand[i]->get_user_data());
+			if (!area) continue;
+			if (!(p_collision_mask & area->collision_layer)) continue;
+			if (is_body_excluded_from_query(area->self_rid)) continue;
+			emit(cand[i], area->self_rid, area->object_instance_id, nullptr, keep_going);
+		}
+	}
+
+	return any;
+}
+
 bool HopDirectSpaceState::_collide_shape(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, void *p_results, int32_t p_max_results, int32_t *p_result_count) {
 	if (p_result_count) *p_result_count = 0;
-	return false;
+	if (p_max_results <= 0) return false;
+
+	// Godot's contract: two Vector3 per contact — the point on the QUERIED shape
+	// first, then the point on the collider. hop reports the mover's reference point
+	// inside the target plus the separating (normal, depth), so the collider-side
+	// point is that point pushed out along the normal.
+	Vector3 *out = static_cast<Vector3 *>(p_results);
+	int32_t count = 0;
+
+	for_each_overlap(p_shape_rid, p_transform, p_margin, p_collision_mask,
+		p_collide_with_bodies, p_collide_with_areas,
+		[&](const hop::collision<hop_scalar> &col, const RID &, uint64_t, HopBodyData *) -> bool {
+			if (out) {
+				Vector3 on_query = to_godot(col.point);
+				Vector3 n = to_godot(col.normal);
+				out[count * 2 + 0] = on_query;
+				out[count * 2 + 1] = on_query + n * to_godot_float(col.depth);
+			}
+			count++;
+			return count < p_max_results;  // stop once the caller's buffer is full
+		});
+
+	if (p_result_count) *p_result_count = count;
+	return count > 0;
 }
 
 bool HopDirectSpaceState::_rest_info(const RID &p_shape_rid, const Transform3D &p_transform, const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies, bool p_collide_with_areas, PhysicsServer3DExtensionShapeRestInfo *p_rest_info) {
-	return false;
+	// The deepest overlap is the one a caller wants to resolve against, so keep the
+	// max-depth contact rather than the first one the broad phase happens to return.
+	float best_depth = -1.0f;
+	bool found = false;
+
+	for_each_overlap(p_shape_rid, p_transform, p_margin, p_collision_mask,
+		p_collide_with_bodies, p_collide_with_areas,
+		[&](const hop::collision<hop_scalar> &col, const RID &rid, uint64_t oid, HopBodyData *body) -> bool {
+			float depth = to_godot_float(col.depth);
+			if (depth <= best_depth) return true;
+			best_depth = depth;
+			found = true;
+			if (p_rest_info) {
+				Vector3 on_query = to_godot(col.point);
+				Vector3 n = to_godot(col.normal);
+				p_rest_info->point = on_query + n * depth;  // on the collider's surface
+				p_rest_info->normal = n;
+				p_rest_info->rid = rid;
+				p_rest_info->collider_id = ObjectID(oid);
+				p_rest_info->shape = 0;
+				// Velocity at the contact point, so a caller resting on a moving or
+				// spinning platform reads the platform's motion and not just its origin's.
+				p_rest_info->linear_velocity = body
+				    ? body->velocity_at_local(p_rest_info->point - body->transform.origin)
+				    : Vector3();
+			}
+			return true;
+		});
+
+	return found;
 }
 
 Vector3 HopDirectSpaceState::_get_closest_point_to_object_volume(const RID &p_object, const Vector3 &p_point) const {
+	// Unimplemented, deliberately. The obvious cheap answer — clamp to the object's world
+	// AABB — is confidently wrong in exactly the way the rest of this wrapper has been
+	// fixed not to be: it answers for an axis-aligned box the object may not be, so a
+	// point in the gap between two shapes, or inside a rotated shape's AABB but outside
+	// the shape, comes back as "you are already inside the volume" with no way for the
+	// caller to tell. Returning the query point is at least an honest no-answer. The real
+	// implementation is a per-shape hop::gjk_core_distance against a point solid, keeping
+	// the minimum; worth writing when something actually calls this.
 	return p_point;
 }

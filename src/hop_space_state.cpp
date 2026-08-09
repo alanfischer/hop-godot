@@ -522,6 +522,15 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 // both callers see one contact per overlapping collider rather than a full contact
 // set. That is what the swept narrow phase computes and what everything else in this
 // wrapper already consumes; a real manifold would have to come from hop.
+//
+// That single contact is folded with intra_merge::deepest, NOT the solver's default
+// average. When several shapes of one collider overlap the query at once, averaging
+// their normals reports a direction belonging to no surface: a character standing on
+// a compound brush's floor while its wall overlaps got normalize((0,1,0)+(0,0,1)) —
+// a 45° normal that reads as neither floor nor wall, and that did not change when the
+// wall became the deeper overlap. Callers resolve a position against this contact and
+// classify it by its normal, so it has to describe one real surface. `deepest` gives
+// them the genuinely deepest shape, which also matches what Godot Physics reports.
 template <typename Report>
 bool HopDirectSpaceState::for_each_overlap(const RID &p_shape_rid, const Transform3D &p_transform,
                                            float p_margin, uint32_t p_collision_mask,
@@ -549,7 +558,8 @@ bool HopDirectSpaceState::for_each_overlap(const RID &p_shape_rid, const Transfo
 	auto emit = [&](hop::solid<hop_scalar> *other, const RID &rid, uint64_t oid,
 	                HopBodyData *body, bool &keep_going) -> bool {
 		hop::collision<hop_scalar> col;
-		space->simulator->test_solid(col, query_solid.get(), zseg, other, margin);
+		space->simulator->test_solid(col, query_solid.get(), zseg, other, margin,
+			hop::intra_merge::deepest);
 		if (to_godot_float(col.time) >= 1.0f) return true;
 		if (!UtilityFunctions::is_instance_id_valid((int64_t)oid)) return true;
 		if (!get_collider_safe(oid)) return true;

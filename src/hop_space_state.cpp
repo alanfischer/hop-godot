@@ -489,7 +489,11 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 	if (p_closest_unsafe) *p_closest_unsafe = MIN(time_f + 0.001f, 1.0f);
 
 	if (time_f < 1.0f && p_info) {
-		p_info->point = to_godot(result.point);
+		// Where the swept shape TOUCHES, not where its centre ended up: col.impact is
+		// the contact point on the shape's surface. (The separation-ray branch above
+		// keeps result.point — a segment trace has no Minkowski expansion, so hop sets
+		// impact == point there and the two are the same thing.)
+		p_info->point = to_godot(result.impact);
 		p_info->normal = to_godot(result.normal);
 		p_info->shape = 0;
 		if (hit_area) {
@@ -604,9 +608,11 @@ bool HopDirectSpaceState::_collide_shape(const RID &p_shape_rid, const Transform
 	if (p_max_results <= 0) return false;
 
 	// Godot's contract: two Vector3 per contact — the point on the QUERIED shape
-	// first, then the point on the collider. hop reports the mover's reference point
-	// inside the target plus the separating (normal, depth), so the collider-side
-	// point is that point pushed out along the normal.
+	// first, then the point on the collider. col.impact is the contact point on the
+	// queried shape's own surface; the collider-side point is that pushed out along
+	// the normal by the penetration depth. (col.point is a different thing — the
+	// queried solid's reference point/centre at impact — and reporting it here put
+	// the "contact" a whole shape-radius away from any surface.)
 	Vector3 *out = static_cast<Vector3 *>(p_results);
 	int32_t count = 0;
 
@@ -614,7 +620,7 @@ bool HopDirectSpaceState::_collide_shape(const RID &p_shape_rid, const Transform
 		p_collide_with_bodies, p_collide_with_areas,
 		[&](const hop::collision<hop_scalar> &col, const RID &, uint64_t, HopBodyData *) -> bool {
 			if (out) {
-				Vector3 on_query = to_godot(col.point);
+				Vector3 on_query = to_godot(col.impact);
 				Vector3 n = to_godot(col.normal);
 				out[count * 2 + 0] = on_query;
 				out[count * 2 + 1] = on_query + n * to_godot_float(col.depth);
@@ -641,7 +647,14 @@ bool HopDirectSpaceState::_rest_info(const RID &p_shape_rid, const Transform3D &
 			best_depth = depth;
 			found = true;
 			if (p_rest_info) {
-				Vector3 on_query = to_godot(col.point);
+				// col.impact is the contact point on the QUERIED shape's surface (hop's
+				// "where it touches"); stepping it out along the normal by the penetration
+				// depth lands on the collider's surface, which is what Godot's contract
+				// asks for here. col.point is NOT that — it is the queried solid's
+				// reference point/centre at impact, so reporting it put the contact a
+				// shape-radius off the surface, inside the query hull and on the wrong
+				// side of the collider's face.
+				Vector3 on_query = to_godot(col.impact);
 				Vector3 n = to_godot(col.normal);
 				p_rest_info->point = on_query + n * depth;  // on the collider's surface
 				p_rest_info->normal = n;

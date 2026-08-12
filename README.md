@@ -57,9 +57,8 @@ no per-body setup, no scene changes.
 | Each collision body | `bsp_scale` (float) | Godot units per GoldSrc unit. **Required** — there is no default, because guessing it would silently trace the map at the wrong size. |
 | Each collision body | `bsp_blocking` (int, optional) | Bitmask over `-contents` of what stops a trace (`SOLID = -2` → bit 2). Defaults to `BLOCK_SOLID`. The sky body sets `CONTENTS_SKY` so sky blocks players on hulls 1–3 while staying passable on hull 0. |
 
-A body missing any of this — or a map imported before the feature existed — falls back to
-its normal trimesh/convex shapes, which is also exactly what default Godot physics does
-with the same scene. The metadata is purely additive.
+A body missing any of this falls back to its normal trimesh/convex shapes, which is also
+exactly what default Godot physics does with the same scene. The metadata is purely additive.
 
 The BSP tree itself is loaded once per map and shared (weakly, so unloading the map frees
 it) across every body on it; a carrier body's own shape geometry is released once the hull

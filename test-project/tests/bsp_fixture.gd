@@ -124,6 +124,31 @@ func _add_box_brush(mins: Vector3, maxs: Vector3, as_nodes: bool,
 	return base
 
 
+## A union of box brushes, built into all four hulls at once. Returns the four
+## headnodes, ready for _add_model.
+##
+## `brushes` is an array of {"mins": Vector3, "maxs": Vector3}, tested in order: the
+## tree reads "solid if inside the first, else the second, …, else empty". It is built
+## back to front so each brush can point its "outside" child at the next one.
+##
+## This exists to state the hull expansion ONCE. It is the line in this file easiest to
+## get wrong — the low bound grows by the hull's MAXS and the high bound shrinks by its
+## MINS, which reads backwards until you remember the hull box is swept around the
+## brush rather than added to it. Hull 0 falls out of the same loop for free, since its
+## box is a point and the arithmetic is a no-op there.
+func _add_expanded_union(brushes: Array) -> Array:
+	var headnodes := [0, 0, 0, 0]
+	for h in 4:
+		var hs: Dictionary = HULL_SIZES[h]
+		var outside := NO_OUTSIDE
+		for i in range(brushes.size() - 1, -1, -1):
+			var br: Dictionary = brushes[i]
+			outside = _add_box_brush(br["mins"] - hs["maxs"], br["maxs"] - hs["mins"],
+				h == 0, CONTENTS_SOLID, outside)
+		headnodes[h] = outside
+	return headnodes
+
+
 func _add_model(mins: Vector3, maxs: Vector3, headnodes: Array) -> void:
 	_f32(_models, mins.x); _f32(_models, mins.y); _f32(_models, mins.z)
 	_f32(_models, maxs.x); _f32(_models, maxs.y); _f32(_models, maxs.z)
@@ -168,17 +193,27 @@ static func wall_on_floor() -> PackedByteArray:
 	var wmins := Vector3(-4096, -4096, 72)
 	var wmaxs := Vector3(-8, 4096, 4096)
 
-	# Floor first, so the wall can point its "outside" children at it.
-	var f0: int = b._add_box_brush(fmins, fmaxs, true)
-	var headnodes := [b._add_box_brush(wmins, wmaxs, true, CONTENTS_SOLID, f0), 0, 0, 0]
-
-	for h in range(1, 4):
-		var hs: Dictionary = HULL_SIZES[h]
-		var ef: int = b._add_box_brush(fmins - hs["maxs"], fmaxs - hs["mins"], false)
-		headnodes[h] = b._add_box_brush(wmins - hs["maxs"], wmaxs - hs["mins"], false,
-			CONTENTS_SOLID, ef)
-
+	var headnodes := b._add_expanded_union([
+		{"mins": wmins, "maxs": wmaxs},   # the wall, falling through to
+		{"mins": fmins, "maxs": fmaxs},   # the floor
+	])
 	b._add_model(fmins, Vector3(fmaxs.x, fmaxs.y, wmaxs.z), headnodes)
+	return b.build()
+
+
+## A free-standing slab, reachable from BOTH sides, and nothing else.
+##
+## Every other fixture here is a wall a mover can only get at from one direction, which
+## is exactly the shape that hid the hull-offset bug for so long: a one-sided wall is
+## always wrong by the same amount, and looks like a deliberate standoff. The defect only
+## states itself as a difference between the two faces of the same slab.
+##
+## GoldSrc: solid x in [-8, +8], above z = 72.
+static func pillar() -> PackedByteArray:
+	var b = new()
+	var mins := Vector3(-8, -4096, 72)
+	var maxs := Vector3(8, 4096, 4096)
+	b._add_model(mins, maxs, b._add_expanded_union([{"mins": mins, "maxs": maxs}]))
 	return b.build()
 
 
@@ -200,19 +235,11 @@ static func corner_on_floor() -> PackedByteArray:
 	var ymins := Vector3(-4096, -4096, 72)
 	var ymaxs := Vector3(4096, -8, 4096)
 
-	# floor, then wall Y falling through to it, then wall X falling through to wall Y —
 	# "solid if in X, else if in Y, else if in the floor, else empty".
-	var f0: int = b._add_box_brush(fmins, fmaxs, true)
-	var y0: int = b._add_box_brush(ymins, ymaxs, true, CONTENTS_SOLID, f0)
-	var headnodes := [b._add_box_brush(xmins, xmaxs, true, CONTENTS_SOLID, y0), 0, 0, 0]
-
-	for h in range(1, 4):
-		var hs: Dictionary = HULL_SIZES[h]
-		var ef: int = b._add_box_brush(fmins - hs["maxs"], fmaxs - hs["mins"], false)
-		var ey: int = b._add_box_brush(ymins - hs["maxs"], ymaxs - hs["mins"], false,
-			CONTENTS_SOLID, ef)
-		headnodes[h] = b._add_box_brush(xmins - hs["maxs"], xmaxs - hs["mins"], false,
-			CONTENTS_SOLID, ey)
-
+	var headnodes := b._add_expanded_union([
+		{"mins": xmins, "maxs": xmaxs},
+		{"mins": ymins, "maxs": ymaxs},
+		{"mins": fmins, "maxs": fmaxs},
+	])
 	b._add_model(fmins, Vector3(fmaxs.x, fmaxs.y, xmaxs.z), headnodes)
 	return b.build()

@@ -25,8 +25,9 @@ extends RefCounted
 ##            here assert real invariants but are not pinned to a specific past bug.
 
 const BspFixture = preload("res://tests/bsp_fixture.gd")
+const BspScene = preload("res://tests/bsp_scene.gd")
 
-const S := 0.025      # a host engine's metres-per-GoldSrc-unit; matches WizardWars
+const S := BspScene.S
 const MARGIN := 0.01  # a typical CharacterBody3D safe_margin
 
 var _map: Node3D
@@ -36,11 +37,6 @@ var _tree: SceneTree
 
 func _init(tree: SceneTree) -> void:
 	_tree = tree
-
-
-## GoldSrc (x, y, z) -> Godot. Godot +x is GoldSrc -x; Godot y is GoldSrc z.
-static func gs(x: float, y: float, z: float) -> Vector3:
-	return Vector3(-x * S, z * S, y * S)
 
 
 func setup() -> void:
@@ -56,39 +52,12 @@ func swap_fixture(blob: PackedByteArray) -> void:
 
 
 func _build(blob: PackedByteArray) -> void:
-	# The blob lives once on an ancestor under "bsp_data"; each carrier body carries the
-	# model index and the scale. Scale has no default on purpose — a missing one means
-	# the two sides disagree about the map's units.
-	_map = Node3D.new()
-	_map.set_meta("bsp_data", blob)
-	_tree.get_root().add_child(_map)
-
-	var world := StaticBody3D.new()
-	world.collision_layer = 1
-	world.set_meta("bsp_model", 0)
-	world.set_meta("bsp_scale", S)
-	# A carrier still needs one enabled shape: the hull stands in for it, but a body with
-	# no enabled shape is intangible by design (that is how a door goes non-solid).
-	var cs := CollisionShape3D.new()
-	var box := BoxShape3D.new()
-	box.size = Vector3(8, 8, 8)
-	cs.shape = box
-	world.add_child(cs)
-	_map.add_child(world)
-
+	_map = BspScene.make_map(_tree, blob)
 	# A standing player: 32x32x72 GoldSrc, feet-origin, which selects hull 1.
-	_mover = CharacterBody3D.new()
-	_mover.collision_layer = 0
-	_mover.collision_mask = 1
-	_mover.safe_margin = MARGIN
-	var mcs := CollisionShape3D.new()
 	var cap := CapsuleShape3D.new()
 	cap.radius = 16 * S
 	cap.height = 72 * S
-	mcs.shape = cap
-	mcs.position = Vector3(0, 36 * S, 0)
-	_mover.add_child(mcs)
-	_map.add_child(_mover)
+	_mover = BspScene.add_mover(_map, cap, Vector3(0, 36 * S, 0), MARGIN)
 
 
 func teardown() -> void:
@@ -102,22 +71,7 @@ func teardown() -> void:
 ## `travel_gs` comes back in GoldSrc units so assertions read in the same numbers the
 ## geometry is stated in.
 func probe(feet: Vector3, motion: Vector3) -> Dictionary:
-	var xform := Transform3D(Basis.IDENTITY, gs(feet.x, feet.y, feet.z))
-	_mover.global_transform = xform
-	var p := PhysicsTestMotionParameters3D.new()
-	p.from = xform
-	p.motion = gs(motion.x, motion.y, motion.z)
-	p.margin = MARGIN
-	p.recovery_as_collision = true
-	p.max_collisions = 4
-	var r := PhysicsTestMotionResult3D.new()
-	PhysicsServer3D.body_test_motion(_mover.get_rid(), p, r)
-	var t := r.get_travel()
-	return {
-		"unsafe": r.get_collision_unsafe_fraction(),
-		"travel_gs": Vector3(-t.x / S, t.z / S, t.y / S),
-		"contacts": r.get_collision_count(),
-	}
+	return BspScene.probe(_mover, feet, motion, MARGIN, 4)
 
 
 # The fixture in GoldSrc units, and the two numbers every pose below is stated against.

@@ -8,6 +8,7 @@ extends SceneTree
 
 const SUITES := [
 	preload("res://tests/test_bsp_body_test_motion.gd"),
+	preload("res://tests/test_bsp_projectile.gd"),
 ]
 
 var _pass := 0
@@ -26,10 +27,6 @@ func gt(a: float, b: float, ctx := "") -> void:
 
 func near(a: float, b: float, tol: float, ctx := "") -> void:
 	_check(absf(a - b) <= tol, "%s ≈ %s (±%s)" % [a, b, tol], ctx)
-
-
-func eq(a, b, ctx := "") -> void:
-	_check(a == b, "%s == %s" % [a, b], ctx)
 
 
 func _check(ok: bool, what: String, ctx: String) -> void:

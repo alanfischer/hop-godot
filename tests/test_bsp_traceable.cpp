@@ -85,8 +85,14 @@ static int add_box_planes(BlobBuilder &b, const double mins[3], const double max
 // plane lands in SOLID; stepping outside any one of them lands in EMPTY.
 //
 // Leaf convention (matching a real BSP): leaf 0 is the solid leaf.
-static void add_box_brush(BlobBuilder &b, const double mins[3], const double maxs[3],
-                          bool as_nodes, int contents = CONTENTS_SOLID) {
+//
+// `outside` overrides where "not in this box" goes, so brushes can be chained into a
+// union: give brush A the root of brush B and the tree reads "solid if inside A, else
+// test B" — which is what lets a fixture have a leaf bounded by another brush's face.
+// Returns the root node/clipnode index of the brush just added.
+static int add_box_brush(BlobBuilder &b, const double mins[3], const double maxs[3],
+                         bool as_nodes, int contents = CONTENTS_SOLID,
+                         int outside = 1) {  // 1 = "use the default empty child"
 	const int p0 = add_box_planes(b, mins, maxs);
 	const int base = as_nodes ? (int)b.nodes.size() : (int)b.clipnodes.size();
 
@@ -98,7 +104,7 @@ static void add_box_brush(BlobBuilder &b, const double mins[3], const double max
 	}
 	// hull 0 addresses leafs as -(leaf+1); hulls 1..3 store the contents directly.
 	const int SOLID_CHILD = as_nodes ? -1 : contents;
-	const int EMPTY_CHILD = as_nodes ? -2 : CONTENTS_EMPTY;
+	const int EMPTY_CHILD = outside != 1 ? outside : (as_nodes ? -2 : CONTENTS_EMPTY);
 
 	for (int i = 0; i < 6; ++i) {
 		const bool upper = (i % 2) == 1;
@@ -120,6 +126,7 @@ static void add_box_brush(BlobBuilder &b, const double mins[3], const double max
 			b.clipnodes.push_back(n);
 		}
 	}
+	return base;
 }
 
 // One model whose hull 0 is a box brush and whose hulls 1..3 are that same brush
@@ -141,6 +148,48 @@ static std::vector<uint8_t> make_box_map(const double mins[3], const double maxs
 		}
 		m.headnode[h] = (int32_t)b.clipnodes.size();
 		add_box_brush(b, emins, emaxs, /*as_nodes=*/false, contents);
+	}
+	b.models.push_back(m);
+	return b.build();
+}
+
+// A floor with a wall standing on it, as a union of two brushes, sized so that in
+// hull 1 the wall's solid begins exactly where the floor's ends (z = 36 — the floor
+// top at 0, raised by the hull's 36-unit half-height).
+//
+// That seam is not contrived: it is where every standing player's trace point lives.
+// A hull-1 mover is traced as the point at feet + 36, so a player resting on a floor
+// sits EXACTLY on that floor's expanded top plane, and if they are pushed into a wall
+// rising off that floor, the leaf they land in is bounded by that plane at distance
+// zero. ww_golem's cockpit is this shape (deck at z=-112, seam at -76).
+static std::vector<uint8_t> make_wall_on_floor_map() {
+	// Floor: everything below z = 0. Wall: everything at x <= -8 above z = 72.
+	// Expanded for hull h the floor tops out at -HULL.mins.z and the wall starts at
+	// 72 - -HULL.mins.z, which meet for hull 1 (36) — the case under test. For the
+	// other hulls they simply overlap, which is just as solid.
+	const double fmins[3] = { -4096, -4096, -4096 }, fmaxs[3] = { 4096, 4096, 0 };
+	const double wmins[3] = { -4096, -4096, 72 }, wmaxs[3] = { -8, 4096, 4096 };
+
+	BlobBuilder b;
+	BSPModel m {};
+	for (int i = 0; i < 3; ++i) { m.mins[i] = (float)fmins[i]; m.maxs[i] = (float)wmaxs[i]; }
+	m.maxs[0] = (float)fmaxs[0];
+	m.maxs[1] = (float)fmaxs[1];
+
+	// Floor first so the wall can point its "outside" children at it.
+	const int f0 = add_box_brush(b, fmins, fmaxs, /*as_nodes=*/true);
+	m.headnode[0] = add_box_brush(b, wmins, wmaxs, /*as_nodes=*/true, CONTENTS_SOLID, f0);
+
+	for (int h = 1; h < 4; ++h) {
+		double efmins[3], efmaxs[3], ewmins[3], ewmaxs[3];
+		for (int i = 0; i < 3; ++i) {
+			efmins[i] = fmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
+			efmaxs[i] = fmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
+			ewmins[i] = wmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
+			ewmaxs[i] = wmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
+		}
+		const int ef = add_box_brush(b, efmins, efmaxs, /*as_nodes=*/false);
+		m.headnode[h] = add_box_brush(b, ewmins, ewmaxs, /*as_nodes=*/false, CONTENTS_SOLID, ef);
 	}
 	b.models.push_back(m);
 	return b.build();
@@ -442,25 +491,174 @@ static void test_solid_starting_stuck_reports_overlap() {
 	// inside the floor then sweeps freely downward under gravity, sinking further
 	// every frame until it drops out of the world. That is exactly what dropped
 	// bots through ww_2fort's ramps to y=-103.
+	//
+	// Depth is measured against the hull shrunk by STUCK_SLOP, so the reported
+	// penetration is the real 0.1 less that band — the mover is deliberately left a
+	// hair inside rather than resolved to exactly zero overlap. That is the point of
+	// the band, and the recovery adds a margin-sized skin on top anyway, so nothing
+	// ends up embedded. Anything shallower than the band is not called stuck at all.
+	const double slop = hopbsp::STUCK_SLOP;
+	//
+	// A swept query from inside solid is answered by stepping off the surface and
+	// sweeping from there, so it comes back as an ordinary surface hit at ~zero
+	// distance rather than as an overlap: the mover is stopped by the floor, which is
+	// the property that matters. (It must not come back CLEAR — that is the bug this
+	// test guards.) The overlap itself is the zero-direction query's job, below, and
+	// that is the call the recovery step actually makes.
 	hop::collision<T> swept = sweep(*t, s, vec(0, 0.8975, 0), vec(0, -4, 0));  // 0.1 GoldSrc units low
-	assert(swept.time == 0.0);
+	assert(swept.time < 0.01 && "a sweep from inside solid must not report a clear path");
 	assert(approx_v(swept.normal, 0, 1, 0));
-	assert(approx(swept.depth / SCALE, 0.1, 0.01));
 
 	// The zero-direction query reports the same thing: push straight up, by
-	// exactly the 0.1 units it is buried.
+	// the 0.1 units it is buried less the slop band.
 	hop::collision<T> rec = sweep(*t, s, vec(0, 0.8975, 0), vec(0, 0, 0));
 	assert(rec.time == 0.0);
 	assert(approx_v(rec.normal, 0, 1, 0));
-	assert(approx(rec.depth / SCALE, 0.1, 0.01));  // in GoldSrc units
+	assert(approx(rec.depth / SCALE, 0.1 - slop, 0.005));  // in GoldSrc units
+
+	// A mover resting exactly ON the surface is not stuck, and neither is one within
+	// the slop band. This is the case that matters most in play: a standing player
+	// traces as the point at feet+36, which IS the floor's expanded top plane.
+	hop::collision<T> resting = sweep(*t, s, vec(0, 0.9, 0), vec(0, 0, 0));
+	assert(resting.depth == 0.0 && "a mover resting on a floor must not read as stuck");
 	printf("  solid_starting_stuck_reports_overlap ok\n");
 }
 
-// Depenetration must nudge, never launch. hull_push_out reports the nearest plane
-// of the LEAF a point landed in, and a leaf can be enormous, so a body placed deep
-// inside solid would be ejected metres in one query — with hop iterating recovery
-// on top. That is reachable in practice wherever the clip hull disagrees with the
-// render geometry, i.e. any CLIP brush, since those exist only in hulls 1..3.
+// Depenetration must nudge, never launch. A body buried deeper than its own size has
+// no escape within reach, so hull_push_out falls back to the nearest plane of the
+// LEAF it landed in — and a leaf can be enormous, so without a cap the body would be
+// ejected metres in one query, with hop iterating recovery on top. Being buried is
+// reachable in practice wherever the clip hull disagrees with the render geometry,
+// i.e. any CLIP brush, since those exist only in hulls 1..3.
+// A mover flush against a wall — the pose depenetration always leaves it in — must
+// still be stopped by that wall.
+//
+// The hull walk calls a start exactly ON a plane solid and gives up, reporting no
+// surface at all, which reads as "nothing in the way" and hands back the whole step.
+// It is not an exotic pose: recovery pushes a body out of a wall to precisely its
+// face, so the very next sweep that tick is taken from there. On ww_golem that let a
+// rider in the cockpit corner walk out through 15 cm of wall, one step per tick.
+// A hull a hair INSIDE the floor it stands on must still be stopped by a wall.
+//
+// This is the ordinary state of standing on a moving platform: the deck bobs, and for
+// a tick the mover is a fraction of a unit below the surface it is resting on. If a
+// start inside the floor lets the horizontal sweep report a clear path, the mover
+// walks straight through whatever is beside it — and 0.07 GoldSrc units is under two
+// millimetres, which is noise, not a pose anyone can avoid.
+//
+// Measured on ww_golem: a rider whose feet were 0.07 units into the cockpit deck swept
+// the full 8 units backwards through a rear wall standing 2.6 units behind them.
+static void test_sunk_into_the_floor_still_hits_the_wall() {
+	auto t = load(make_wall_on_floor_map());
+	auto s = make_box_solid(0.4, 0.9, 0.4);
+	// Resting height is Godot y = 0.9 (the box centre IS the hull-1 trace point, and
+	// the floor's expanded top is GoldSrc z = 36). Drop it 0.07 units below that.
+	const T sunk = (T)(0.9 - 0.07 * SCALE);
+	// Start 12 GoldSrc units clear of the wall face (GoldSrc x = 8) and drive into it.
+	// Godot +x is GoldSrc -x, so the wall is 12 units along a 16-unit sweep.
+	hop::collision<T> c = sweep(*t, s, vec((T)(-20 * SCALE), sunk, (T)0),
+	                            vec((T)(16 * SCALE), 0, 0));
+	// The trace must not hand back a clear path. It answers with the floor it is in
+	// rather than the wall ahead — that is this layer's contract, and _body_test_motion
+	// is what turns it into a fraction — but "you are inside something" and "the way is
+	// clear" must never be the same answer.
+	assert(c.time < 0.01 && "a mover sunk into the floor must not get a clear sweep");
+	assert(c.depth > T {} && "being inside the floor must be reported as an overlap");
+}
+
+static void test_flush_against_a_wall_is_still_blocked() {
+	auto t = load(make_wall_on_floor_map());
+	auto s = make_box_solid(0.4, 0.9, 0.4);
+	// In hull 1 the wall's solid is GoldSrc x <= 8 (its face at -8 expanded by the
+	// hull's 16). Sit half of STUCK_SLOP inside it: the stuck test measures against a
+	// hull shrunk by that band, so this is a pose it calls free and a pose a push-out
+	// is content to leave a body in — while the sweep, which uses no such band, still
+	// begins in solid. Godot +x is GoldSrc -x, so +x drives into the wall, -x leaves.
+	const V flush = vec((T)(-(8 - hopbsp::STUCK_SLOP * 0.5) * SCALE), (T)1.5, (T)0);
+
+	hop::collision<T> into = sweep(*t, s, flush, vec((T)0.15, 0, 0));
+	assert(into.time < 0.01 && "a mover flush on a wall face must be stopped by that wall");
+	assert(approx_v(into.normal, -1, 0, 0));
+
+	// The same pose moving AWAY is free — the fix must block the wall, not pin the
+	// body to it. Backing the start off along the motion puts it inside the solid it
+	// is leaving, the walk gives up again, and the move stays clear.
+	hop::collision<T> away = sweep(*t, s, flush, vec((T)-0.15, 0, 0));
+	assert(away.time > 0.99 && "a mover flush on a wall must stay free to leave it");
+}
+
+// Sliding DOWN a wall face, a mover must still land on the floor that wall stands on.
+//
+// The seam reached sideways. Where the wall face meets the floor the two expanded solids
+// share a corner point, and contents being a strict d < 0 puts a mover arriving exactly
+// there inside NEITHER. The resting-gap invariant only lifts along gravity, so it does
+// not cover this approach — the traceable itself has to report the floor.
+static void test_sliding_down_a_wall_face_still_lands_on_the_floor() {
+	auto t = load(make_wall_on_floor_map());
+	auto s = make_box_solid(0.4, 0.9, 0.4);
+	// Flush on the wall face (the pose a slide leaves a body in), well above the floor,
+	// sweeping straight down past the floor's expanded top at Godot y = 0.9.
+	const V flush = vec((T)(-8 * SCALE), (T)1.5, (T)0);
+	hop::collision<T> down = sweep(*t, s, flush, vec((T)0, (T)-1.2, (T)0));
+	assert(down.time < (T)0.99 && "a mover sliding down a wall must not fall through the floor");
+	assert(down.normal.y > (T)0.5 && "the surface that stops it must be the floor");
+
+	// The same, half a slop band inside the wall — the pose a push-out is content to
+	// leave a body in, and the one a real slide actually produces.
+	const V inside = vec((T)(-(8 - hopbsp::STUCK_SLOP * 0.5) * SCALE), (T)1.5, (T)0);
+	hop::collision<T> in_down = sweep(*t, s, inside, vec((T)0, (T)-1.2, (T)0));
+	assert(in_down.time < (T)0.99 &&
+	       "a mover a hair inside a wall must still be stopped by the floor below it");
+
+	// The motion a falling rider actually has: diagonal, driving into the wall while
+	// dropping past the floor. Down and sideways are both answered correctly on their
+	// own; the composite must not be assumed to follow from them.
+	const V clear_of_face = vec((T)(-8.4 * SCALE), (T)(0.9 + 2 * SCALE), (T)0);
+	hop::collision<T> diag = sweep(*t, s, clear_of_face,
+	                               vec((T)(1.99 * SCALE), (T)(-4.49 * SCALE), (T)0));
+	assert(diag.time < (T)0.99 &&
+	       "a mover driving into a wall while falling must still be stopped");
+}
+
+// A mover a HAIR inside a wall face must still be reported as inside it.
+//
+// Three hundredths of a unit is under the DIST_EPSILON a trace backs its endpoints off
+// by, so it is where traces naturally leave a body, not an unusual pose. Read as clear,
+// recovery has nothing to push out of and the next sweep begins inside solid unnoticed.
+static void test_a_hair_inside_a_wall_is_still_inside_it() {
+	auto t = load(make_wall_on_floor_map());
+	auto s = make_box_solid(0.4, 0.9, 0.4);
+	// The wall's expanded solid is GoldSrc x <= 8; sit 0.03 units inside it. Godot +x
+	// is GoldSrc -x, so a more negative Godot x is a larger GoldSrc x.
+	const V hair = vec((T)(-(8 - 0.03) * SCALE), (T)1.5, (T)0);
+
+	hop::collision<T> still = sweep(*t, s, hair, vec((T)0, (T)0, (T)0));
+	assert(still.depth > T {} && "a mover 0.03 units into a wall must report an overlap");
+	assert(still.normal.x < (T)-0.5 && "and the way out must point out of that wall");
+
+	// And the consequence: falling from that pose must still be stopped.
+	hop::collision<T> fall = sweep(*t, s, hair, vec((T)0, (T)-1.2, (T)0));
+	assert(fall.time < (T)0.99 &&
+	       "a mover a hair inside a wall must not fall straight through the floor");
+}
+
+// Already buried in a wall, a mover must not be free to travel deeper into it.
+//
+// Sweeping from inside solid finds no entry plane — the next surface along the path
+// is the wall's FAR face — so an unguarded trace reports a clear path all the way
+// through and out the other side. Measured on ww_golem: a rider 0.1 units into the
+// cockpit's side wall was handed the full step and came out the back of it.
+static void test_inside_a_wall_cannot_travel_deeper() {
+	auto t = load(make_wall_on_floor_map());
+	auto s = make_box_solid(0.4, 0.9, 0.4);
+	// One GoldSrc unit past the face, i.e. inside the wall.
+	const V buried = vec((T)(-7 * SCALE), (T)1.5, (T)0);
+
+	hop::collision<T> deeper = sweep(*t, s, buried, vec((T)0.15, 0, 0));
+	assert(deeper.time < 0.01 && "a buried mover must not sweep freely deeper into the solid");
+	assert(deeper.depth > T {} && "being inside solid must be reported as an overlap");
+}
+
 static void test_deep_overlap_is_nudged_not_launched() {
 	// A thick slab: 512 units deep, so its interior leaf is far from any face.
 	const double mins[3] = { -512, -512, -512 };
@@ -479,6 +677,40 @@ static void test_deep_overlap_is_nudged_not_launched() {
 	assert(c.depth <= hull_height_m + 1e-6 && "one recovery step must not teleport the body");
 	assert(c.depth < 5.0 && "the raw leaf-plane distance would be metres");
 	printf("  deep_overlap_is_nudged_not_launched ok\n");
+}
+
+// Depenetration must aim somewhere that actually leaves the solid. The nearest plane
+// bounding a mover's LEAF is not that: the compiler cuts a solid region into many
+// convex cells, so most of a leaf's faces open onto the next cell of the same brush.
+//
+// The case that bites is a player standing on a floor and squeezed into a wall rising
+// off it — a moving brush entity sweeping into them will do it. Their trace point sits
+// exactly on the floor's expanded top plane, so that plane wins at distance ZERO over
+// the wall face they actually came through, and the push-out comes back pointing into
+// the floor they are standing on, with no depth. Nothing then ejects them; worse,
+// _body_test_motion reads the vertical normal as "flush, not moving into it" and hands
+// back the whole motion, so the player simply walks out through the wall. That is the
+// golem cockpit bug: riders shot out of the back of ww_golem while it walked.
+static void test_push_out_picks_a_direction_that_exits() {
+	auto t = load(make_wall_on_floor_map());
+	auto s = make_box_solid(0.4, 0.9, 0.4);  // 32x32x72, centre origin → hull 1, no offset
+
+	// Trace point at GoldSrc (-20, 0, 36): 28 units inside the wall's expanded face
+	// (x = 8) and exactly ON the floor's expanded top (z = 36). Godot (0.5, 0.9, 0).
+	hop::collision<T> c = sweep(*t, s, vec(0.5, 0.9, 0.0), vec(0, 0, 0));
+	assert(c.time == 0.0 && "a point inside solid must report an overlap");
+	// The nearest leaf face is the seam, at distance 0, pushing DOWN into the floor —
+	// the answer that used to come back, and a dead end. The only way out is sideways.
+	assert(approx_v(c.normal, -1, 0, 0) && "push-out must aim out of the wall, not into the floor");
+	assert(approx(c.depth / SCALE, 28.0, 0.1));
+
+	// Control: the same penetration higher up the wall, where the nearest face was
+	// already the right one. Unchanged, and the seam costs nothing when it isn't near.
+	hop::collision<T> high = sweep(*t, s, vec(0.5, 5.0, 0.0), vec(0, 0, 0));
+	assert(high.time == 0.0);
+	assert(approx_v(high.normal, -1, 0, 0));
+	assert(approx(high.depth / SCALE, 28.0, 0.1));
+	printf("  push_out_picks_a_direction_that_exits ok\n");
 }
 
 // --- contents filtering ---------------------------------------------------
@@ -593,7 +825,13 @@ int main() {
 	test_solid_overlap_pushes_out();
 	test_solid_margin_finds_resting_contact();
 	test_solid_starting_stuck_reports_overlap();
+	test_sunk_into_the_floor_still_hits_the_wall();
+	test_flush_against_a_wall_is_still_blocked();
+	test_sliding_down_a_wall_face_still_lands_on_the_floor();
+	test_a_hair_inside_a_wall_is_still_inside_it();
+	test_inside_a_wall_cannot_travel_deeper();
 	test_deep_overlap_is_nudged_not_launched();
+	test_push_out_picks_a_direction_that_exits();
 	test_sky_is_passable_but_maskable();
 	test_float_instantiation();
 	printf("all bsp traceable tests passed\n");

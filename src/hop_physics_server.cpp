@@ -1241,15 +1241,59 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		body->hop_solid->set_orientation(from_orient);
 
 	float margin = std::max(p_margin, 0.0f);
-	// How far past a contact surface we shove the body during recovery: enough to
-	// re-establish the margin gap, but small enough not to pop through thin walls.
-	float skin = margin > 1e-4f ? margin : 1e-3f;
+	// The resting gap: never leave a mover EXACTLY on a surface.
+	//
+	// Contents is a strict d < 0, so a point on a plane is inside neither solid that
+	// plane bounds. A wall standing on a floor shares one plane once both are expanded
+	// for a hull, so a mover resting there is in neither and sweeps through the wall.
+	// GoldSrc avoids this by keeping every trace crosspoint DIST_EPSILON off its plane;
+	// this restores the invariant for positions that did not come from a trace endpoint
+	// (a carry, a snap, a teleport).
+	float touch_eps = std::max(margin * 0.1f, 1e-4f);
 
 	// --- (1) Recovery: iteratively push out of any static overlap ---
+	//
+	// Each iteration resolves the deepest overlap and re-probes, so successive passes
+	// walk the surfaces a body is wedged between one at a time: for a rider jammed into
+	// the corner where ww_golem's cockpit deck meets its rear wall, pass one is the wall
+	// and pass two is the deck. That sequence is a contact MANIFOLD, and the only thing
+	// missing was that we threw it away — the old code kept the LAST pass's normal beside
+	// the MAX pass's depth and reported the pair as one contact. Those come from
+	// different surfaces: that rider was reported as the wall's normal carrying the
+	// deck's 6-unit depth, a contact belonging to neither.
+	//
+	// So keep two matched (normal, depth, body) pairs instead, split by whether the
+	// surface supports the body against gravity. Callers ask genuinely independent
+	// questions of them — "am I standing on something?" and "is something pressing into
+	// me?" — and in a corner both answers are yes. Collapsing to one contact forced a
+	// caller to pick, and which surface it happened to get depended on which BSP hull the
+	// body's size selected, so a standing player and a ducked one in the same spot
+	// classified the same corner differently.
 	Vector3 recover;
-	Vector3 recover_normal;
 	float recover_depth = 0.0f;
-	HopBodyData *recover_body = nullptr;  // the body we depenetrated from (for its contact velocity)
+
+	// Blocking contacts are kept as a SET, not a single winner. Each recovery iteration
+	// resolves one surface and re-probes, so a body wedged in a corner yields one wall
+	// per pass, and a caller cannot reconstruct contacts it never received — a pusher
+	// handed only the side wall never learns that the rear wall is the one advancing.
+	// Godot asks for max_collisions contacts for exactly this reason.
+	static const int MAX_BLOCK_CONTACTS = 4;
+	Vector3 block_normal[MAX_BLOCK_CONTACTS], block_pos[MAX_BLOCK_CONTACTS];
+	float block_depth[MAX_BLOCK_CONTACTS] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	HopBodyData *block_body[MAX_BLOCK_CONTACTS] = { nullptr, nullptr, nullptr, nullptr };
+	int block_count = 0;
+
+	Vector3 support_normal, support_pos;
+	float support_depth = 0.0f;
+	HopBodyData *support_body = nullptr;
+
+	// Which way is "held up against gravity". Matches the ground probe below, and the
+	// 0.7 threshold is the same one CharacterBody3D's default floor angle lands on, so
+	// hop's split agrees with how the caller will classify the contact anyway.
+	Vector3 gvec = to_godot(space->simulator->get_gravity());
+	float glen = gvec.length();
+	Vector3 up_dir = glen > 0.0f ? -gvec / glen : Vector3(0, 1, 0);
+
 	const int MAX_RECOVER_ITERS = 4;
 	for (int i = 0; i < MAX_RECOVER_ITERS; ++i) {
 		Vector3 test_pos = p_from.origin + recover;
@@ -1264,14 +1308,89 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		// time >= 1 means no static overlap at this position.
 		if (to_godot_float(overlap.time) > 0.0f) break;
 
+		// `overlap.depth` is EXACT — no margin baked in. The public trace_solid query
+		// passes margin 0 down both of the simulator's paths, and this server never
+		// propagates a shape's own margin into hop; only the simulator's internal
+		// discovery pass inflates, and none of it runs here.
+		//
+		// Reading it as margin-inflated (`depth - margin`) declared anything less than a
+		// margin deep to be clear, so a body something was pushing into settled at
+		// exactly one margin inside — and one margin inside a wall standing on a floor
+		// is past the floor's edge. Do not push a body that has nothing to depenetrate,
+		// and clear the surface by a hair rather than a whole margin when it does; a
+		// margin of overshoot is what used to ping-pong a body between opposing faces.
 		float depth = to_godot_float(overlap.depth);
 		Vector3 n = to_godot(overlap.normal);
-		if (depth <= 0.0f || n == Vector3()) break; // touching, but not penetrating
+		if (n == Vector3()) break;
+		if (depth <= touch_eps) {
+			// Touching, not embedded: nothing to depenetrate, but it must not be left
+			// exactly ON the plane either (see `touch_eps`).
+			//
+			// `depth + touch_eps`, same as the deep case below — NOT `touch_eps - depth`.
+			// depth is how far IN we are, so clearing by a hair means travelling the
+			// penetration plus the hair; subtracting undershoots by twice the depth and
+			// collapses to nothing as depth approaches touch_eps, leaving the body inside
+			// the DIST_EPSILON band where the hull walk can resolve nothing.
+			//
+			// Then KEEP GOING: a touching contact says nothing about the other surfaces
+			// the body is in, and which one this query reports first is arbitrary.
+			// Breaking here made recovery a coin flip on report order. It still
+			// terminates — the next probe no longer overlaps the surface just cleared.
+			if (depth >= 0.0f) recover += n * (depth + touch_eps);
+			continue;
+		}
 
-		recover += n * (depth + skin);
-		recover_normal = n;
-		recover_body = body_of(overlap.collider, overlap.collidee, body->hop_solid.get());
+		HopBodyData *other = body_of(overlap.collider, overlap.collidee, body->hop_solid.get());
+		if (n.dot(up_dir) > 0.7f) {
+			if (depth > support_depth) {
+				support_depth = depth;
+				support_normal = n;
+				support_pos = test_pos;
+				support_body = other;
+			}
+		} else {
+			// Same surface seen again on a later pass: keep the deeper reading rather
+			// than adding a duplicate. Anything else is a distinct surface.
+			int slot = -1;
+			for (int j = 0; j < block_count; ++j) {
+				if (n.dot(block_normal[j]) > 0.99f) { slot = j; break; }
+			}
+			if (slot < 0 && block_count < MAX_BLOCK_CONTACTS) slot = block_count++;
+			if (slot >= 0 && depth > block_depth[slot]) {
+				block_depth[slot] = depth;
+				block_normal[slot] = n;
+				block_pos[slot] = test_pos;
+				block_body[slot] = other;
+			}
+		}
+
+		// Depth plus the resting hair, not plus a margin — see above.
+		recover += n * (depth + touch_eps);
 		if (depth > recover_depth) recover_depth = depth;
+	}
+
+	// Enforce the resting gap (see `touch_eps`). Recovery cannot: it reports only REAL
+	// penetration, and a mover exactly on a plane is not penetrating anything.
+	//
+	// A short sweep along gravity answers it — a mover with any gap stops partway, one
+	// ON the surface stops at fraction zero. Only when recovery found nothing; a mover
+	// already being pushed out does not need a nudge as well.
+	if (recover == Vector3() && touch_eps > 0.0f && glen > 0.0f) {
+		const Vector3 down = gvec / glen;
+		// A full margin, not a hair: a start exactly on a plane is answered by backing
+		// off and re-sweeping, so a hair-long probe backs off further than it travels
+		// and reports the floor underfoot as absent.
+		const float rest_len = std::max(margin, touch_eps * 4.0f);
+		body->hop_solid->set_position(to_hop(p_from.origin));
+		hop::segment<hop_scalar> rest;
+		rest.set_start_end(to_hop(p_from.origin), to_hop(p_from.origin + down * rest_len));
+		hop::collision<hop_scalar> touch;
+		space->simulator->trace_solid(touch, body->hop_solid.get(), rest, body->collision_mask);
+		const float gap = std::min(to_godot_float(touch.time), 1.0f) * rest_len;
+		if (gap < touch_eps) {
+			const Vector3 tn = to_godot(touch.normal);
+			recover += (tn != Vector3() ? tn : -down) * (touch_eps - gap);
+		}
 	}
 
 	Vector3 from_pos = p_from.origin + recover;
@@ -1323,15 +1442,33 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	Vector3 ground_normal;
 	HopBodyData *ground_body = nullptr;  // the floor body (for moving-platform carry velocity)
 	if (p_recovery_as_collision) {
-		Vector3 gvec = to_godot(space->simulator->get_gravity());
-		float glen = gvec.length();
-		if (glen > 0.0f && p_motion.dot(gvec / glen) >= -1e-4f) {
+		if (glen > 0.0f) {
 			Vector3 down = gvec / glen;
 			// Cover the `margin` resting gap (step 3) with slack for numerics.
 			float probe_dist = std::max(margin * 2.0f, 0.02f);
-			body->hop_solid->set_position(to_hop(from_pos));
+
+			// Probe from where the motion ENDS, not from where it starts, and do it
+			// whichever way the motion points.
+			//
+			// This used to skip the probe entirely whenever the motion had any upward
+			// component, so that a jump would read as airborne on its first tick. But
+			// the sign of the motion cannot tell a jump from a rider being carried
+			// UPWARD by the floor they are standing on. ww_golem rises as it strides,
+			// so its riders' carry is up-and-forward — and hop called them airborne for
+			// it. The game gates the ride on being grounded, so the carry then stopped,
+			// and the golem walked out from under a rider frozen in place: two ticks of
+			// that put them behind the cockpit's rear wall and out of the golem.
+			//
+			// Ending position is the honest discriminator and needs no special cases. A
+			// jump clears the resting gap many times over in one tick and finds nothing
+			// below it. A rider lifted a fraction of that stays inside the gap of a
+			// floor that rose with them. A blocked upward move never leaves, so the
+			// swept fraction keeps the probe where the body really is.
+			const float swept = std::min(to_godot_float(result.time), 1.0f);
+			const Vector3 gfrom = from_pos + p_motion * swept;
+			body->hop_solid->set_position(to_hop(gfrom));
 			hop::segment<hop_scalar> gseg;
-			gseg.set_start_end(to_hop(from_pos), to_hop(from_pos + down * probe_dist));
+			gseg.set_start_end(to_hop(gfrom), to_hop(gfrom + down * probe_dist));
 			space->simulator->set_average_normals(false);
 			hop::collision<hop_scalar> gres;
 			space->simulator->trace_solid(gres, body->hop_solid.get(), gseg, body->collision_mask);
@@ -1359,35 +1496,99 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	float unsafe = motion_len > 1e-6f ? std::min(hit_dist / motion_len, 1.0f)
 	                                  : (probe_time < 1.0f ? 0.0f : 1.0f);
 
-	// A t==0 swept contact (the body is already flush — within the speculative
-	// margin of a surface) must not starve a move the body isn't really driving
-	// into. Depenetration is handled separately by the recovery step above. Two
-	// cases get freed (probe_time/unsafe forced to "no swept hit"):
+	// A t==0 swept contact means the body is already flush — within the speculative
+	// margin of a surface — or inside one. Either way the swept fraction is 0 and, taken
+	// at face value, every move the body makes is starved, including the ones the surface
+	// has nothing to do with. Depenetration is handled separately by the recovery step
+	// above; this clause is about what the body is allowed to MOVE.
 	//
-	//  1. WALKABLE surface (normal within 45° of up): the floor/ramp you stand on.
-	//     It must never block horizontal motion — but a walk carries a small
-	//     downward gravity sliver, so mdir·n is slightly negative and a pure
-	//     moving-into test wrongly classifies the floor as an obstruction, zeroing
-	//     the safe fraction every tick the capsule settles within the (8mm) spec
-	//     band of the floor. That is the "random stuck on flat floor" bug.
-	//  2. WALL the body is only flush against, not moving into (tangential or
-	//     separating) — so it can slide along a wall instead of sticking in the
-	//     spec band (recovery, measured against the bare radius, never pushes it
-	//     out of that band).
+	// Do NOT infer the answer from the contact's normal. "This contact does not block
+	// me" is not "nothing blocks me": the trace stops at the FIRST t==0 overlap and
+	// discards every other hit for being no nearer, so the surface the motion actually
+	// drives into may never have been looked at. Instead make the question answerable —
+	// a sweep that BEGINS inside solid cannot answer, so step the start out first.
 	//
-	// Genuine into-a-wall motion (low n.y, mdir·n < 0) still blocks normally.
+	// The speculative margin is saved and cleared below for safety only; it is not what
+	// does the work. The public trace_solid query passes margin 0 by contract (manager.h
+	// — the band applies to the simulator's own discovery pass, not to queries), so
+	// there is no band here to switch off.
 	if (probe_time <= 1e-4f && motion_len > 1e-6f) {
-		Vector3 n = to_godot(result.normal);
-		Vector3 up(0.0f, 1.0f, 0.0f);
-		Vector3 g = to_godot(space->simulator->get_gravity());
-		if (g.length() > 1e-6f) up = -g.normalized();
-		bool walkable = n.dot(up) >= 0.707f;             // floor/ramp — never blocks the walk
-		bool not_into = (p_motion / motion_len).dot(n) >= -1e-3f; // wall: only blocks motion into it
-		if (walkable || not_into) {
-			probe_time = 1.0f;
-			unsafe = 1.0f;
+		const hop_scalar saved_spec = space->simulator->get_speculative_margin();
+		const bool saved_avg2 = space->simulator->get_average_normals();
+		space->simulator->set_speculative_margin(hop_scalar {});
+		space->simulator->set_average_normals(false);
+
+		// Step the start out of what it is inside and ask again. A corner takes one
+		// iteration per surface, hence the loop; the displacement is a penetration depth
+		// (millimetres), so the fraction still describes the motion the caller asked
+		// about. Seeded with `result` — the cast this clause was entered on swept this
+		// exact segment from this exact origin, so re-issuing it before stepping
+		// anywhere would be a guaranteed duplicate on an already expensive path.
+		Vector3 origin = from_pos;
+		hop::collision<hop_scalar> retry = result;
+		for (int tries = 0;; ++tries) {
+			if (to_godot_float(retry.time) > 0.0f || tries >= 4) break;
+
+			// Ask for the way out with the query that HAS one. `retry` is a swept trace:
+			// its normal and depth describe the hit it stopped on, which for a sweep that
+			// began inside solid is not a push-out and must not be used as one — it can
+			// point straight INTO the surface. The static point-segment overlap is the
+			// query that answers "how far in, and which way out", same sign convention as
+			// the recovery loop above.
+			body->hop_solid->set_position(to_hop(origin));
+			hop::segment<hop_scalar> at_rest;
+			at_rest.set_start_end(to_hop(origin), to_hop(origin));
+			hop::collision<hop_scalar> stuck;
+			space->simulator->trace_solid(stuck, body->hop_solid.get(), at_rest,
+			                              body->collision_mask);
+			const Vector3 rn = to_godot(stuck.normal);
+			const float rd = to_godot_float(stuck.depth);
+			if (rn == Vector3() || rd <= 0.0f) break;  // no way out to follow
+			origin += rn * (rd + touch_eps);
+
+			// Stepped somewhere new — now the sweep is worth re-running.
+			body->hop_solid->set_position(to_hop(origin));
+			hop::segment<hop_scalar> seg2;
+			seg2.set_start_end(to_hop(origin), to_hop(origin + probe_motion));
+			space->simulator->trace_solid(retry, body->hop_solid.get(), seg2,
+			                              body->collision_mask);
+		}
+
+		space->simulator->set_average_normals(saved_avg2);
+		space->simulator->set_speculative_margin(saved_spec);
+
+		float retry_time = std::min(to_godot_float(retry.time), 1.0f);
+
+		if (retry_time > 0.0f) {
+			// The start is outside solid, so this is a real sweep: the path is clear,
+			// or it stops somewhere real. Either way it is an answer the trace gave
+			// rather than one inferred from a single contact normal.
+			probe_time = retry_time;
+			hit_dist = probe_time * probe_len;
+			unsafe = motion_len > 1e-6f ? std::min(hit_dist / motion_len, 1.0f)
+			                           : (probe_time < 1.0f ? 0.0f : 1.0f);
+			if (probe_time < 1.0f) result.set(retry);
+		} else {
+			// Buried deep enough that stepping out along the push-out never freed the
+			// start, so no sweep has seen the path and there is nothing to go on.
+			//
+			// Neither absolute is right here. Refusing the move outright is what a
+			// first cut did: an embedded body could not move in ANY direction, not
+			// even out of what it was stuck in, and on ww_golem that froze a rider
+			// solid for a tick or two while the golem strode on and the cockpit's rear
+			// wall arrived and took them. Freeing it outright is the bug at the top of
+			// this clause — "I cannot see" read as "nothing is there".
+			//
+			// So let it move, but only by a margin. That is always enough to work
+			// itself free over a few frames, and never enough to cross a surface it
+			// cannot see. The recovery re-probes next frame from wherever it lands.
+			const float cap = std::max(margin, 1e-3f);
+			unsafe = std::min(1.0f, cap / motion_len);
+			probe_time = probe_len > 1e-6f
+				? std::min(1.0f, (unsafe * motion_len) / probe_len) : unsafe;
 		}
 	}
+
 
 	bool recovered = recover != Vector3();
 	bool collided = probe_time < 1.0f;
@@ -1458,8 +1659,26 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 
 		// Recovery contact: report the surface we pushed out of so callers that
 		// asked for it (is_on_floor / wall stability) see a stable contact.
-		if (p_recovery_as_collision && recovered && recover_normal != Vector3() && count < max_collisions) {
-			add_collision(from_pos, recover_normal, recover_depth, recover_body);
+		// Recovery contacts: the surfaces we pushed out of, kept apart so a caller can
+		// ask about ground and about an obstruction independently. The blocking one goes
+		// first — a caller with room for only one contact wants the surface in its way,
+		// not the one holding it up, which the ground probe below reports anyway.
+		// Deepest blocking contact first, so a caller with room for only one gets the
+		// surface most in its way.
+		for (int emitted = 0; emitted < block_count && count < max_collisions; ++emitted) {
+			int best = -1;
+			for (int j = 0; j < block_count; ++j) {
+				if (block_normal[j] == Vector3()) continue;
+				if (best < 0 || block_depth[j] > block_depth[best]) best = j;
+			}
+			if (best < 0) break;
+			if (p_recovery_as_collision)
+				add_collision(block_pos[best], block_normal[best], block_depth[best],
+				              block_body[best]);
+			block_normal[best] = Vector3();  // consumed
+		}
+		if (p_recovery_as_collision && support_normal != Vector3() && count < max_collisions) {
+			add_collision(support_pos, support_normal, support_depth, support_body);
 		}
 
 		// Ground-rest contact: the floor found by the gravity-down probe, reported

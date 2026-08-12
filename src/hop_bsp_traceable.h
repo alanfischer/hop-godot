@@ -62,8 +62,27 @@ inline constexpr hull_size HULL_SIZES[4] = {
 };
 
 // GoldSrc's SV_HullForEntity sizing rule, on a mover's GoldSrc-space box size.
+//
+// One deviation, at the bottom end. GoldSrc's rule is `sx <= 8 -> hull 0`, which works
+// there only because entities are built to fit the hulls: a projectile is SetSize(0,0,0)
+// and a player is exactly 32 wide, so nothing lands in between. A host engine's bodies
+// are sized by whatever the art wanted, and anything between 8 and 32 units wide used to
+// be handed hull 3 — a 32x32x36 box, several times its size, expanded around a corner
+// rather than its centre. A 12-unit satchel stopped 6 units short of one face of a wall
+// and 26 short of the other.
+//
+// A sized hull is only the right answer for a mover that actually matches it, so below
+// 32 units the trace uses hull 0 and inflates it by the mover's own radius instead (see
+// trace_solid). That is what GoldSrc does with projectiles, and it is exact rather than
+// approximate. Players and monsters are unaffected: 32 wide still picks 1 or 3 by
+// height, over 36 still picks 2.
+//
+// It is not purely a fidelity improvement — hull 0 is the only hull without CLIP
+// brushes in it, so a body that moves down here stops being blocked by clip geometry.
+// For projectiles that is correct and is what GoldSrc does. A small body that DOES want
+// clip brushes has to be sized to a hull, same as in Half-Life.
 inline int hull_for_size(double sx, double sz) {
-	if (sx <= 8.0) return 0;
+	if (sx < 32.0) return 0;
 	if (sx <= 36.0) return (sz <= 36.0) ? 3 : 1;
 	return 2;
 }
@@ -118,26 +137,37 @@ struct hull_trace {
 	bool hit = false;      // fraction < 1 and `normal` is meaningful
 };
 
-// Signed distance of `p` from a plane, with the whole hull inflated outward by
-// `margin`. Solid is the back side (d < 0), so pushing `dist` out by the margin
-// grows the solid region — exact on faces, rounding the convex corners off. That
-// bias is applied at read time rather than by copying the plane array: a map has
-// tens of thousands of planes and hundreds of brush entities.
-inline double plane_dist(const hop_bsp::BSPPlane &pl, const double p[3], double margin) {
-	double d = (pl.type < 3)
+// Signed distance of `p` from a plane. Solid is the back side (d < 0).
+inline double plane_dist(const hop_bsp::BSPPlane &pl, const double p[3]) {
+	return (pl.type < 3)
 		? p[pl.type] - pl.dist
 		: pl.normal[0] * p[0] + pl.normal[1] * p[1] + pl.normal[2] * p[2] - pl.dist;
-	return d - margin;
 }
 
-// Contents at point `p` (GoldSrc space), descending from node `num`.
-inline int hull_point_contents(const hull &h, int num, const double p[3], double margin = 0) {
+// Contents at `p` with every plane distance biased by `bias`. This does NOT inflate
+// the hull, and it is worth being blunt about why, because the name it used to have
+// said it did: solid is the back side of a plane only when the descent goes that way,
+// and roughly half of any brush's planes have solid on the FRONT. Biasing every
+// distance the same way therefore grows the solid on some faces and shrinks it on the
+// others — a brush does not inflate, it TRANSLATES by `bias` along each axis.
+//
+// A nonzero bias is therefore only ever the STUCK_SLOP band, which asks a directional
+// question ("is a mover resting ON this surface, rather than in it") that a symmetric
+// inflation cannot express anyway, and which the six-axis probes in hull_push_out are
+// what actually decide. Symmetric inflation is expressed instead by the crosspoint
+// back-off in recursive_hull_check, which needs no bias at all.
+inline int hull_point_contents_biased(const hull &h, int num, const double p[3], double bias) {
 	while (num >= 0) {
 		if (num >= h.node_count) return hop_bsp::CONTENTS_SOLID;
-		double d = plane_dist(h.planes[h.planenum(num)], p, margin);
+		double d = plane_dist(h.planes[h.planenum(num)], p) - bias;
 		num = h.child(num, d < 0 ? 1 : 0);
 	}
 	return num;
+}
+
+// Contents at point `p` (GoldSrc space), descending from node `num`.
+inline int hull_point_contents(const hull &h, int num, const double p[3]) {
+	return hull_point_contents_biased(h, num, p, 0.0);
 }
 
 // The nearest bounding plane of the leaf containing `p`, as an outward push-out
@@ -148,13 +178,13 @@ inline int hull_point_contents(const hull &h, int num, const double p[3], double
 // Only a fallback for hull_push_out — the nearest face of a leaf is very often not a
 // way out of the SOLID, see there.
 inline bool hull_nearest_leaf_plane(const hull &h, int num, const double p[3], int blocking,
-                                    double normal[3], double &depth, double margin = 0) {
+                                    double normal[3], double &depth) {
 	double best = 1e30;
 	double best_n[3] = { 0, 0, 1 };
 	while (num >= 0) {
 		if (num >= h.node_count) return false;
 		const hop_bsp::BSPPlane &pl = h.planes[h.planenum(num)];
-		double d = plane_dist(pl, p, margin);
+		double d = plane_dist(pl, p);
 		// best_n is the way OUT through this plane: descending to the back means
 		// the plane bounds the cell from above, so out is +normal; to the front
 		// means it bounds from below, so out is -normal.
@@ -176,12 +206,28 @@ inline bool hull_nearest_leaf_plane(const hull &h, int num, const double p[3], i
 	return true;
 }
 
+// How a sweep treats surfaces it passes near. Resolved once by hull_sweep and carried
+// down the descent: both members are invariant for a whole trace, and re-deriving them
+// per node in a self-recursive walk is work the compiler cannot hoist.
+//
+// Two DIFFERENT mechanisms, which is why they are two fields rather than one signed
+// number. `grow` inflates the hull, and is applied to the SEGMENT by holding its
+// crosspoints that much further off every plane it crosses — the walk cannot know
+// which side of a splitting plane is solid until it has descended, so biasing the
+// distance would translate the brush instead of inflating it (see
+// hull_point_contents_biased). `bias` IS that translation, and the only caller who
+// wants it is the STUCK_SLOP band, whose question is directional.
+struct sweep_skin {
+	double grow = 0;  // >= 0: inflate the hull by this, via the crosspoint back-off
+	double bias = 0;  // <= 0: the STUCK_SLOP plane translation, or 0 for none
+};
+
 // Quake's SV_RecursiveHullCheck. Sweeps the point p1→p2 (GoldSrc space) through
 // the hull, splitting the segment at every plane crossing. Returns false once the
 // trace has been stopped.
 inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
                                  const double p1[3], const double p2[3],
-                                 int blocking, hull_trace &tr, double margin = 0) {
+                                 int blocking, hull_trace &tr, sweep_skin skin) {
 	if (num < 0) {
 		if ((blocking & blocking_bit(num)) == 0) tr.allsolid = false;
 		return true;
@@ -189,15 +235,16 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 	if (num >= h.node_count) return false;
 
 	const hop_bsp::BSPPlane &pl = h.planes[h.planenum(num)];
-	const double t1 = plane_dist(pl, p1, margin);
-	const double t2 = plane_dist(pl, p2, margin);
+	const double t1 = plane_dist(pl, p1) - skin.bias;
+	const double t2 = plane_dist(pl, p2) - skin.bias;
 
-	if (t1 >= 0 && t2 >= 0) return recursive_hull_check(h, h.child(num, 0), p1f, p2f, p1, p2, blocking, tr, margin);
-	if (t1 < 0 && t2 < 0)   return recursive_hull_check(h, h.child(num, 1), p1f, p2f, p1, p2, blocking, tr, margin);
+	if (t1 >= 0 && t2 >= 0) return recursive_hull_check(h, h.child(num, 0), p1f, p2f, p1, p2, blocking, tr, skin);
+	if (t1 < 0 && t2 < 0)   return recursive_hull_check(h, h.child(num, 1), p1f, p2f, p1, p2, blocking, tr, skin);
 
-	// Split, keeping the crosspoint DIST_EPSILON on the near side of the plane.
-	double frac = (t1 < 0) ? (t1 + DIST_EPSILON) / (t1 - t2)
-	                       : (t1 - DIST_EPSILON) / (t1 - t2);
+	// Split, keeping the crosspoint this far on the near side of the plane.
+	const double eps = DIST_EPSILON + skin.grow;
+	double frac = (t1 < 0) ? (t1 + eps) / (t1 - t2)
+	                       : (t1 - eps) / (t1 - t2);
 	if (frac < 0) frac = 0;
 	if (frac > 1) frac = 1;
 
@@ -207,12 +254,12 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 
 	int side = (t1 < 0) ? 1 : 0;
 
-	if (!recursive_hull_check(h, h.child(num, side), p1f, midf, p1, mid, blocking, tr, margin))
+	if (!recursive_hull_check(h, h.child(num, side), p1f, midf, p1, mid, blocking, tr, skin))
 		return false;
 
-	int far_contents = hull_point_contents(h, h.child(num, side ^ 1), mid, margin);
-	if ((blocking & blocking_bit(far_contents)) == 0)
-		return recursive_hull_check(h, h.child(num, side ^ 1), midf, p2f, mid, p2, blocking, tr, margin);
+	if ((blocking & blocking_bit(
+	         hull_point_contents_biased(h, h.child(num, side ^ 1), mid, skin.bias))) == 0)
+		return recursive_hull_check(h, h.child(num, side ^ 1), midf, p2f, mid, p2, blocking, tr, skin);
 
 	if (tr.allsolid) return false;  // never got out of the solid area
 
@@ -227,7 +274,7 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 
 	// Back up if the crosspoint still landed inside solid — rare, but the epsilon
 	// nudge can't save every degenerate plane pair.
-	while ((blocking & blocking_bit(hull_point_contents(h, h.root, mid, margin))) != 0) {
+	while ((blocking & blocking_bit(hull_point_contents_biased(h, h.root, mid, skin.bias))) != 0) {
 		frac -= 0.1;
 		if (frac < 0) {
 			tr.fraction = midf;
@@ -244,13 +291,28 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 }
 
 // Full point sweep through one hull, GoldSrc space in and out.
-inline hull_trace hull_sweep(const hull &h, const double start[3], const double end[3],
-                             int blocking = BLOCK_SOLID, double margin = 0) {
+inline hull_trace hull_sweep_skin(const hull &h, const double start[3], const double end[3],
+                                  int blocking, sweep_skin skin) {
 	hull_trace tr;
 	for (int i = 0; i < 3; ++i) tr.endpos[i] = end[i];
 	if (!h.valid()) { tr.allsolid = false; return tr; }
-	recursive_hull_check(h, h.root, 0.0, 1.0, start, end, blocking, tr, margin);
+	recursive_hull_check(h, h.root, 0.0, 1.0, start, end, blocking, tr, skin);
 	return tr;
+}
+
+// The ordinary sweep: the hull inflated outward by `grow`.
+inline hull_trace hull_sweep(const hull &h, const double start[3], const double end[3],
+                             int blocking = BLOCK_SOLID, double grow = 0) {
+	return hull_sweep_skin(h, start, end, blocking, sweep_skin{ grow, 0.0 });
+}
+
+// A sweep against the hull translated inward by STUCK_SLOP — the same band the stuck
+// test and the push-out already measure against, so a mover resting exactly ON a
+// surface is not treated as starting inside it. Named rather than spelled as a
+// negative margin: it is a different mechanism, not a smaller one.
+inline hull_trace hull_sweep_stuck_band(const hull &h, const double start[3],
+                                        const double end[3], int blocking) {
+	return hull_sweep_skin(h, start, end, blocking, sweep_skin{ 0.0, -STUCK_SLOP });
 }
 
 // A sweep whose start sits EXACTLY on the surface it is driving into.
@@ -301,9 +363,9 @@ inline double hull_inside_distance(const hull &h, int root, const double p[3],
 	// Shrunk by STUCK_SLOP for the same reason hull_push_out is (see there): a
 	// candidate that lands ON a floor is a place the mover can be, and rejecting it
 	// leaves only candidates that exit the model completely.
-	if ((blocking & blocking_bit(hull_point_contents(h, root, away, -STUCK_SLOP))) != 0)
+	if ((blocking & blocking_bit(hull_point_contents_biased(h, root, away, -STUCK_SLOP))) != 0)
 		return -1.0;
-	hull_trace tr = hull_sweep(h, away, p, blocking, -STUCK_SLOP);
+	hull_trace tr = hull_sweep_stuck_band(h, away, p, blocking);
 	if (!tr.hit) return -1.0;
 	// The crosspoint sits DIST_EPSILON on the empty side, so the surface is that much
 	// further in than where the trace stopped.
@@ -353,7 +415,8 @@ inline double hull_inside_distance(const hull &h, int root, const double p[3],
 inline bool hull_push_out(const hull &h, int root, const double p[3], int blocking,
                           const double extent[3], double normal[3], double &depth,
                           bool *in_solid = nullptr) {
-	const bool solid = (blocking & blocking_bit(hull_point_contents(h, root, p, -STUCK_SLOP))) != 0;
+	const bool solid =
+		(blocking & blocking_bit(hull_point_contents_biased(h, root, p, -STUCK_SLOP))) != 0;
 	if (in_solid) *in_solid = solid;
 	if (!solid)
 		return false;
@@ -517,18 +580,58 @@ public:
 		const int hi = hopbsp::hull_for_size(maxs[0] - mins[0], maxs[2] - mins[2]);
 		const hopbsp::hull &h = hulls_[hi];
 		if (!h.valid()) return;
-		// Reduce the mover to the point the hull was expanded around. GoldSrc traces
-		// (origin + mins - clip_mins): the hull is built for a box whose origin sits
-		// at clip_mins from its low corner, so a mover whose origin sits elsewhere in
-		// its own box has to be shifted by the difference.
+		// The box this trace is effectively expanded around, and how the mover maps
+		// onto it. Decided once, here, because four things downstream depend on it —
+		// the trace point, the inflation, the eject budget, and the witness walk-back
+		// — and when each decided for itself they did not all agree.
 		//
-		// This is ZERO for a centre-origin box, which is what makes it easy to get
-		// backwards and never notice — GoldSrc's own player is centre-origin. Godot
-		// bodies are not: WizardWars offsets the player's collider upward so the
-		// origin is at the feet, and with the sign flipped the trace point lands a
-		// full half-height BELOW the feet, i.e. inside the floor, every frame.
-		double offset[3];
-		for (int i = 0; i < 3; ++i) offset[i] = mins[i] - hopbsp::HULL_SIZES[hi].mins[i];
+		//   offset   add to the mover's origin to get the point that is traced
+		//   box_*    the box the hull behaves as if it were expanded for
+		//   inflate  extra growth the tree does not already contain
+		double offset[3], box_mins[3], box_maxs[3];
+		double inflate = 0.0;
+
+		if (hi == 0) {
+			// Hull 0 is the point hull, and GoldSrc's low-corner alignment is a poor
+			// deal there: it puts the trace point on a CORNER of the mover's box, so
+			// the same body stops its full width short of one face of a wall and clips
+			// through the other. A hull-0 mover is traced from its box CENTRE instead,
+			// and the hull inflated by the box's inscribed radius. Inflation is
+			// symmetric by construction; a translation never can be.
+			//
+			// Inscribed (smallest half-extent), not circumscribed: a scalar inflation
+			// of a non-cube box has to under-cover on some axis or over-cover on
+			// another, and a projectile that passes a hair closer than it should beats
+			// one that stops against thin air. Spheres — every projectile in
+			// practice — are exact.
+			inflate = 1e30;
+			for (int i = 0; i < 3; ++i) {
+				offset[i] = (mins[i] + maxs[i]) * 0.5;
+				const double half = (maxs[i] - mins[i]) * 0.5;
+				if (half < inflate) inflate = half;
+			}
+			// The tree contributes nothing, so the effective box is the mover's own,
+			// recentred on the traced point.
+			for (int i = 0; i < 3; ++i) {
+				box_mins[i] = mins[i] - offset[i];
+				box_maxs[i] = maxs[i] - offset[i];
+			}
+		} else {
+			// The three sized hulls are boxes a mover is meant to match, and there
+			// GoldSrc's own rule is right: trace (origin + mins - clip_mins), aligning
+			// the two low corners. Where the boxes match that is identical to centring.
+			//
+			// The offset is ZERO for a centre-origin box, which is what makes it easy
+			// to get backwards and never notice — GoldSrc's own player is centre-origin.
+			// Godot bodies are not: WizardWars offsets the player's collider upward so
+			// the origin is at the feet, and with the sign flipped the trace point lands
+			// a full half-height BELOW the feet, i.e. inside the floor, every frame.
+			for (int i = 0; i < 3; ++i) {
+				box_mins[i] = hopbsp::HULL_SIZES[hi].mins[i];
+				box_maxs[i] = hopbsp::HULL_SIZES[hi].maxs[i];
+				offset[i] = mins[i] - box_mins[i];
+			}
+		}
 
 		hop::vec3<T> lo, ld;
 		to_local(seg.origin, seg.direction, position, orientation, lo, ld);
@@ -543,7 +646,7 @@ public:
 		// `margin` inflates the hull outward so a near-resting mover registers as a
 		// contact. Pushing every plane out by it is exact on faces and rounds the
 		// convex corners off — the accepted approximation for speculative contacts.
-		const double margin_gs = (double)margin * inv_scale_;
+		const double margin_gs = (double)margin * inv_scale_ + inflate;
 
 		const bool zero_dir = hop::length_squared(ld) == T {};
 
@@ -572,9 +675,12 @@ public:
 		// a spot a player stands on quite happily under the trimesh colliders can be
 		// solid here, and everyone inside one gets ejected the moment hulls come on.
 		// Launching them is how you end up through a wall.
+		//
+		// Hull 0's box is a point, which would give a hull-0 mover no eject budget at
+		// all. Its own box is the honest bound there, and it is the box the trace is
+		// now centred on.
 		double extent[3];
-		for (int i = 0; i < 3; ++i)
-			extent[i] = hopbsp::HULL_SIZES[hi].maxs[i] - hopbsp::HULL_SIZES[hi].mins[i];
+		for (int i = 0; i < 3; ++i) extent[i] = box_maxs[i] - box_mins[i];
 
 		double n[3], depth = 0;
 		bool start_in_solid = false;
@@ -694,7 +800,7 @@ public:
 		// reported above, shallower and the start is not in solid at all — which is
 		// where traces routinely leave bodies, DIST_EPSILON being twice it.
 		if (!ht.hit && ht.allsolid && !inside)
-			ht = hopbsp::hull_sweep(h, start, end, blocking_, -hopbsp::STUCK_SLOP);
+			ht = hopbsp::hull_sweep_stuck_band(h, start, end, blocking_);
 
 		if (!ht.hit || (T)ht.fraction >= result.time) return;
 		if (hopbsp::stopped_against_sky(h, ht, blocking_)) return;
@@ -707,10 +813,16 @@ public:
 		hop::vec3<T> p_local = gs_to_godot(ht.endpos[0] - offset[0], ht.endpos[1] - offset[1], ht.endpos[2] - offset[2]);
 		to_world(p_local, n_local, position, orientation, result.point, result.normal);
 
-		// The witness point: endpos sits on the EXPANDED surface, so walk back by
-		// the hull box's own extent along the normal to land on the real geometry.
-		// Exact on a face, off by the box corner on a bevel — the same
-		// approximation the expanded hulls are built on.
+		// The witness point: endpos sits on the EXPANDED surface, so walk back by the
+		// expansion along the normal to land on the real geometry. Exact on a face,
+		// off by the box corner on a bevel — the same approximation the expanded hulls
+		// are built on.
+		//
+		// This walks back by the TREE's expansion only. A hull-0 mover is additionally
+		// inflated by `inflate` above, and that part is deliberately not walked back
+		// here: result.impact feeds velocity_at_local for moving-platform carry, so
+		// moving it is a behaviour change rather than a cleanup. Known gap — a
+		// projectile's reported contact point is its own radius off the surface.
 		double w[3];
 		for (int i = 0; i < 3; ++i) {
 			w[i] = ht.endpos[i] + (ht.normal[i] > 0 ? hopbsp::HULL_SIZES[hi].mins[i]

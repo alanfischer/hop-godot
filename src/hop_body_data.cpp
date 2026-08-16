@@ -12,6 +12,11 @@ void HopBodyData::create_hop_solid() {
 	}
 
 	hop_solid->set_coefficient_of_restitution(to_hop_scalar(bounce));
+	// Godot combines a contact's two bounce values with max, not hop's default
+	// average. Level geometry carries no PhysicsMaterial (bounce 0), so averaging
+	// halved every bouncy body against the world: a 0.75 ball bounced at 0.375 and
+	// was flat after one hop.
+	hop_solid->set_restitution_combine(hop::restitution_combine::maximum);
 	hop_solid->set_coefficient_of_static_friction(to_hop_scalar(friction));
 	hop_solid->set_coefficient_of_dynamic_friction(to_hop_scalar(friction));
 	if (is_static_or_kinematic()) {

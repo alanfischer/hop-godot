@@ -108,8 +108,16 @@ void HopBodyData::on_collision(const hop::collision<hop_scalar> &c) {
 	ci.local_velocity = linear_velocity;
 	ci.local_shape = 0;
 
-	if (c.collidee) {
-		HopBodyData *other = static_cast<HopBodyData *>(c.collidee->get_user_data());
+	// In a *delivered* collision hop names the receiver `collidee` and the thing it hit
+	// `collider` (simulator::report_collisions inverts the pair for the second listener so
+	// this holds for both). Reading collidee here reported every body as having collided
+	// with itself: a RigidBody3D's get_contact_collider_object() came back as its own node,
+	// so contact_monitor logic that asks "what did I hit?" — a projectile dealing its damage,
+	// say — never found a target and the body just bounced. Take collider, and fall back to
+	// collidee for any path that hands us the opposite convention.
+	const hop::solid<hop_scalar> *other_solid = c.collider != hop_solid.get() ? c.collider : c.collidee;
+	if (other_solid && other_solid != hop_solid.get()) {
+		HopBodyData *other = static_cast<HopBodyData *>(other_solid->get_user_data());
 		if (other) {
 			ci.collider_rid = other->self_rid;
 			ci.collider_id = other->object_instance_id;

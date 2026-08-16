@@ -1628,10 +1628,13 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		int max_collisions = p_max_collisions > 0 ? p_max_collisions : 1;
 
 		// Fill one contact entry (other/velocity default to none for static hits).
+		// Callers guarantee a non-zero normal; re-normalize it because Godot's
+		// CharacterBody3D asserts a unit normal before sliding along it, and a
+		// fixed-point trace can hand back one a hair off length.
 		auto add_collision = [&](const Vector3 &position, const Vector3 &normal, float depth, HopBodyData *other) {
 			auto &col = p_result->collisions[count];
 			col.position = position;
-			col.normal = normal;
+			col.normal = normal.normalized();
 			col.depth = depth;
 			col.local_shape = 0;
 			col.collider_shape = 0;
@@ -1652,9 +1655,23 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		// excluding self. Without this, move_and_collide().get_collider() came back
 		// null/RID(0) for every static hit (worldspawn trimesh AND brush-entity
 		// convex), since the old code read the always-null collidee.
+		//
+		// `collided` does not guarantee `result` names a surface: the buried-deep
+		// branch above caps the motion at a margin without any sweep having landed a
+		// hit, so the normal can still be the zero vector it was initialized with.
+		// CharacterBody3D slides velocity along whatever we report here and errors out
+		// on a non-unit normal ("The normal Vector3 (0,0,0) must be normalized"), then
+		// slides along a zero vector — so name the only surface a stopped sweep can be
+		// sure of, the one it drove into: -motion. Every other contact below is already
+		// guarded this way. The unit check also absorbs a normal that arrives slightly
+		// off-length from fixed-point.
 		if (collided) {
 			HopBodyData *other = body_of(result.collider, result.collidee, body->hop_solid.get());
-			add_collision(to_godot(result.point), to_godot(result.normal), 0.0f, other);
+			Vector3 n = to_godot(result.normal);
+			if (n == Vector3() && motion_len > 1e-6f)
+				n = -p_motion / motion_len;
+			if (n != Vector3())
+				add_collision(to_godot(result.point), n, 0.0f, other);
 		}
 
 		// Recovery contact: report the surface we pushed out of so callers that

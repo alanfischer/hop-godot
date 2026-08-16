@@ -251,7 +251,12 @@ uint64_t HopDirectBodyState::_get_contact_collider_id(int32_t p_contact_idx) con
 
 Object *HopDirectBodyState::_get_contact_collider_object(int32_t p_contact_idx) const {
 	uint64_t id = _get_contact_collider_id(p_contact_idx);
-	return get_collider_safe(id);
+	if (!id) return nullptr;
+	// A binding wrapper, NOT the raw engine pointer get_collider_safe() returns: godot-cpp
+	// marshals a virtual's Object* return through ret->_owner, so a raw pointer reads garbage
+	// out of the engine object and the caller sees null. (The raw form is right where the
+	// engine reads our pointer directly — the query result structs in hop_space_state.)
+	return ObjectDB::get_instance(id);
 }
 
 int32_t HopDirectBodyState::_get_contact_collider_shape(int32_t p_contact_idx) const {

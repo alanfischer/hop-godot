@@ -210,17 +210,43 @@ inline bool hull_nearest_leaf_plane(const hull &h, int num, const double p[3], i
 // down the descent: both members are invariant for a whole trace, and re-deriving them
 // per node in a self-recursive walk is work the compiler cannot hoist.
 //
-// Two DIFFERENT mechanisms, which is why they are two fields rather than one signed
-// number. `grow` inflates the hull, and is applied to the SEGMENT by holding its
-// crosspoints that much further off every plane it crosses — the walk cannot know
-// which side of a splitting plane is solid until it has descended, so biasing the
-// distance would translate the brush instead of inflating it (see
-// hull_point_contents_biased). `bias` IS that translation, and the only caller who
-// wants it is the STUCK_SLOP band, whose question is directional.
+// THREE different mechanisms, which is why they are separate fields rather than one
+// signed number.
+//
+// `half` is the mover's own box, and it is the only one that expands the hull as a
+// Minkowski sum: every plane is pushed out by the box's extent along that plane's
+// normal, on BOTH sides, so the descent itself sees a mover of size rather than a
+// point. That per-plane, per-side push is the part a single biased distance cannot
+// express (see hull_point_contents_biased) — and it has to be in the DESCENT, not
+// just the crosspoint: a walk that decides "both ends are on the front side" from the
+// bare plane never reaches the split at all, so a mover skimming a floor is waved
+// through until its traced point is genuinely inside the brush. That is what dropped
+// a corpse half its own height into the floor before anything stopped it.
+//
+// `grow` is the speculative contact margin. It is deliberately NOT an expansion: it
+// only holds the crosspoint that much further off a plane the segment does cross, so
+// a mover that gets stopped is stopped a hair early. Bodies resting against surfaces
+// are found by the overlap path, not by inflating every sweep.
+//
+// `bias` is the STUCK_SLOP plane TRANSLATION, whose question is directional ("is this
+// mover resting on the surface, or in it") and which no symmetric expansion expresses.
 struct sweep_skin {
-	double grow = 0;  // >= 0: inflate the hull by this, via the crosspoint back-off
-	double bias = 0;  // <= 0: the STUCK_SLOP plane translation, or 0 for none
+	double half[3] = { 0, 0, 0 };  // mover half-extents (GoldSrc units); expands the hull
+	double grow = 0;               // >= 0: crosspoint back-off (speculative margin)
+	double bias = 0;               // <= 0: the STUCK_SLOP plane translation, or 0 for none
+	bool boxed = false;            // any half-extent nonzero — keeps the point walk free of the math
 };
+
+// How far the mover's box reaches past its centre along `pl`'s normal: the amount
+// that plane moves outward when the hull is expanded for this box. Axial planes
+// (pl.type < 3, the overwhelming majority in a BSP) read one extent directly.
+inline double plane_offset(const hop_bsp::BSPPlane &pl, const double half[3]) {
+	if (pl.type < 3) return half[pl.type];
+	const double nx = pl.normal[0] < 0 ? -pl.normal[0] : pl.normal[0];
+	const double ny = pl.normal[1] < 0 ? -pl.normal[1] : pl.normal[1];
+	const double nz = pl.normal[2] < 0 ? -pl.normal[2] : pl.normal[2];
+	return nx * half[0] + ny * half[1] + nz * half[2];
+}
 
 // Quake's SV_RecursiveHullCheck. Sweeps the point p1→p2 (GoldSrc space) through
 // the hull, splitting the segment at every plane crossing. Returns false once the
@@ -237,22 +263,42 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 	const hop_bsp::BSPPlane &pl = h.planes[h.planenum(num)];
 	const double t1 = plane_dist(pl, p1) - skin.bias;
 	const double t2 = plane_dist(pl, p2) - skin.bias;
+	// The plane, pushed out by the mover's box. `off` is 0 for a point walk, which
+	// is every trace against a sized hull (1..3): those trees are already expanded
+	// for their box by the compiler, so expanding again would double-count.
+	const double off = skin.boxed ? plane_offset(pl, skin.half) : 0.0;
 
-	if (t1 >= 0 && t2 >= 0) return recursive_hull_check(h, h.child(num, 0), p1f, p2f, p1, p2, blocking, tr, skin);
-	if (t1 < 0 && t2 < 0)   return recursive_hull_check(h, h.child(num, 1), p1f, p2f, p1, p2, blocking, tr, skin);
+	if (t1 >= off && t2 >= off)   return recursive_hull_check(h, h.child(num, 0), p1f, p2f, p1, p2, blocking, tr, skin);
+	if (t1 < -off && t2 < -off)   return recursive_hull_check(h, h.child(num, 1), p1f, p2f, p1, p2, blocking, tr, skin);
 
-	// Split, keeping the crosspoint this far on the near side of the plane.
+	// Split, keeping the crosspoint this far on the near side of the EXPANDED plane.
+	// Which child the mover starts in is read from the direction of travel rather
+	// than the sign of t1: inside the band [-off, off] its box straddles the plane
+	// and the sign says nothing about where it came from.
 	const double eps = DIST_EPSILON + skin.grow;
-	double frac = (t1 < 0) ? (t1 + eps) / (t1 - t2)
-	                       : (t1 - eps) / (t1 - t2);
+	int side;
+	double frac;
+	if (t1 > t2) {          // travelling toward the back side
+		side = 0;
+		frac = (t1 - off - eps) / (t1 - t2);
+	} else if (t1 < t2) {   // travelling toward the front side
+		side = 1;
+		frac = (t1 + off + eps) / (t1 - t2);
+	} else {
+		// Exactly parallel and inside the band — a box sliding along a surface it
+		// rests on, the most ordinary pose there is. Walk the side it is on over the
+		// whole segment; the far-side test below then lands at p2, so any contact it
+		// reports is at fraction 1 and costs the mover no motion. Blocking here
+		// instead would freeze every body the moment it touched a floor.
+		side = (t1 >= 0) ? 0 : 1;
+		frac = 1.0;
+	}
 	if (frac < 0) frac = 0;
 	if (frac > 1) frac = 1;
 
 	double midf = p1f + (p2f - p1f) * frac;
 	double mid[3];
 	for (int i = 0; i < 3; ++i) mid[i] = p1[i] + frac * (p2[i] - p1[i]);
-
-	int side = (t1 < 0) ? 1 : 0;
 
 	if (!recursive_hull_check(h, h.child(num, side), p1f, midf, p1, mid, blocking, tr, skin))
 		return false;
@@ -300,10 +346,30 @@ inline hull_trace hull_sweep_skin(const hull &h, const double start[3], const do
 	return tr;
 }
 
-// The ordinary sweep: the hull inflated outward by `grow`.
+// A skin for a mover of size `half` (GoldSrc units), with `grow` as its speculative
+// crosspoint back-off. All-zero half extents give the plain point walk back.
+inline sweep_skin box_skin(const double half[3], double grow) {
+	sweep_skin s;
+	s.grow = grow;
+	for (int i = 0; i < 3; ++i) {
+		s.half[i] = half[i];
+		if (half[i] != 0.0) s.boxed = true;
+	}
+	return s;
+}
+
+// The ordinary point sweep, stopped `grow` short of whatever it crosses.
 inline hull_trace hull_sweep(const hull &h, const double start[3], const double end[3],
                              int blocking = BLOCK_SOLID, double grow = 0) {
-	return hull_sweep_skin(h, start, end, blocking, sweep_skin{ grow, 0.0 });
+	return hull_sweep_skin(h, start, end, blocking, sweep_skin{ { 0, 0, 0 }, grow, 0.0, false });
+}
+
+// The same sweep for a mover with size: the hull is expanded by `half` as the walk
+// descends it (see sweep_skin), so the box stops ON surfaces instead of passing
+// through them until its centre is inside.
+inline hull_trace hull_sweep_box(const hull &h, const double start[3], const double end[3],
+                                 int blocking, const double half[3], double grow) {
+	return hull_sweep_skin(h, start, end, blocking, box_skin(half, grow));
 }
 
 // A sweep against the hull translated inward by STUCK_SLOP — the same band the stuck
@@ -311,8 +377,11 @@ inline hull_trace hull_sweep(const hull &h, const double start[3], const double 
 // surface is not treated as starting inside it. Named rather than spelled as a
 // negative margin: it is a different mechanism, not a smaller one.
 inline hull_trace hull_sweep_stuck_band(const hull &h, const double start[3],
-                                        const double end[3], int blocking) {
-	return hull_sweep_skin(h, start, end, blocking, sweep_skin{ 0.0, -STUCK_SLOP });
+                                        const double end[3], int blocking,
+                                        const double half[3] = nullptr) {
+	sweep_skin skin = half ? box_skin(half, 0.0) : sweep_skin{};
+	skin.bias = -STUCK_SLOP;
+	return hull_sweep_skin(h, start, end, blocking, skin);
 }
 
 // A sweep whose start sits EXACTLY on the surface it is driving into.
@@ -326,7 +395,8 @@ inline hull_trace hull_sweep_stuck_band(const hull &h, const double start[3],
 // Moving AWAY from a flush surface needs no special case: backing off puts the start
 // inside the solid it is leaving, the walk gives up again, and the move stays free.
 inline hull_trace hull_sweep_off_surface(const hull &h, const double start[3],
-                                         const double end[3], int blocking) {
+                                         const double end[3], int blocking,
+                                         const double half[3] = nullptr) {
 	hull_trace miss;
 	miss.hit = false;
 	double dir[3], len2 = 0;
@@ -339,7 +409,8 @@ inline hull_trace hull_sweep_off_surface(const hull &h, const double start[3],
 	const double back = DIST_EPSILON * 2.0;
 	double from[3];
 	for (int i = 0; i < 3; ++i) from[i] = start[i] - dir[i] / len * back;
-	hull_trace nudged = hull_sweep(h, from, end, blocking, 0.0);
+	hull_trace nudged = half ? hull_sweep_box(h, from, end, blocking, half, 0.0)
+	                         : hull_sweep(h, from, end, blocking, 0.0);
 	if (!nudged.hit) return miss;
 	nudged.fraction = (nudged.fraction * (len + back) - back) / len;
 	if (nudged.fraction < 0.0) nudged.fraction = 0.0;
@@ -587,28 +658,28 @@ public:
 		//
 		//   offset   add to the mover's origin to get the point that is traced
 		//   box_*    the box the hull behaves as if it were expanded for
-		//   inflate  extra growth the tree does not already contain
+		//   half     the mover's own half-extents, which expand the hull as it is walked
 		double offset[3], box_mins[3], box_maxs[3];
-		double inflate = 0.0;
+		double half[3] = { 0, 0, 0 };
 
 		if (hi == 0) {
 			// Hull 0 is the point hull, and GoldSrc's low-corner alignment is a poor
 			// deal there: it puts the trace point on a CORNER of the mover's box, so
 			// the same body stops its full width short of one face of a wall and clips
 			// through the other. A hull-0 mover is traced from its box CENTRE instead,
-			// and the hull inflated by the box's inscribed radius. Inflation is
-			// symmetric by construction; a translation never can be.
+			// and the tree expanded by the mover's own half-extents as the walk
+			// descends it (sweep_skin). Expansion is symmetric by construction; a
+			// translation never can be.
 			//
-			// Inscribed (smallest half-extent), not circumscribed: a scalar inflation
-			// of a non-cube box has to under-cover on some axis or over-cover on
-			// another, and a projectile that passes a hair closer than it should beats
-			// one that stops against thin air. Spheres — every projectile in
-			// practice — are exact.
-			inflate = 1e30;
+			// Per-plane, so a box that is not a cube is exact rather than approximated
+			// by one radius: a corpse capsule is 24 units wide and 40 tall, and a single
+			// inscribed radius left it resting 8 units inside the floor on the axis it
+			// under-covered — while the overlap probe measured the same body against a
+			// different surface and shoved it back out, over and over. That disagreement
+			// is what made corpses bounce.
 			for (int i = 0; i < 3; ++i) {
 				offset[i] = (mins[i] + maxs[i]) * 0.5;
-				const double half = (maxs[i] - mins[i]) * 0.5;
-				if (half < inflate) inflate = half;
+				half[i] = (maxs[i] - mins[i]) * 0.5;
 			}
 			// The tree contributes nothing, so the effective box is the mover's own,
 			// recentred on the traced point.
@@ -643,10 +714,10 @@ public:
 		godot_to_gs(lend, end);
 		for (int i = 0; i < 3; ++i) { start[i] += offset[i]; end[i] += offset[i]; }
 
-		// `margin` inflates the hull outward so a near-resting mover registers as a
-		// contact. Pushing every plane out by it is exact on faces and rounds the
-		// convex corners off — the accepted approximation for speculative contacts.
-		const double margin_gs = (double)margin * inv_scale_ + inflate;
+		// The speculative contact margin, in GoldSrc units. It widens what counts as a
+		// contact; the mover's own size is `half`, and the two are added wherever a
+		// distance is measured from the traced point (the overlap probes below).
+		const double margin_gs = (double)margin * inv_scale_;
 
 		const bool zero_dir = hop::length_squared(ld) == T {};
 
@@ -709,10 +780,16 @@ public:
 		if ((point_solid && !touching_only) || zero_dir) {
 			if (inside) {
 				double cap = 0;
-				for (int i = 0; i < 3; ++i)
-					cap += (n[i] < 0 ? -n[i] : n[i]) * extent[i];
+				double reach = 0;  // how far the box reaches past its centre along n
+				for (int i = 0; i < 3; ++i) {
+					const double a = n[i] < 0 ? -n[i] : n[i];
+					cap += a * extent[i];
+					reach += a * half[i];
+				}
 				if (cap > 0 && depth > cap) depth = cap;
-				depth += margin_gs;
+				// hull_push_out measured the traced POINT out of the solid; the body
+				// around it still has to clear the surface, so add its own reach.
+				depth += margin_gs + reach;
 			} else if (point_solid) {
 				// In solid, with no way out that the push-out could find. Report the
 				// overlap with no direction and no depth: "you are inside something and
@@ -723,12 +800,13 @@ public:
 				n[0] = n[1] = n[2] = 0;
 				depth = 0;
 			} else {
-				if (margin_gs <= 0) return;
-				// Not inside, but a face within `margin` still counts as a contact:
-				// sweeping a probe along every candidate normal is overkill, so use
-				// the six axes and take the nearest surface.
-				if (!nearest_surface(h, start, margin_gs, n, depth)) return;
-				depth = margin_gs - depth;
+				// Not inside, but a surface the BODY reaches — its own half-extent on
+				// that axis, plus `margin` — still counts as a contact. Sweeping a probe
+				// along every candidate normal is overkill, so use the six axes and take
+				// the deepest. This is the contact a resting body has, so a hull-0 mover
+				// asks for it even at zero margin: its box has reach of its own.
+				if (margin_gs <= 0 && half[0] == 0 && half[1] == 0 && half[2] == 0) return;
+				if (!nearest_surface(h, start, margin_gs, half, n, depth)) return;
 				if (depth <= 0) return;
 			}
 			if (T {} >= result.time) return;
@@ -741,7 +819,7 @@ public:
 			return;
 		}
 
-		hopbsp::hull_trace ht = hopbsp::hull_sweep(h, start, end, blocking_, margin_gs);
+		hopbsp::hull_trace ht = hopbsp::hull_sweep_box(h, start, end, blocking_, half, margin_gs);
 
 		// `margin_gs` inflates the hull, so a mover merely RESTING against a wall
 		// starts the sweep inside the inflated solid even though it is not touching
@@ -762,7 +840,7 @@ public:
 		// embedded), so this is an ordinary empty-to-solid trace and it stops on the
 		// surface the mover is actually driving into.
 		if (!ht.hit && ht.allsolid && margin_gs > 0)
-			ht = hopbsp::hull_sweep(h, start, end, blocking_, 0.0);
+			ht = hopbsp::hull_sweep_box(h, start, end, blocking_, half, 0.0);
 
 		// Still no answer: the start is EXACTLY on the surface it is driving into.
 		// The hull walk calls a start on the plane solid and gives up, so a mover
@@ -779,7 +857,7 @@ public:
 		// special case: backing off puts the start inside the solid it is leaving, the
 		// walk gives up again, and the move stays free, which is correct.
 		if (!ht.hit && ht.allsolid) {
-			hopbsp::hull_trace nudged = hopbsp::hull_sweep_off_surface(h, start, end, blocking_);
+			hopbsp::hull_trace nudged = hopbsp::hull_sweep_off_surface(h, start, end, blocking_, half);
 			if (nudged.hit) ht = nudged;
 		}
 
@@ -800,13 +878,31 @@ public:
 		// reported above, shallower and the start is not in solid at all — which is
 		// where traces routinely leave bodies, DIST_EPSILON being twice it.
 		if (!ht.hit && ht.allsolid && !inside)
-			ht = hopbsp::hull_sweep_stuck_band(h, start, end, blocking_);
+			ht = hopbsp::hull_sweep_stuck_band(h, start, end, blocking_, half);
 
 		if (!ht.hit || (T)ht.fraction >= result.time) return;
 		if (hopbsp::stopped_against_sky(h, ht, blocking_)) return;
 
 		result.time = (T)ht.fraction;
 		result.depth = T {};
+		// A sweep that yields NO motion means the mover is already up against this
+		// surface, and a caller with a speculative margin reads `depth` as how far
+		// inside the margin shell it sits — reporting zero tells hop's solver it has a
+		// whole margin of room, every tick, so a resting body creeps into the floor
+		// forever at margin-per-tick and is periodically shoved back out. (That creep
+		// was the second half of the bouncing corpse.) Measure the real gap along the
+		// normal we just hit — one probe, only on the touching path — and report it in
+		// the same terms the overlap branch does. Zero margin (the public query) keeps
+		// an exact depth of zero, since a mover that is merely touching is not inside.
+		if (margin_gs > 0 && ht.fraction <= 0) {
+			double reach = 0;
+			for (int i = 0; i < 3; ++i)
+				reach += (ht.normal[i] < 0 ? -ht.normal[i] : ht.normal[i]) * half[i];
+			const double limit = reach + margin_gs;
+			const double dir[3] = { -ht.normal[0], -ht.normal[1], -ht.normal[2] };
+			const double gap = surface_gap(h, start, dir, limit);
+			if (gap >= 0 && limit - gap > 0) result.depth = (T)((limit - gap) * scale_);
+		}
 		hop::vec3<T> n_local = gs_dir_to_godot(ht.normal[0], ht.normal[1], ht.normal[2]);
 		// endpos is where the POINT stopped; undo the hull offset to get the mover's
 		// origin, and place the witness point on the surface it stopped against.
@@ -907,41 +1003,61 @@ private:
 		for (int i = 0; i < 3; ++i) { mins[i] = lo[i]; maxs[i] = hi[i]; }
 	}
 
-	// Nearest blocking surface within `limit` of `p`, by six axis probes. Only used
-	// for the speculative (margin, not penetrating) contact case.
-	bool nearest_surface(const hopbsp::hull &h, const double p[3], double limit,
-	                     double n[3], double &gap) const {
+	// Deepest blocking surface the mover's box reaches, by six axis probes: on each
+	// axis it looks out `half` (the box's own reach that way) plus `margin`, and
+	// reports how far past the surface that reaches. Only used for the speculative
+	// (touching, not penetrating) contact case.
+	//
+	// Per-axis rather than one radius because the box need not be a cube — a 24x24x40
+	// corpse capsule reaches 20 units down and 12 sideways, and measuring the floor
+	// with the sideways number is what left it resting inside the floor.
+	bool nearest_surface(const hopbsp::hull &h, const double p[3], double margin,
+	                     const double half[3], double n[3], double &depth) const {
 		static const double axes[6][3] = {
 			{ 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 }
 		};
 		bool found = false;
-		gap = limit;
-		for (const auto &a : axes) {
-			double e[3] = { p[0] + a[0] * limit, p[1] + a[1] * limit, p[2] + a[2] * limit };
-			hopbsp::hull_trace t = hopbsp::hull_sweep(h, p, e, blocking_);
-			if (!t.hit && t.allsolid) {
-				// `p` is exactly ON this surface. The hull walk calls a start that sits
-				// on a plane solid and gives up with no surface at all, so the one
-				// contact a resting mover definitely has — the floor under it — was the
-				// one contact this probe could not see. Nothing then reported the mover
-				// as resting, so nothing lifted it off the plane, and on ww_golem it
-				// sat on the seam where the cockpit's rear wall meets its deck: inside
-				// neither, blocked by neither, and out the back.
-				//
-				// Same remedy as the swept path: back off a hair along the probe and
-				// ask again, which puts the start strictly outside and returns the real
-				// plane. The distance is zero by construction — we started on it.
-				t = hopbsp::hull_sweep_off_surface(h, p, e, blocking_);
-			}
-			if (!t.hit) continue;
-			double d = t.fraction * limit;
-			if (d < gap) {
-				gap = d;
-				n[0] = t.normal[0]; n[1] = t.normal[1]; n[2] = t.normal[2];
+		depth = 0.0;
+		for (int ai = 0; ai < 6; ++ai) {
+			const double limit = half[ai / 2] + margin;
+			if (limit <= 0) continue;
+			double t_n[3];
+			const double gap = surface_gap(h, p, axes[ai], limit, t_n);
+			if (gap < 0) continue;
+			const double d = limit - gap;  // how far past the surface the box reaches
+			if (d > depth) {
+				depth = d;
+				n[0] = t_n[0]; n[1] = t_n[1]; n[2] = t_n[2];
 				found = true;
 			}
 		}
 		return found;
+	}
+
+	// Distance from `p` to the first blocking surface along `dir`, or -1 if none
+	// within `limit`. `dir` is a unit GoldSrc-space direction; `out_n`, when given,
+	// receives the surface normal.
+	double surface_gap(const hopbsp::hull &h, const double p[3], const double dir[3],
+	                   double limit, double *out_n = nullptr) const {
+		const double e[3] = { p[0] + dir[0] * limit, p[1] + dir[1] * limit, p[2] + dir[2] * limit };
+		hopbsp::hull_trace t = hopbsp::hull_sweep(h, p, e, blocking_);
+		if (!t.hit && t.allsolid) {
+			// `p` is exactly ON this surface. The hull walk calls a start that sits on
+			// a plane solid and gives up with no surface at all, so the one contact a
+			// resting mover definitely has — the floor under it — was the one contact
+			// this probe could not see. Nothing then reported the mover as resting, so
+			// nothing lifted it off the plane, and on ww_golem it sat on the seam where
+			// the cockpit's rear wall meets its deck: inside neither, blocked by
+			// neither, and out the back.
+			//
+			// Same remedy as the swept path: back off a hair along the probe and ask
+			// again, which puts the start strictly outside and returns the real plane.
+			// The distance is zero by construction — we started on it.
+			t = hopbsp::hull_sweep_off_surface(h, p, e, blocking_);
+		}
+		if (!t.hit) return -1.0;
+		if (out_n) { out_n[0] = t.normal[0]; out_n[1] = t.normal[1]; out_n[2] = t.normal[2]; }
+		return t.fraction * limit;
 	}
 
 	std::shared_ptr<hopbsp::map_data> map_;  // keeps the shared bytes alive

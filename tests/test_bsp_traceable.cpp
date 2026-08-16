@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -805,6 +806,104 @@ static void test_float_instantiation() {
 	printf("  float_instantiation ok\n");
 }
 
+// --- hull-0 movers with a box of their own --------------------------------
+
+// A hull-0 mover is traced as its box CENTRE with the tree expanded by its own
+// half-extents. WizardWars' corpse is the awkward shape that exposed whether that
+// expansion is real: a capsule r=0.3 h=1.0 whose collider sits +0.5 above the body
+// origin, so in GoldSrc units a 24x24x40 box with the origin on its bottom face.
+static std::shared_ptr<hop::solid<T>> make_corpse_solid() {
+	hop::aa_box<T> b;
+	b.mins = vec(-0.3, 0, -0.3);
+	b.maxs = vec(0.3, 1.0, 0.3);
+	auto s = std::make_shared<hop::solid<T>>();
+	s->add_shape(std::make_shared<hop::shape<T>>(b));
+	return s;
+}
+
+// It must come to rest ON the floor. The expansion has to be applied while the tree
+// is DESCENDED, not only at the crosspoint: a walk that reads both segment ends as
+// "in front of the floor plane" never splits, so the mover was waved through until
+// its centre was genuinely inside the brush — 0.5m of floor, for this body.
+static void test_hull0_box_lands_on_the_floor() {
+	auto t = load(make_floor_map());
+	auto s = make_corpse_solid();
+	hop::collision<T> c = sweep(*t, s, vec(0, 1.5, 0), vec(0, -2.0, 0));
+	assert(c.time < 1.0 && "the box must be stopped by the floor");
+	const double rest = 1.5 - 2.0 * (double)c.time;
+	assert(approx(rest, 0.0, 0.02) && "it rests with its bottom face on the floor");
+	assert(approx_v(c.normal, 0, 1, 0));
+	printf("  hull0_box_lands_on_the_floor ok (rest y=%.4f)\n", rest);
+}
+
+// Sideways, against a wall: it stops its own half-WIDTH short (0.3), not its
+// half-height and not centred on the surface. One scalar radius cannot do both.
+static void test_hull0_box_stops_at_its_own_width() {
+	// A wall block occupying x >= 4 (GoldSrc x is -godot x, so this is the -x side).
+	const double mins[3] = { -512, -512, -512 };
+	const double maxs[3] = { -160, 512, 512 };  // godot x >= 4.0
+	auto t = load(make_box_map(mins, maxs));
+	auto s = make_corpse_solid();
+	hop::collision<T> c = sweep(*t, s, vec(0, 1.0, 0), vec(5.0, 0, 0));
+	assert(c.time < 1.0);
+	const double stop = 5.0 * (double)c.time;
+	assert(approx(stop, 4.0 - 0.3, 0.02) && "stops half its width short of the wall");
+	printf("  hull0_box_stops_at_its_own_width ok (stop x=%.4f)\n", stop);
+}
+
+// The bug this file gained a section for: a corpse that bounced on the ground,
+// forever. Sweep and overlap are two answers to the same question, and they used
+// different geometry — the sweep let the body sink half its height into the floor,
+// the overlap probe shoved it back out to the surface, and the next frame it fell
+// again. Run the loop the physics server runs and require it to settle.
+static void test_hull0_box_settles_instead_of_bouncing() {
+	auto t = load(make_floor_map());
+	auto s = make_corpse_solid();
+	const double dt = 1.0 / 60.0, gravity = 20.0;
+	double y = 1.0, vy = 0.0, lo = 1e30, hi = -1e30;
+
+	for (int step = 0; step < 240; ++step) {
+		vy -= gravity * dt;
+		hop::collision<T> c = sweep(*t, s, vec(0, (T)y, 0), vec(0, (T)(vy * dt), 0));
+		if (c.time < 1.0) { y += vy * dt * (double)c.time; vy = 0.0; }
+		else { y += vy * dt; }
+		// Depenetration, as _body_test_motion's recovery does it.
+		hop::collision<T> o = sweep(*t, s, vec(0, (T)y, 0), vec(0, 0, 0));
+		if (o.time == 0.0 && o.depth > 0.0) y += (double)o.normal.y * (double)o.depth;
+		if (step >= 120) { lo = std::min(lo, y); hi = std::max(hi, y); }
+	}
+	printf("  hull0_box_settles_instead_of_bouncing ok (y=%.4f, band=%.4f)\n", y, hi - lo);
+	assert(hi - lo < 0.01 && "a settled body must not oscillate");
+	assert(approx(y, 0.0, 0.02) && "and it settles on the floor, not inside it");
+}
+
+// hop's speculative solver reads a time-0 contact's `depth` as how far into the
+// margin shell the body sits: separation = margin - depth. A sweep that yields no
+// motion has to answer in those terms, or the solver is told the body has a whole
+// margin of room and lets it approach that far EVERY tick — a resting body then
+// creeps into the floor at margin-per-tick forever.
+static void test_touching_sweep_reports_the_margin_gap() {
+	auto t = load(make_floor_map());
+	const T margin = 0.007;
+
+	auto corpse = make_corpse_solid();  // hull 0, resting on the floor
+	hop::collision<T> c = sweep(*t, corpse, vec(0, 0, 0), vec(0, -0.01, 0), margin);
+	assert(c.time == 0.0 && "a body on the floor cannot move down");
+	assert(approx(c.depth, margin, 0.002) && "gap 0 must read back as separation 0");
+
+	// A sized-hull mover (the player) resting on the floor: same contract.
+	auto player = make_feet_box_solid(0.4, 1.8, 0.4);
+	hop::collision<T> p = sweep(*t, player, vec(0, 0, 0), vec(0, -0.01, 0), margin);
+	assert(p.time == 0.0);
+	assert(approx(p.depth, margin, 0.002));
+
+	// With no margin (the public _body_test_motion query) depth stays exact: a body
+	// that is merely touching is not inside anything.
+	hop::collision<T> bare = sweep(*t, corpse, vec(0, 0, 0), vec(0, -0.01, 0));
+	assert(bare.time == 0.0 && bare.depth == 0.0);
+	printf("  touching_sweep_reports_the_margin_gap ok\n");
+}
+
 int main() {
 	printf("test_bsp_traceable\n");
 	test_blob_roundtrip();
@@ -832,6 +931,10 @@ int main() {
 	test_inside_a_wall_cannot_travel_deeper();
 	test_deep_overlap_is_nudged_not_launched();
 	test_push_out_picks_a_direction_that_exits();
+	test_hull0_box_lands_on_the_floor();
+	test_hull0_box_stops_at_its_own_width();
+	test_hull0_box_settles_instead_of_bouncing();
+	test_touching_sweep_reports_the_margin_gap();
 	test_sky_is_passable_but_maskable();
 	test_float_instantiation();
 	printf("all bsp traceable tests passed\n");

@@ -648,18 +648,23 @@ void HopPhysicsServer::rebuild_area_shapes(HopAreaData *area) {
 	area->hop_solid->set_position(to_hop(area->transform.origin));
 	area->hop_solid->set_orientation(to_hop_orientation(area->transform.basis));
 	area->hop_solid->deactivate();
-	// World bound changed — the area broadphase must rebuild before its next query.
+	// World bound changed — the area broadphase must see the new bounds next query.
 	mark_area_bvh_dirty(area);
 }
 
+// Areas move constantly — every per-bone hitbox rides an animated skeleton — so this is
+// a refit, not a rebuild. mark_dirty() would re-sort and rebuild the whole area tree on
+// the next query, which profiled as more expensive than querying it.
 void HopPhysicsServer::mark_area_bvh_dirty(HopAreaData *area) {
 	HopSpaceData *space = space_owner.get_or_null(area->space_rid);
-	if (space) space->area_bvh.mark_dirty();
+	if (space) space->area_bvh.mark_dynamic_moved();
 }
 
 void HopPhysicsServer::add_area_to_space(HopAreaData *area, HopSpaceData *space) {
 	rebuild_area_shapes(area); // ensures the solid exists and its shapes are built
-	space->area_bvh.add_solid(area->hop_solid.get(), /*is_static=*/true);
+	// Dynamic bucket: areas are refit in place when they move. Registering them static
+	// meant any one moving area invalidated the entire tree and forced a full rebuild.
+	space->area_bvh.add_solid(area->hop_solid.get(), /*is_static=*/false);
 }
 
 void HopPhysicsServer::remove_area_from_space(HopAreaData *area) {

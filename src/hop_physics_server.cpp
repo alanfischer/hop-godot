@@ -1706,6 +1706,36 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			add_collision(ground_point, ground_normal, 0.0f, ground_body);
 		}
 
+		// Reporting "yes, something happened" with no contact to show for it is not an
+		// answer Godot can use: its callers read collisions[0] the moment the query
+		// returns true, without consulting collision_count. PhysicsBody3D asks for
+		// collisions[0].depth, and CharacterBody3D slides the remainder along
+		// collisions[0].normal — which for a contact that was never written is the
+		// zero vector, hence "The normal Vector3 (0,0,0) must be normalized" and a slide
+		// along nothing that kills the rest of the move.
+		//
+		// A recovery-only result is how we got there: pushing out of a merely TOUCHING
+		// surface, or applying the resting-gap nudge, displaces the body without
+		// recording a block/support contact (neither is penetration). With no swept hit
+		// and no ground probe, that returned true carrying zero contacts. It normally
+		// stayed invisible because a recovery-only result also leaves remainder at
+		// exactly zero, which CharacterBody3D breaks on first — until floor_stop_on_slope
+		// (on by default) makes the first slide iteration cancel sliding, and
+		// move_and_collide rewrites remainder from travel. The recovery displacement is
+		// in travel, so the rewritten remainder is a hair long instead of zero, and the
+		// slide goes ahead with a normal nobody wrote.
+		//
+		// So close it where the invariant belongs: whoever we are about to tell "true",
+		// hand a surface. The push-out direction IS the normal of what we are touching,
+		// which is the honest answer; -motion for a sweep that stopped against something
+		// it could not name, and up as a last resort.
+		if (count == 0 && (collided || (p_recovery_as_collision && recovered) || ground_hit)) {
+			Vector3 n = recover.normalized();
+			if (n == Vector3() && motion_len > 1e-6f) n = -p_motion / motion_len;
+			if (n == Vector3()) n = up_dir;
+			add_collision(from_pos, n, recover_depth, nullptr);
+		}
+
 		p_result->collision_count = count;
 	}
 

@@ -704,6 +704,10 @@ public:
 			}
 		}
 
+		// The offset is a WORLD-space translation of the mover, so on a rotated model
+		// it has to arrive in the model's frame rotated — see rotate_offset_to_local.
+		rotate_offset_to_local(orientation, offset);
+
 		hop::vec3<T> lo, ld;
 		to_local(seg.origin, seg.direction, position, orientation, lo, ld);
 
@@ -955,6 +959,33 @@ private:
 		out[0] = -(double)v.x * inv_scale_;
 		out[1] = (double)v.z * inv_scale_;
 		out[2] = (double)v.y * inv_scale_;
+	}
+
+	// The hull offset in the model's axes. GoldSrc applies it in WORLD space —
+	// SV_ClipMoveToEntity builds its matrix at the offset and inverse-transforms the
+	// world endpoints through it, giving local + R⁻¹(mins - clip_mins).
+	//
+	// Unrotated it sends a standing player's 36-unit "raise the point to my centre"
+	// along whichever model axis is up in the FILE. Identical on an unrotated brush;
+	// on a plate authored lying down and rotated upright to close (ww_monoliths' spawn
+	// gates) the raise goes sideways through the door instead, stopping the player 72
+	// units off one face and putting their eye through the other.
+	//
+	// Only the offset rotates. The tree's own expansion stays in model space, where the
+	// compiler baked it — which is why a tipped plate collides fat on its thin axis in
+	// GoldSrc too.
+	void rotate_offset_to_local(const hop::mat3<T> &orientation, double offset[3]) const {
+		static const hop::mat3<T> identity;
+		if (orientation == identity) return;
+		const hop::vec3<T> w = gs_dir_to_godot(offset[0], offset[1], offset[2]);
+		hop::mat3<T> Rt;
+		hop::transpose(Rt, orientation);
+		hop::vec3<T> l;
+		hop::mul(l, Rt, w);
+		// gs_dir_to_godot's axis swap is its own inverse, so the way back is the same map.
+		offset[0] = -(double)l.x;
+		offset[1] = (double)l.z;
+		offset[2] = (double)l.y;
 	}
 
 	void to_local(const hop::vec3<T> &origin, const hop::vec3<T> &dir,

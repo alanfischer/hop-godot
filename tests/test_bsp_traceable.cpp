@@ -226,11 +226,12 @@ static std::shared_ptr<hop::solid<T>> make_box_solid(T hx, T hy, T hz) {
 // below is one of these plus its assertions; a zero `motion` is the static
 // overlap query.
 static hop::collision<T> sweep(HopBspTraceable<T> &t, std::shared_ptr<hop::solid<T>> s,
-                               V from, V motion, T margin = T {}, V at = V {}) {
+                               V from, V motion, T margin = T {}, V at = V {},
+                               hop::mat3<T> rot = hop::mat3<T>()) {
 	hop::collision<T> c;
 	hop::segment<T> seg;
 	seg.set_start_dir(from, motion);
-	t.trace_solid(c, s.get(), at, hop::mat3<T>(), seg, margin);
+	t.trace_solid(c, s.get(), at, rot, seg, margin);
 	return c;
 }
 
@@ -420,6 +421,55 @@ static void test_feet_origin_mover_resting_is_not_stuck() {
 	assert(down.time < 1.0);
 	assert(down.normal.y > 0.5 && "the floor must push UP, never down");
 	printf("  feet_origin_mover_resting_is_not_stuck ok\n");
+}
+
+// A brush entity authored lying down and rotated upright to close: ww_monoliths'
+// spawn gates. Rays already cover orientation, but a ray is a point mover with no hull
+// offset — so the one thing rotation can break, they cannot see. Applied unrotated,
+// a standing player's 36-unit "raise the point to my centre" went sideways THROUGH the
+// plate: 72 units off one face, eye inside the other.
+static void test_feet_origin_mover_against_a_tipped_plate() {
+	// 16 units thin on GoldSrc z — a floor slab, until it is stood on its edge.
+	const double mins[3] = { -512, -512, -8 };
+	const double maxs[3] = { 512, 512, 8 };
+	auto t = load(make_box_map(mins, maxs));
+
+	// +90° about Godot z sends the plate's thin axis (Godot y) to Godot x: a wall
+	// whose faces sit at x = ±0.2.
+	hop::mat3<T> rot;
+	hop::set_mat3_from_axis_angle(rot, vec(0, 0, 1), (T)(M_PI / 2));
+
+	// The tree is expanded in the MODEL's frame, so the thin axis carries hull 1's
+	// 36-unit half-HEIGHT rather than its 16-unit half-width: 0.9 m of standoff off
+	// each face. Fat — and fat in GoldSrc too, for the same reason. What this asserts
+	// is that both faces agree, which is what the offset decides.
+	auto standing = make_feet_box_solid(0.4, 1.8, 0.4);
+	hop::collision<T> plus = sweep(*t, standing, vec(3, 0, 0), vec(-6, 0, 0), T {}, V {}, rot);
+	assert(plus.time < 1.0);
+	assert(approx(plus.point.x, 1.1, 0.02));
+	assert(approx_v(plus.normal, 1, 0, 0));
+
+	hop::collision<T> minus = sweep(*t, standing, vec(-3, 0, 0), vec(6, 0, 0), T {}, V {}, rot);
+	assert(minus.time < 1.0);
+	assert(approx(minus.point.x, -1.1, 0.02));
+	assert(approx_v(minus.normal, -1, 0, 0));
+
+	// Crouched picks hull 3, whose offset is 18 rather than 36 — the same test with a
+	// different number, and the pair is what pins the offset to the mover's own box.
+	auto crouched = make_feet_box_solid(0.4, 0.9, 0.4);
+	hop::collision<T> cplus = sweep(*t, crouched, vec(3, 0, 0), vec(-6, 0, 0), T {}, V {}, rot);
+	hop::collision<T> cminus = sweep(*t, crouched, vec(-3, 0, 0), vec(6, 0, 0), T {}, V {}, rot);
+	assert(approx(cplus.point.x, 0.65, 0.02));
+	assert(approx(cminus.point.x, -0.65, 0.02));
+
+	// A centre-origin mover has no offset at all, so it was symmetric even while this
+	// was broken: it holds the fixture itself honest.
+	auto centred = make_box_solid(0.4, 0.9, 0.4);
+	hop::collision<T> nplus = sweep(*t, centred, vec(3, 0, 0), vec(-6, 0, 0), T {}, V {}, rot);
+	hop::collision<T> nminus = sweep(*t, centred, vec(-3, 0, 0), vec(6, 0, 0), T {}, V {}, rot);
+	assert(approx(nplus.point.x, 1.1, 0.02));
+	assert(approx(nminus.point.x, -1.1, 0.02));
+	printf("  feet_origin_mover_against_a_tipped_plate ok\n");
 }
 
 static void test_solid_crouched_uses_short_hull() {
@@ -918,6 +968,7 @@ int main() {
 	test_solid_lands_on_floor();
 	test_feet_origin_mover_lands_on_the_floor();
 	test_feet_origin_mover_resting_is_not_stuck();
+	test_feet_origin_mover_against_a_tipped_plate();
 	test_solid_crouched_uses_short_hull();
 	test_solid_impact_is_on_the_surface();
 	test_solid_misses();

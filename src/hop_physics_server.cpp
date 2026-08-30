@@ -2296,6 +2296,34 @@ void HopPhysicsServer::_step(float p_step) {
 		});
 	}
 
+	// Angular damping, the way Godot's own integrator does it: w *= max(0, 1 - damp*dt),
+	// applied once per step just before integration. hop's only drag is a fluid force on
+	// LINEAR velocity, so without this BODY_PARAM_ANGULAR_DAMP was stored and never read —
+	// a body given spin kept every bit of it for as long as it lived. Debris is what
+	// notices: a gib is thrown with a random tumble and set to damp out of it, and under
+	// hop it span at its launch rate until it faded, where the same gib settles under
+	// GodotPhysics3D.
+	//
+	// Body damp only, no area override, matching what the linear path resolves above.
+	{
+		const float fdt = p_step > 0.0f ? p_step : (1.0f / 60.0f);
+		body_owner.for_each([&](HopBodyData *body) {
+			if (!body->hop_solid || body->is_static_or_kinematic()) return;
+			if (body->angular_damp <= 0.0f) return;
+			// A body hop does not spin dynamically carries ω as scripted motion (the
+			// kinematic-carry path writes it); damping that would be a behaviour change.
+			if (!body->hop_solid->rotates_dynamically()) return;
+			const float f = 1.0f - body->angular_damp * fdt;
+			hop::vec3<hop_scalar> w = body->hop_solid->get_angular_velocity();
+			if (f <= 0.0f) {
+				w.reset();
+			} else {
+				hop::mul(w, scalar_from_float<hop_scalar>(f));
+			}
+			body->hop_solid->set_angular_velocity(w);
+		});
+	}
+
 	// Step all active spaces
 	space_owner.for_each([&](HopSpaceData *space) {
 		if (!space->active) return;

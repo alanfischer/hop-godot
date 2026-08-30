@@ -9,6 +9,7 @@ extends SceneTree
 const SUITES := [
 	preload("res://tests/test_bsp_body_test_motion.gd"),
 	preload("res://tests/test_bsp_projectile.gd"),
+	preload("res://tests/test_angular_damp.gd"),
 ]
 
 var _pass := 0

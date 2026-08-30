@@ -10,6 +10,7 @@ const SUITES := [
 	preload("res://tests/test_bsp_body_test_motion.gd"),
 	preload("res://tests/test_bsp_projectile.gd"),
 	preload("res://tests/test_angular_damp.gd"),
+	preload("res://tests/test_bsp_contact_point.gd"),
 ]
 
 var _pass := 0
@@ -54,7 +55,9 @@ func _run() -> void:
 			inst.setup()
 			# One physics frame so freshly added collision nodes reach the server.
 			await physics_frame
-			inst.call(name, self)
+			# Awaited, so a test may itself await physics frames — settling a dynamic
+			# body takes more than one. A test that never awaits resolves right here.
+			await inst.call(name, self)
 			inst.teardown()
 			await physics_frame
 			print("  %s %s" % ["✓" if _fail == before else "✗", name])

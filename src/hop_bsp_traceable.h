@@ -913,21 +913,41 @@ public:
 		hop::vec3<T> p_local = gs_to_godot(ht.endpos[0] - offset[0], ht.endpos[1] - offset[1], ht.endpos[2] - offset[2]);
 		to_world(p_local, n_local, position, orientation, result.point, result.normal);
 
-		// The witness point: endpos sits on the EXPANDED surface, so walk back by the
-		// expansion along the normal to land on the real geometry. Exact on a face,
-		// off by the box corner on a bevel — the same approximation the expanded hulls
-		// are built on.
+		// The witness point: endpos sits on the EXPANDED surface, so walk back onto the
+		// real geometry — straight DOWN THE NORMAL, by however far the box reaches that
+		// way. The box is box_mins/box_maxs, the one this trace was actually expanded
+		// around: the engine's hull box for a sized hull, the mover's own for hull 0.
 		//
-		// This walks back by the TREE's expansion only. A hull-0 mover is additionally
-		// inflated by `inflate` above, and that part is deliberately not walked back
-		// here: result.impact feeds velocity_at_local for moving-platform carry, so
-		// moving it is a behaviour change rather than a cleanup. Known gap — a
-		// projectile's reported contact point is its own radius off the surface.
-		double w[3];
+		// Which walk-back this is matters more than it looks, because the solver takes a
+		// contact's lever arm as (impact − centre) and every contact is resolved about it.
+		//
+		//   * Leaving hull 0 out of the walk-back entirely (what this did) puts the point
+		//     at the mover's CENTRE. Fine for a projectile, which only ever reads the
+		//     contact as a position; useless for a tumbling rigid body, whose every
+		//     contact then arrives with a zero arm and applies no torque at all. Gibs
+		//     landed flat, slid, and never tipped, whatever they hit.
+		//   * Taking the box's CORNER — its support point in −n, per axis — is exact for
+		//     the plane the sweep stopped on, and catastrophic for a body resting on it:
+		//     a floor normal says nothing about the two tangential axes, so the corner
+		//     picks a lever arm ACROSS the face and the normal impulse holding the body
+		//     up becomes a torque. A gib landing on a flat floor span up to 37 rad/s and
+		//     kept gaining.
+		//
+		// Down the normal is the honest answer for a shape whose contact patch a hull
+		// trace cannot resolve: the arm is parallel to the normal, so the support impulse
+		// makes no torque, and friction across the face still tips the body as it should.
+		//
+		// result.impact also feeds velocity_at_local for moving-platform carry, where it
+		// is the same improvement — a rider samples a turning platform's ω×r at the point
+		// it stands on rather than at a corner of its own bounding box.
+		double reach = 0;
 		for (int i = 0; i < 3; ++i) {
-			w[i] = ht.endpos[i] + (ht.normal[i] > 0 ? hopbsp::HULL_SIZES[hi].mins[i]
-			                                        : hopbsp::HULL_SIZES[hi].maxs[i]);
+			const double h = (box_maxs[i] - box_mins[i]) * 0.5;
+			reach += (ht.normal[i] < 0 ? -ht.normal[i] : ht.normal[i]) * h;
 		}
+		double w[3];
+		for (int i = 0; i < 3; ++i)
+			w[i] = ht.endpos[i] - ht.normal[i] * reach;
 		hop::vec3<T> impact_local = gs_to_godot(w[0], w[1], w[2]);
 		hop::vec3<T> ignored;
 		to_world(impact_local, n_local, position, orientation, result.impact, ignored);

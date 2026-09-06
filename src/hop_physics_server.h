@@ -9,6 +9,7 @@
 #include <godot_cpp/core/class_db.hpp>
 
 #include <unordered_map>
+#include <vector>
 
 #include "hop_rid.h"
 #include "hop_shape_data.h"
@@ -85,6 +86,16 @@ public:
 	void add_area_to_space(HopAreaData *area, HopSpaceData *space);
 	void remove_area_from_space(HopAreaData *area);
 	void mark_area_bvh_dirty(HopAreaData *area);
+
+	// A body whose RID is being freed is dropped from every area holding it, and the exit is
+	// queued for the next _flush_queries — the listener is owed the callback, but the moment the
+	// body goes away is a destructor, not a place to run game code.
+	struct PendingMonitorExit {
+		RID area;
+		uint64_t object_id;
+	};
+	std::vector<PendingMonitorExit> pending_monitor_exits;
+	void report_body_gone(HopBodyData *body);
 
 	// === Shape API ===
 	RID _world_boundary_shape_create() override;

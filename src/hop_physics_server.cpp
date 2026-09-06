@@ -400,6 +400,22 @@ void HopPhysicsServer::_area_set_ray_pickable(const RID &p_area, bool p_enable) 
 	if (area) area->ray_pickable = p_enable;
 }
 
+// Godot frees a body's RID after its node has already left the tree, so the next flush would
+// otherwise report the exit through a RID that no longer resolves — or, if the area is out of the
+// space by then, never report it at all.
+void HopPhysicsServer::report_body_gone(HopBodyData *body) {
+	if (!body || body->object_instance_id == 0) return;
+	uint64_t id = body->object_instance_id;
+	area_owner.for_each([&](HopAreaData *area) {
+		auto it = area->overlapping_bodies.find(id);
+		if (it == area->overlapping_bodies.end()) return;
+		area->overlapping_bodies.erase(it);
+		if (area->monitor_callback.is_valid()) {
+			pending_monitor_exits.push_back({ area->self_rid, id });
+		}
+	});
+}
+
 void HopPhysicsServer::_area_set_monitor_callback(const RID &p_area, const Callable &p_callback) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
 	if (area) area->monitor_callback = p_callback;
@@ -2019,6 +2035,7 @@ void HopPhysicsServer::_free_rid(const RID &p_rid) {
 		delete s;
 	} else if (body_owner.owns(p_rid)) {
 		HopBodyData *body = body_owner.get_or_null(p_rid);
+		report_body_gone(body);
 		remove_body_from_space(body);
 		if (body->direct_state) {
 			body->direct_state->body = nullptr;
@@ -2366,15 +2383,48 @@ void HopPhysicsServer::_flush_queries() {
 		body->state_sync_callback.call(body->direct_state);
 	});
 
+	// Deferred exits for bodies that left the world outright (see report_body_gone). Reported here,
+	// not at the moment they left, because that moment is inside the node's tree teardown and these
+	// callbacks run game code.
+	if (!pending_monitor_exits.empty()) {
+		std::vector<PendingMonitorExit> exits;
+		exits.swap(pending_monitor_exits);
+		for (const PendingMonitorExit &e : exits) {
+			HopAreaData *area = area_owner.get_or_null(e.area);
+			if (area && area->monitor_callback.is_valid()) {
+				area->monitor_callback.call(PhysicsServer3D::AREA_BODY_REMOVED,
+					RID(), ObjectID(e.object_id), 0, 0);
+			}
+		}
+	}
+
 	// Area monitoring: detect body enter/exit for areas with monitor callbacks
 	area_owner.for_each([&](HopAreaData *area) {
-		if (!area->monitor_callback.is_valid()) return;
-		if (!area->space_rid.is_valid()) return;
-		HopSpaceData *space = space_owner.get_or_null(area->space_rid);
-		if (!space) return;
+		// Nothing to report and nobody to report to: the common case, kept cheap.
+		if (!area->monitor_callback.is_valid() && area->overlapping_bodies.empty()) return;
+		HopSpaceData *space = area->space_rid.is_valid() ? space_owner.get_or_null(area->space_rid) : nullptr;
+		bool can_monitor = area->monitor_callback.is_valid() && space
+			&& area->hop_solid && !area->hop_solid->get_shapes().empty();
+
+		// An area that stops monitoring — left its space, lost its callback, lost its shapes — still
+		// owes an exit for everything it was holding. Skipping that leaves the overlap recorded here
+		// forever: the listener never hears the body leave, and if the area comes back with the body
+		// still inside, the re-entry diffs away to nothing and the body is never reported again.
+		if (!can_monitor) {
+			if (!area->overlapping_bodies.empty()) {
+				std::map<uint64_t, RID> stale;
+				stale.swap(area->overlapping_bodies);
+				if (area->monitor_callback.is_valid()) {
+					for (auto &[id, rid] : stale) {
+						area->monitor_callback.call(PhysicsServer3D::AREA_BODY_REMOVED,
+							rid, ObjectID(id), 0, 0);
+					}
+				}
+			}
+			return;
+		}
 
 		// The area's world AABB comes straight off its persistent solid.
-		if (!area->hop_solid || area->hop_solid->get_shapes().empty()) return;
 		hop::aa_box<hop_scalar> area_aabb = area->hop_solid->get_world_bound();
 
 		// Find bodies overlapping the area's AABB. The buffer holds every solid in the
@@ -2413,36 +2463,51 @@ void HopPhysicsServer::_flush_queries() {
 			current_overlaps[body->object_instance_id] = body->self_rid;
 		}
 
-		// Fire ADDED callbacks for newly overlapping bodies
+		// Diff, COMMIT, then notify. The callbacks below run game code — a body_entered handler can
+		// free the body, teleport it, or disable another area — so our own record has to be the new
+		// one before any of it runs, and must not be touched again afterwards.
+		std::vector<std::pair<uint64_t, RID>> entered, exited;
 		for (auto &[id, rid] : current_overlaps) {
-			if (area->overlapping_bodies.find(id) == area->overlapping_bodies.end()) {
-				area->monitor_callback.call(
-					PhysicsServer3D::AREA_BODY_ADDED,
-					rid, ObjectID(id), 0, 0);
-			}
+			if (area->overlapping_bodies.find(id) == area->overlapping_bodies.end())
+				entered.push_back({ id, rid });
 		}
-
-		// Fire REMOVED callbacks for bodies that left
 		for (auto &[id, rid] : area->overlapping_bodies) {
-			if (current_overlaps.find(id) == current_overlaps.end()) {
-				area->monitor_callback.call(
-					PhysicsServer3D::AREA_BODY_REMOVED,
-					rid, ObjectID(id), 0, 0);
-			}
+			if (current_overlaps.find(id) == current_overlaps.end())
+				exited.push_back({ id, rid });
 		}
-
 		area->overlapping_bodies = current_overlaps;
+
+		Callable cb = area->monitor_callback;
+		for (auto &[id, rid] : entered)
+			cb.call(PhysicsServer3D::AREA_BODY_ADDED, rid, ObjectID(id), 0, 0);
+		for (auto &[id, rid] : exited)
+			cb.call(PhysicsServer3D::AREA_BODY_REMOVED, rid, ObjectID(id), 0, 0);
 	});
 
 	// Area-to-area monitoring: detect when areas (monitoring=true) overlap monitorable areas
 	area_owner.for_each([&](HopAreaData *detector) {
-		if (!detector->area_monitor_callback.is_valid()) return;
-		if (!detector->space_rid.is_valid()) return;
-		HopSpaceData *space = space_owner.get_or_null(detector->space_rid);
-		if (!space) return;
+		if (!detector->area_monitor_callback.is_valid() && detector->overlapping_areas.empty()) return;
+		HopSpaceData *space = detector->space_rid.is_valid() ? space_owner.get_or_null(detector->space_rid) : nullptr;
+		bool can_monitor = detector->area_monitor_callback.is_valid() && space
+			&& detector->hop_solid && !detector->hop_solid->get_shapes().empty();
+
+		// Same debt as the body pass: a detector that stops monitoring owes an exit for every area
+		// it was holding.
+		if (!can_monitor) {
+			if (!detector->overlapping_areas.empty()) {
+				std::map<uint64_t, RID> stale;
+				stale.swap(detector->overlapping_areas);
+				if (detector->area_monitor_callback.is_valid()) {
+					for (auto &[id, rid] : stale) {
+						detector->area_monitor_callback.call(PhysicsServer3D::AREA_BODY_REMOVED,
+							rid, ObjectID(id), 0, 0);
+					}
+				}
+			}
+			return;
+		}
 
 		// Detector AABB from its persistent solid.
-		if (!detector->hop_solid || detector->hop_solid->get_shapes().empty()) return;
 		hop::aa_box<hop_scalar> det_aabb = detector->hop_solid->get_world_bound();
 
 		// Broadphase the area index instead of scanning every area: the candidates
@@ -2468,21 +2533,23 @@ void HopPhysicsServer::_flush_queries() {
 			current_area_overlaps[target->object_instance_id] = target->self_rid;
 		}
 
-		// Fire ADDED callbacks for newly overlapping areas
+		// Diff, commit, then notify — as in the body pass.
+		std::vector<std::pair<uint64_t, RID>> entered, exited;
 		for (auto &[id, rid] : current_area_overlaps) {
-			if (detector->overlapping_areas.find(id) == detector->overlapping_areas.end()) {
-				detector->area_monitor_callback.call(
-					PhysicsServer3D::AREA_BODY_ADDED, rid, ObjectID(id), 0, 0);
-			}
+			if (detector->overlapping_areas.find(id) == detector->overlapping_areas.end())
+				entered.push_back({ id, rid });
 		}
-		// Fire REMOVED callbacks for areas that left
 		for (auto &[id, rid] : detector->overlapping_areas) {
-			if (current_area_overlaps.find(id) == current_area_overlaps.end()) {
-				detector->area_monitor_callback.call(
-					PhysicsServer3D::AREA_BODY_REMOVED, rid, ObjectID(id), 0, 0);
-			}
+			if (current_area_overlaps.find(id) == current_area_overlaps.end())
+				exited.push_back({ id, rid });
 		}
 		detector->overlapping_areas = current_area_overlaps;
+
+		Callable cb = detector->area_monitor_callback;
+		for (auto &[id, rid] : entered)
+			cb.call(PhysicsServer3D::AREA_BODY_ADDED, rid, ObjectID(id), 0, 0);
+		for (auto &[id, rid] : exited)
+			cb.call(PhysicsServer3D::AREA_BODY_REMOVED, rid, ObjectID(id), 0, 0);
 	});
 
 	flushing_queries = false;

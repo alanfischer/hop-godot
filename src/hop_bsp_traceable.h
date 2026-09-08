@@ -47,6 +47,15 @@ inline constexpr double DIST_EPSILON = 0.03125;
 // surfaces by, so a point this trace could legitimately produce is never called stuck.
 inline constexpr double STUCK_SLOP = DIST_EPSILON * 0.5;
 
+// How square-on a contact has to be before it is treated as a FACE (and so resolved
+// as a four-corner patch) rather than an edge or corner. cos(8 degrees): a box on a
+// GoldSrc ramp — the shallowest of which is well past this — still gets its patch,
+// while a body caught on a brush edge keeps the single honest point.
+inline constexpr double FACE_CONTACT_COS = 0.99;
+// A face narrower than this has no width worth two points; in GoldSrc units, a
+// quarter inch. Below it the corners collapse together and the patch is noise.
+inline constexpr double MIN_FACE_EXTENT = 0.25;
+
 // Engine-baked hull box sizes (Half-Life). These live in the engine, not the
 // file: the compiler expanded the clipnode trees for exactly these boxes, so a
 // consumer has to know them to pick a hull and offset the traced point.
@@ -231,21 +240,52 @@ inline bool hull_nearest_leaf_plane(const hull &h, int num, const double p[3], i
 // `bias` is the STUCK_SLOP plane TRANSLATION, whose question is directional ("is this
 // mover resting on the surface, or in it") and which no symmetric expansion expresses.
 struct sweep_skin {
-	double half[3] = { 0, 0, 0 };  // mover half-extents (GoldSrc units); expands the hull
+	// Support along the three GoldSrc axes — the mover's half-extents when unrotated,
+	// the rotated box's per-axis reach otherwise. Keeps the axial fast path one read.
+	double half[3] = { 0, 0, 0 };
 	double grow = 0;               // >= 0: crosspoint back-off (speculative margin)
 	double bias = 0;               // <= 0: the STUCK_SLOP plane translation, or 0 for none
 	bool boxed = false;            // any half-extent nonzero — keeps the point walk free of the math
+	// The mover's own axes and extents, for oblique planes. oriented == false means
+	// axis-aligned here, and the expansion is bit-identical to the pre-rotation trace.
+	bool oriented = false;
+	double axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+	double hext[3] = { 0, 0, 0 };
 };
 
 // How far the mover's box reaches past its centre along `pl`'s normal: the amount
 // that plane moves outward when the hull is expanded for this box. Axial planes
 // (pl.type < 3, the overwhelming majority in a BSP) read one extent directly.
-inline double plane_offset(const hop_bsp::BSPPlane &pl, const double half[3]) {
-	if (pl.type < 3) return half[pl.type];
-	const double nx = pl.normal[0] < 0 ? -pl.normal[0] : pl.normal[0];
-	const double ny = pl.normal[1] < 0 ? -pl.normal[1] : pl.normal[1];
-	const double nz = pl.normal[2] < 0 ? -pl.normal[2] : pl.normal[2];
-	return nx * half[0] + ny * half[1] + nz * half[2];
+// Reach of an axis-aligned box along `n`.
+template <typename N> inline double axis_support(const N n[3], const double ext[3]) {
+	return (n[0] < 0 ? -(double)n[0] : (double)n[0]) * ext[0] +
+	       (n[1] < 0 ? -(double)n[1] : (double)n[1]) * ext[1] +
+	       (n[2] < 0 ? -(double)n[2] : (double)n[2]) * ext[2];
+}
+
+// Reach of an ORIENTED box along `n`. Namesake of hoptri::obb_support, which returns
+// the support corner as a vector; this is the scalar reach, in GoldSrc doubles.
+template <typename N> inline double obb_support(const N n[3], const double axes[3][3], const double hext[3]) {
+	double sum = 0;
+	for (int j = 0; j < 3; ++j) {
+		const double d = (double)n[0] * axes[j][0] + (double)n[1] * axes[j][1] +
+		                 (double)n[2] * axes[j][2];
+		sum += (d < 0 ? -d : d) * hext[j];
+	}
+	return sum;
+}
+
+// The mover's reach along a direction, however it is shaped.
+template <typename N> inline double skin_support(const sweep_skin &skin, const N n[3]) {
+	return skin.oriented ? obb_support(n, skin.axes, skin.hext) : axis_support(n, skin.half);
+}
+
+// How far the mover reaches past its centre along `pl`'s normal: how far that plane
+// moves outward when the hull is expanded for it. An axial plane's normal IS a world
+// axis, so its support is one array read — rotated or not, and axial planes dominate.
+inline double plane_offset(const hop_bsp::BSPPlane &pl, const sweep_skin &skin) {
+	if (pl.type < 3) return skin.half[pl.type];
+	return skin_support(skin, pl.normal);
 }
 
 // Quake's SV_RecursiveHullCheck. Sweeps the point p1→p2 (GoldSrc space) through
@@ -253,7 +293,7 @@ inline double plane_offset(const hop_bsp::BSPPlane &pl, const double half[3]) {
 // trace has been stopped.
 inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
                                  const double p1[3], const double p2[3],
-                                 int blocking, hull_trace &tr, sweep_skin skin) {
+                                 int blocking, hull_trace &tr, const sweep_skin &skin) {
 	if (num < 0) {
 		if ((blocking & blocking_bit(num)) == 0) tr.allsolid = false;
 		return true;
@@ -266,7 +306,7 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 	// The plane, pushed out by the mover's box. `off` is 0 for a point walk, which
 	// is every trace against a sized hull (1..3): those trees are already expanded
 	// for their box by the compiler, so expanding again would double-count.
-	const double off = skin.boxed ? plane_offset(pl, skin.half) : 0.0;
+	const double off = skin.boxed ? plane_offset(pl, skin) : 0.0;
 
 	if (t1 >= off && t2 >= off)   return recursive_hull_check(h, h.child(num, 0), p1f, p2f, p1, p2, blocking, tr, skin);
 	if (t1 < -off && t2 < -off)   return recursive_hull_check(h, h.child(num, 1), p1f, p2f, p1, p2, blocking, tr, skin);
@@ -338,7 +378,7 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 
 // Full point sweep through one hull, GoldSrc space in and out.
 inline hull_trace hull_sweep_skin(const hull &h, const double start[3], const double end[3],
-                                  int blocking, sweep_skin skin) {
+                                  int blocking, const sweep_skin &skin) {
 	hull_trace tr;
 	for (int i = 0; i < 3; ++i) tr.endpos[i] = end[i];
 	if (!h.valid()) { tr.allsolid = false; return tr; }
@@ -351,9 +391,34 @@ inline hull_trace hull_sweep_skin(const hull &h, const double start[3], const do
 inline sweep_skin box_skin(const double half[3], double grow) {
 	sweep_skin s;
 	s.grow = grow;
+	// Its own axes ARE the world axes (the default), so hext is just half — consumers
+	// then need not care which kind of skin they were handed.
 	for (int i = 0; i < 3; ++i) {
 		s.half[i] = half[i];
+		s.hext[i] = half[i];
 		if (half[i] != 0.0) s.boxed = true;
+	}
+	return s;
+}
+
+// A skin for a box rotated in this hull's frame: `axes` its unit axes in GoldSrc
+// space, `hext` its extents along them. Per-axis support is derived once, here.
+inline sweep_skin obb_skin(const double axes[3][3], const double hext[3], double grow) {
+	sweep_skin s;
+	s.grow = grow;
+	s.oriented = true;
+	for (int j = 0; j < 3; ++j) {
+		s.hext[j] = hext[j];
+		for (int i = 0; i < 3; ++i) s.axes[j][i] = axes[j][i];
+	}
+	for (int i = 0; i < 3; ++i) {
+		double sum = 0;
+		for (int j = 0; j < 3; ++j) {
+			const double a = axes[j][i] < 0 ? -axes[j][i] : axes[j][i];
+			sum += a * hext[j];
+		}
+		s.half[i] = sum;
+		if (sum != 0.0) s.boxed = true;
 	}
 	return s;
 }
@@ -361,7 +426,9 @@ inline sweep_skin box_skin(const double half[3], double grow) {
 // The ordinary point sweep, stopped `grow` short of whatever it crosses.
 inline hull_trace hull_sweep(const hull &h, const double start[3], const double end[3],
                              int blocking = BLOCK_SOLID, double grow = 0) {
-	return hull_sweep_skin(h, start, end, blocking, sweep_skin{ { 0, 0, 0 }, grow, 0.0, false });
+	sweep_skin point_skin;
+	point_skin.grow = grow;
+	return hull_sweep_skin(h, start, end, blocking, point_skin);
 }
 
 // The same sweep for a mover with size: the hull is expanded by `half` as the walk
@@ -380,6 +447,14 @@ inline hull_trace hull_sweep_stuck_band(const hull &h, const double start[3],
                                         const double end[3], int blocking,
                                         const double half[3] = nullptr) {
 	sweep_skin skin = half ? box_skin(half, 0.0) : sweep_skin{};
+	skin.bias = -STUCK_SLOP;
+	return hull_sweep_skin(h, start, end, blocking, skin);
+}
+
+inline hull_trace hull_sweep_stuck_band(const hull &h, const double start[3],
+                                        const double end[3], int blocking,
+                                        sweep_skin skin) {
+	skin.grow = 0.0;
 	skin.bias = -STUCK_SLOP;
 	return hull_sweep_skin(h, start, end, blocking, skin);
 }
@@ -411,6 +486,29 @@ inline hull_trace hull_sweep_off_surface(const hull &h, const double start[3],
 	for (int i = 0; i < 3; ++i) from[i] = start[i] - dir[i] / len * back;
 	hull_trace nudged = half ? hull_sweep_box(h, from, end, blocking, half, 0.0)
 	                         : hull_sweep(h, from, end, blocking, 0.0);
+	if (!nudged.hit) return miss;
+	nudged.fraction = (nudged.fraction * (len + back) - back) / len;
+	if (nudged.fraction < 0.0) nudged.fraction = 0.0;
+	return nudged;
+}
+
+inline hull_trace hull_sweep_off_surface(const hull &h, const double start[3],
+                                         const double end[3], int blocking,
+                                         sweep_skin skin) {
+	hull_trace miss;
+	miss.hit = false;
+	double dir[3], len2 = 0;
+	for (int i = 0; i < 3; ++i) {
+		dir[i] = end[i] - start[i];
+		len2 += dir[i] * dir[i];
+	}
+	if (len2 <= 0) return miss;
+	const double len = std::sqrt(len2);
+	const double back = DIST_EPSILON * 2.0;
+	double from[3];
+	for (int i = 0; i < 3; ++i) from[i] = start[i] - dir[i] / len * back;
+	skin.grow = 0.0;
+	hull_trace nudged = hull_sweep_skin(h, from, end, blocking, skin);
 	if (!nudged.hit) return miss;
 	nudged.fraction = (nudged.fraction * (len + back) - back) / len;
 	if (nudged.fraction < 0.0) nudged.fraction = 0.0;
@@ -661,6 +759,9 @@ public:
 		//   half     the mover's own half-extents, which expand the hull as it is walked
 		double offset[3], box_mins[3], box_maxs[3];
 		double half[3] = { 0, 0, 0 };
+		bool oriented = false;
+		double obb_axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+		double obb_hext[3] = { 0, 0, 0 };
 
 		if (hi == 0) {
 			// Hull 0 is the point hull, and GoldSrc's low-corner alignment is a poor
@@ -681,12 +782,9 @@ public:
 				offset[i] = (mins[i] + maxs[i]) * 0.5;
 				half[i] = (maxs[i] - mins[i]) * 0.5;
 			}
-			// The tree contributes nothing, so the effective box is the mover's own,
-			// recentred on the traced point.
-			for (int i = 0; i < 3; ++i) {
-				box_mins[i] = mins[i] - offset[i];
-				box_maxs[i] = maxs[i] - offset[i];
-			}
+			// A rotated box reaches further on some axes and less on others; the local
+			// AABB knows neither.
+			oriented = mover_obb(s, orientation, obb_axes, obb_hext);
 		} else {
 			// The three sized hulls are boxes a mover is meant to match, and there
 			// GoldSrc's own rule is right: trace (origin + mins - clip_mins), aligning
@@ -757,6 +855,23 @@ public:
 		double extent[3];
 		for (int i = 0; i < 3; ++i) extent[i] = box_maxs[i] - box_mins[i];
 
+		// One skin for the whole trace, so a rotated mover cannot be expanded one way
+		// on the main sweep and another on a retry.
+		const hopbsp::sweep_skin skin = oriented
+			? hopbsp::obb_skin(obb_axes, obb_hext, margin_gs)
+			: hopbsp::box_skin(half, margin_gs);
+		if (oriented) {
+			for (int i = 0; i < 3; ++i) half[i] = skin.half[i];
+		}
+		if (hi == 0) {
+			// The tree contributes nothing, so the effective box is the mover's own,
+			// recentred on the traced point.
+			for (int i = 0; i < 3; ++i) {
+				box_mins[i] = -half[i];
+				box_maxs[i] = half[i];
+			}
+		}
+
 		double n[3], depth = 0;
 		bool start_in_solid = false;
 		const bool inside = hopbsp::hull_push_out(h, h.root, start, blocking_, extent, n, depth,
@@ -820,10 +935,13 @@ public:
 			hop::vec3<T> p_local = gs_to_godot(start[0] - offset[0], start[1] - offset[1], start[2] - offset[2]);
 			to_world(p_local, n_local, position, orientation, result.point, result.normal);
 			result.impact = result.point;
+			double org_rest[3];
+			for (int i = 0; i < 3; ++i) org_rest[i] = start[i] - offset[i];
+			emit_manifold(result, s, h, skin, n, org_rest, margin_gs, position, orientation);
 			return;
 		}
 
-		hopbsp::hull_trace ht = hopbsp::hull_sweep_box(h, start, end, blocking_, half, margin_gs);
+		hopbsp::hull_trace ht = hopbsp::hull_sweep_skin(h, start, end, blocking_, skin);
 
 		// `margin_gs` inflates the hull, so a mover merely RESTING against a wall
 		// starts the sweep inside the inflated solid even though it is not touching
@@ -843,8 +961,11 @@ public:
 		// outside the real geometry (hull_push_out already established it is not
 		// embedded), so this is an ordinary empty-to-solid trace and it stops on the
 		// surface the mover is actually driving into.
-		if (!ht.hit && ht.allsolid && margin_gs > 0)
-			ht = hopbsp::hull_sweep_box(h, start, end, blocking_, half, 0.0);
+		if (!ht.hit && ht.allsolid && margin_gs > 0) {
+			hopbsp::sweep_skin bare = skin;
+			bare.grow = 0.0;
+			ht = hopbsp::hull_sweep_skin(h, start, end, blocking_, bare);
+		}
 
 		// Still no answer: the start is EXACTLY on the surface it is driving into.
 		// The hull walk calls a start on the plane solid and gives up, so a mover
@@ -861,7 +982,7 @@ public:
 		// special case: backing off puts the start inside the solid it is leaving, the
 		// walk gives up again, and the move stays free, which is correct.
 		if (!ht.hit && ht.allsolid) {
-			hopbsp::hull_trace nudged = hopbsp::hull_sweep_off_surface(h, start, end, blocking_, half);
+			hopbsp::hull_trace nudged = hopbsp::hull_sweep_off_surface(h, start, end, blocking_, skin);
 			if (nudged.hit) ht = nudged;
 		}
 
@@ -882,7 +1003,7 @@ public:
 		// reported above, shallower and the start is not in solid at all — which is
 		// where traces routinely leave bodies, DIST_EPSILON being twice it.
 		if (!ht.hit && ht.allsolid && !inside)
-			ht = hopbsp::hull_sweep_stuck_band(h, start, end, blocking_, half);
+			ht = hopbsp::hull_sweep_stuck_band(h, start, end, blocking_, skin);
 
 		if (!ht.hit || (T)ht.fraction >= result.time) return;
 		if (hopbsp::stopped_against_sky(h, ht, blocking_)) return;
@@ -899,10 +1020,7 @@ public:
 		// the same terms the overlap branch does. Zero margin (the public query) keeps
 		// an exact depth of zero, since a mover that is merely touching is not inside.
 		if (margin_gs > 0 && ht.fraction <= 0) {
-			double reach = 0;
-			for (int i = 0; i < 3; ++i)
-				reach += (ht.normal[i] < 0 ? -ht.normal[i] : ht.normal[i]) * half[i];
-			const double limit = reach + margin_gs;
+			const double limit = hopbsp::skin_support(skin, ht.normal) + margin_gs;
 			const double dir[3] = { -ht.normal[0], -ht.normal[1], -ht.normal[2] };
 			const double gap = surface_gap(h, start, dir, limit);
 			if (gap >= 0 && limit - gap > 0) result.depth = (T)((limit - gap) * scale_);
@@ -940,17 +1058,100 @@ public:
 		// result.impact also feeds velocity_at_local for moving-platform carry, where it
 		// is the same improvement — a rider samples a turning platform's ω×r at the point
 		// it stands on rather than at a corner of its own bounding box.
-		double reach = 0;
-		for (int i = 0; i < 3; ++i) {
-			const double h = (box_maxs[i] - box_mins[i]) * 0.5;
-			reach += (ht.normal[i] < 0 ? -ht.normal[i] : ht.normal[i]) * h;
-		}
+		const double box_half[3] = { (box_maxs[0] - box_mins[0]) * 0.5,
+		                             (box_maxs[1] - box_mins[1]) * 0.5,
+		                             (box_maxs[2] - box_mins[2]) * 0.5 };
+		const double reach = oriented ? hopbsp::obb_support(ht.normal, obb_axes, obb_hext)
+		                              : hopbsp::axis_support(ht.normal, box_half);
 		double w[3];
 		for (int i = 0; i < 3; ++i)
 			w[i] = ht.endpos[i] - ht.normal[i] * reach;
 		hop::vec3<T> impact_local = gs_to_godot(w[0], w[1], w[2]);
 		hop::vec3<T> ignored;
 		to_world(impact_local, n_local, position, orientation, result.impact, ignored);
+
+		// Everything above resolves the contact to ONE point, which is all a hull trace
+		// can say about where a body touches. emit_manifold answers the other half of
+		// the question — how WIDE that touch is — for the case where it is answerable.
+		double org_sweep[3];
+		for (int i = 0; i < 3; ++i) org_sweep[i] = ht.endpos[i] - offset[i];
+		emit_manifold(result, s, h, skin, ht.normal, org_sweep, margin_gs, position, orientation);
+	}
+
+	// The corners of the mover's support face, as a contact patch — the width the
+	// single down-the-normal witness cannot have.
+	//
+	// Gated because a patch would otherwise be a lie: a body that cannot spin has no
+	// use for a lever arm, a query cannot use one either, a normal not square-on to a
+	// face means an edge or corner contact, and a corner with nothing beneath IT is
+	// not carrying load, so a box overhanging a ledge tips instead.
+	void emit_manifold(hop::collision<T> &result, hop::solid<T> *s,
+	                   const hopbsp::hull &h, const hopbsp::sweep_skin &skin,
+	                   const double surf_n[3], const double org[3], double margin_gs,
+	                   const hop::vec3<T> &position, const hop::mat3<T> &orientation) const {
+		// manager.h's contract separates the callers: discovery passes the speculative
+		// margin, queries pass 0. First because it is a register compare, where
+		// rotates_dynamically() reaches into the solid.
+		if (margin_gs <= 0) return;
+		if (s == nullptr || !s->rotates_dynamically()) return;
+		// Hulls 1..3 are pre-expanded for a FIXED box, so the mover's own corners are
+		// not where that expansion assumed. (skin.boxed is false exactly there.)
+		if (!skin.boxed) return;
+		// test_solid reuses one collision across every shape pair without clearing the
+		// patch, so a compound mover would append a second face onto the first's.
+		result.clear_patch();
+
+		// box_skin leaves axes identity and hext the per-axis reach, so the unrotated
+		// case needs no special handling — its face is a world-axis face.
+		const double (*ax_v)[3] = skin.axes;
+		const double *hext = skin.hext;
+
+		// The box face pointing most directly into the surface.
+		int ax = 0;
+		double best = 0, best_dot = 0;
+		for (int j = 0; j < 3; ++j) {
+			const double d = surf_n[0] * ax_v[j][0] + surf_n[1] * ax_v[j][1] + surf_n[2] * ax_v[j][2];
+			const double a = d < 0 ? -d : d;
+			if (a > best) { best = a; best_dot = d; ax = j; }
+		}
+		if (best < hopbsp::FACE_CONTACT_COS) return;
+
+		const int u = (ax + 1) % 3, v = (ax + 2) % 3;
+		if (hext[u] <= hopbsp::MIN_FACE_EXTENT || hext[v] <= hopbsp::MIN_FACE_EXTENT) return;
+
+		// The face on the surface's side: a floor supports the box's underside, i.e. the
+		// end of the ax axis that points AGAINST the surface normal.
+		const double face = (best_dot > 0) ? -hext[ax] : hext[ax];
+		// Must clear the speculative margin: a body at rest sits inside that shell, not
+		// on the surface, and a stuck-band-sized probe finds empty space under every
+		// corner.
+		const double probe = margin_gs + hopbsp::STUCK_SLOP + hopbsp::DIST_EPSILON;
+
+		int emitted = 0;
+		for (int c = 0; c < 4; ++c) {
+			// Stop once the corners left cannot reach two — the overhang and edge cases.
+			if (emitted + (4 - c) < 2) break;
+			const double du = (c & 1) ? hext[u] : -hext[u];
+			const double dv = (c & 2) ? hext[v] : -hext[v];
+			double corner[3], under[3];
+			for (int i = 0; i < 3; ++i) {
+				corner[i] = org[i] + ax_v[ax][i] * face + ax_v[u][i] * du + ax_v[v][i] * dv;
+				under[i] = corner[i] - surf_n[i] * probe;
+			}
+			if ((blocking_ & hopbsp::blocking_bit(
+			        hopbsp::hull_point_contents(h, h.root, under))) == 0)
+				continue;
+
+			const hop::vec3<T> pt_world =
+				point_to_world(gs_to_godot(corner[0], corner[1], corner[2]), position, orientation);
+			// Face axis and corner index, so the same physical corner lands in the same
+			// warm-start slot next tick. +1 keeps it clear of no_feature.
+			result.add_patch_point(pt_world, result.normal, result.depth, ax * 4 + c + 1);
+			++emitted;
+		}
+
+		// One corner is not a patch, and the representative point says it better.
+		if (result.patch_count < 2) result.clear_patch();
 	}
 
 	// Contents at a Godot-space point, for tests and callers that want the raw
@@ -1025,6 +1226,19 @@ private:
 		}
 	}
 
+	hop::vec3<T> point_to_world(const hop::vec3<T> &p_local, const hop::vec3<T> &position,
+	                            const hop::mat3<T> &orientation) const {
+		static const hop::mat3<T> identity;
+		hop::vec3<T> out;
+		if (orientation != identity) {
+			hop::mul(out, orientation, p_local);
+			hop::add(out, position);
+		} else {
+			hop::add(out, p_local, position);
+		}
+		return out;
+	}
+
 	void to_world(const hop::vec3<T> &p_local, const hop::vec3<T> &n_local,
 	              const hop::vec3<T> &position, const hop::mat3<T> &orientation,
 	              hop::vec3<T> &p_out, hop::vec3<T> &n_out) const {
@@ -1037,6 +1251,59 @@ private:
 			hop::add(p_out, p_local, position);
 			n_out = n_local;
 		}
+	}
+
+	// The mover's box axes and extents in this hull's frame, GoldSrc units.
+	//
+	// Only for a solid that IS one centred box. Of the restrictions, only the shape
+	// count is fundamental: plane_offset returns ONE symmetric offset, which a union
+	// with asymmetric reach cannot express. Off-centre boxes are refused because the
+	// trace point is taken from the AABB centre — liftable by deriving it from the
+	// rotated box's centre, as trace_solid_rotated already does.
+	//
+	// False when already axis-aligned here, so an unrotated body is bit-identical.
+	bool mover_obb(hop::solid<T> *s, const hop::mat3<T> &orientation,
+	               double axes[3][3], double hext[3]) const {
+		if (s == nullptr) return false;
+		const auto &shapes = s->get_shapes();
+		if (shapes.size() != 1) return false;
+		hop::shape<T> *sh = shapes[0].get();
+		if (sh->get_type() != hop::shape_type::box) return false;
+
+		const hop::vec3<T> &lp = sh->get_local_position();
+		const hop::aa_box<T> &b = sh->get_box();
+		hop::vec3<T> centre;
+		hop::add(centre, b.mins, b.maxs);
+		hop::mul(centre, hop::scalar_traits<T>::half());
+		// Off-centre in the solid's frame: the rotation would move the trace point.
+		if (!(centre.x == T {} && centre.y == T {} && centre.z == T {} &&
+		      lp.x == T {} && lp.y == T {} && lp.z == T {}))
+			return false;
+
+		// Q is identity exactly when Rm == orientation (orthonormal), so the common
+		// unrotated case is settled by a compare, before any matrix products.
+		hop::mat3<T> Rm;
+		hop::mul(Rm, s->get_orientation(), sh->get_local_rotation());
+		if (Rm == orientation) return false;  // axis-aligned here: nothing to honour
+
+		hop::mat3<T> Rt, Q;
+		hop::transpose(Rt, orientation);
+		hop::mul(Q, Rt, Rm);
+
+		hop::vec3<T> half_ext;
+		hop::sub(half_ext, b.maxs, b.mins);
+		hop::mul(half_ext, hop::scalar_traits<T>::half());
+		const double h[3] = { (double)half_ext.x, (double)half_ext.y, (double)half_ext.z };
+
+		// mat3 is column-major, so column j IS box axis j. Godot (x,y,z) -> GoldSrc
+		// (-x, z, y); a direction, so no scale.
+		for (int j = 0; j < 3; ++j) {
+			axes[j][0] = -(double)Q.at(0, j);
+			axes[j][1] = (double)Q.at(2, j);
+			axes[j][2] = (double)Q.at(1, j);
+			hext[j] = h[j] * inv_scale_;
+		}
+		return true;
 	}
 
 	// The mover's own box, in GoldSrc units. hop maintains this union for us and

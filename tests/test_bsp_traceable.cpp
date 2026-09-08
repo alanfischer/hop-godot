@@ -26,201 +26,7 @@ using T = double;
 using V = hop::vec3<T>;
 using namespace hop_bsp;
 
-static const double SCALE = 0.025;  // WizardWars' GameConsts.SCALE_FACTOR
-
-static V vec(T x, T y, T z) { V v; v.set(x, y, z); return v; }
-static bool approx(T a, T b, T tol = 1e-3) { return std::fabs(a - b) < tol; }
-static bool approx_v(const V &v, T x, T y, T z, T tol = 1e-3) {
-	return approx(v.x, x, tol) && approx(v.y, y, tol) && approx(v.z, z, tol);
-}
-
-// --- synthetic blob authoring ---------------------------------------------
-
-struct BlobBuilder {
-	std::vector<BSPPlane> planes;
-	std::vector<BSPNode> nodes;
-	std::vector<BSPClipNode> clipnodes;
-	std::vector<BSPLeaf> leafs;
-	std::vector<BSPModel> models;
-
-	std::vector<uint8_t> build() const {
-		std::vector<uint8_t> out(sizeof(BSPHeader), 0);
-		BSPHeader hdr {};
-		hdr.version = HLBSP_VERSION;
-
-		auto put = [&](int idx, const void *data, size_t sz) {
-			if (sz == 0) return;
-			hdr.lumps[idx].fileofs = (int32_t)out.size();
-			hdr.lumps[idx].filelen = (int32_t)sz;
-			const uint8_t *p = (const uint8_t *)data;
-			out.insert(out.end(), p, p + sz);
-		};
-		put(LUMP_PLANES, planes.data(), planes.size() * sizeof(BSPPlane));
-		put(LUMP_NODES, nodes.data(), nodes.size() * sizeof(BSPNode));
-		put(LUMP_CLIPNODES, clipnodes.data(), clipnodes.size() * sizeof(BSPClipNode));
-		put(LUMP_LEAFS, leafs.data(), leafs.size() * sizeof(BSPLeaf));
-		put(LUMP_MODELS, models.data(), models.size() * sizeof(BSPModel));
-
-		memcpy(out.data(), &hdr, sizeof(BSPHeader));
-		return out;
-	}
-};
-
-// Six axis planes bounding [mins, maxs], appended to `planes`. Returns the index
-// of the first. Plane k*2 is the lower bound on axis k, k*2+1 the upper.
-static int add_box_planes(BlobBuilder &b, const double mins[3], const double maxs[3]) {
-	int first = (int)b.planes.size();
-	for (int axis = 0; axis < 3; ++axis) {
-		for (int hi = 0; hi < 2; ++hi) {
-			BSPPlane p {};
-			p.normal[axis] = 1.0f;
-			p.dist = (float)(hi ? maxs[axis] : mins[axis]);
-			p.type = axis;  // axial — exercises the fast `p[type] - dist` path
-			b.planes.push_back(p);
-		}
-	}
-	return first;
-}
-
-// A solid axis-aligned box brush as a 6-deep tree. Descending "inward" on every
-// plane lands in SOLID; stepping outside any one of them lands in EMPTY.
-//
-// Leaf convention (matching a real BSP): leaf 0 is the solid leaf.
-//
-// `outside` overrides where "not in this box" goes, so brushes can be chained into a
-// union: give brush A the root of brush B and the tree reads "solid if inside A, else
-// test B" — which is what lets a fixture have a leaf bounded by another brush's face.
-// Returns the root node/clipnode index of the brush just added.
-static int add_box_brush(BlobBuilder &b, const double mins[3], const double maxs[3],
-                         bool as_nodes, int contents = CONTENTS_SOLID,
-                         int outside = 1) {  // 1 = "use the default empty child"
-	const int p0 = add_box_planes(b, mins, maxs);
-	const int base = as_nodes ? (int)b.nodes.size() : (int)b.clipnodes.size();
-
-	if (as_nodes && b.leafs.empty()) {
-		BSPLeaf solid {}; solid.contents = contents;
-		BSPLeaf empty {}; empty.contents = CONTENTS_EMPTY;
-		b.leafs.push_back(solid);
-		b.leafs.push_back(empty);
-	}
-	// hull 0 addresses leafs as -(leaf+1); hulls 1..3 store the contents directly.
-	const int SOLID_CHILD = as_nodes ? -1 : contents;
-	const int EMPTY_CHILD = outside != 1 ? outside : (as_nodes ? -2 : CONTENTS_EMPTY);
-
-	for (int i = 0; i < 6; ++i) {
-		const bool upper = (i % 2) == 1;
-		const int inward = (i == 5) ? SOLID_CHILD : (base + i + 1);
-		int child0, child1;
-		if (upper) { child0 = EMPTY_CHILD; child1 = inward; }
-		else       { child0 = inward;      child1 = EMPTY_CHILD; }
-		if (as_nodes) {
-			BSPNode n {};
-			n.planenum = p0 + i;
-			n.children[0] = (int16_t)child0;
-			n.children[1] = (int16_t)child1;
-			b.nodes.push_back(n);
-		} else {
-			BSPClipNode n {};
-			n.planenum = p0 + i;
-			n.children[0] = (int16_t)child0;
-			n.children[1] = (int16_t)child1;
-			b.clipnodes.push_back(n);
-		}
-	}
-	return base;
-}
-
-// One model whose hull 0 is a box brush and whose hulls 1..3 are that same brush
-// expanded by each engine hull size — exactly what the map compiler bakes.
-static std::vector<uint8_t> make_box_map(const double mins[3], const double maxs[3],
-                                         int contents = CONTENTS_SOLID) {
-	BlobBuilder b;
-	BSPModel m {};
-	for (int i = 0; i < 3; ++i) { m.mins[i] = (float)mins[i]; m.maxs[i] = (float)maxs[i]; }
-
-	m.headnode[0] = 0;
-	add_box_brush(b, mins, maxs, /*as_nodes=*/true, contents);
-
-	for (int h = 1; h < 4; ++h) {
-		double emins[3], emaxs[3];
-		for (int i = 0; i < 3; ++i) {
-			emins[i] = mins[i] - hopbsp::HULL_SIZES[h].maxs[i];
-			emaxs[i] = maxs[i] - hopbsp::HULL_SIZES[h].mins[i];
-		}
-		m.headnode[h] = (int32_t)b.clipnodes.size();
-		add_box_brush(b, emins, emaxs, /*as_nodes=*/false, contents);
-	}
-	b.models.push_back(m);
-	return b.build();
-}
-
-// A floor with a wall standing on it, as a union of two brushes, sized so that in
-// hull 1 the wall's solid begins exactly where the floor's ends (z = 36 — the floor
-// top at 0, raised by the hull's 36-unit half-height).
-//
-// That seam is not contrived: it is where every standing player's trace point lives.
-// A hull-1 mover is traced as the point at feet + 36, so a player resting on a floor
-// sits EXACTLY on that floor's expanded top plane, and if they are pushed into a wall
-// rising off that floor, the leaf they land in is bounded by that plane at distance
-// zero. ww_golem's cockpit is this shape (deck at z=-112, seam at -76).
-static std::vector<uint8_t> make_wall_on_floor_map() {
-	// Floor: everything below z = 0. Wall: everything at x <= -8 above z = 72.
-	// Expanded for hull h the floor tops out at -HULL.mins.z and the wall starts at
-	// 72 - -HULL.mins.z, which meet for hull 1 (36) — the case under test. For the
-	// other hulls they simply overlap, which is just as solid.
-	const double fmins[3] = { -4096, -4096, -4096 }, fmaxs[3] = { 4096, 4096, 0 };
-	const double wmins[3] = { -4096, -4096, 72 }, wmaxs[3] = { -8, 4096, 4096 };
-
-	BlobBuilder b;
-	BSPModel m {};
-	for (int i = 0; i < 3; ++i) { m.mins[i] = (float)fmins[i]; m.maxs[i] = (float)wmaxs[i]; }
-	m.maxs[0] = (float)fmaxs[0];
-	m.maxs[1] = (float)fmaxs[1];
-
-	// Floor first so the wall can point its "outside" children at it.
-	const int f0 = add_box_brush(b, fmins, fmaxs, /*as_nodes=*/true);
-	m.headnode[0] = add_box_brush(b, wmins, wmaxs, /*as_nodes=*/true, CONTENTS_SOLID, f0);
-
-	for (int h = 1; h < 4; ++h) {
-		double efmins[3], efmaxs[3], ewmins[3], ewmaxs[3];
-		for (int i = 0; i < 3; ++i) {
-			efmins[i] = fmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
-			efmaxs[i] = fmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
-			ewmins[i] = wmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
-			ewmaxs[i] = wmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
-		}
-		const int ef = add_box_brush(b, efmins, efmaxs, /*as_nodes=*/false);
-		m.headnode[h] = add_box_brush(b, ewmins, ewmaxs, /*as_nodes=*/false, CONTENTS_SOLID, ef);
-	}
-	b.models.push_back(m);
-	return b.build();
-}
-
-// A wide, thin slab centred on the GoldSrc origin: a floor whose top face sits at
-// z = 0, i.e. Godot y = 0.
-static std::vector<uint8_t> make_floor_map() {
-	const double mins[3] = { -512, -512, -64 };
-	const double maxs[3] = { 512, 512, 0 };
-	return make_box_map(mins, maxs);
-}
-
-static std::unique_ptr<HopBspTraceable<T>> load(const std::vector<uint8_t> &blob,
-                                                int blocking = hopbsp::BLOCK_SOLID) {
-	auto t = std::make_unique<HopBspTraceable<T>>();
-	bool ok = t->build(blob.data(), blob.size(), 0, (T)SCALE, blocking);
-	assert(ok && "blob failed to parse");
-	(void)ok;
-	return t;
-}
-
-static std::shared_ptr<hop::solid<T>> make_box_solid(T hx, T hy, T hz) {
-	hop::aa_box<T> b;
-	b.mins = vec(-hx, -hy, -hz);
-	b.maxs = vec(hx, hy, hz);
-	auto s = std::make_shared<hop::solid<T>>();
-	s->add_shape(std::make_shared<hop::shape<T>>(b));
-	return s;
-}
+#include "bsp_fixtures.h"
 
 // Sweep `s` from `from` along `motion` and return what it hit. Every solid test
 // below is one of these plus its assertions; a zero `motion` is the static
@@ -954,6 +760,294 @@ static void test_touching_sweep_reports_the_margin_gap() {
 	printf("  touching_sweep_reports_the_margin_gap ok\n");
 }
 
+
+// --- contact manifold -----------------------------------------------------
+//
+// The four-corner patch a resting box gets, and every case where it must NOT be
+// produced. A patch exists to give the solver lever arms wide enough to resist
+// rocking; produced where it doesn't belong it would invent support that isn't there.
+
+// Sweep and hand back the whole collision; the patch, if there is one, rides in it.
+// A patch is produced only for the solver's discovery pass, which is the caller that
+// passes a speculative margin (manager.h's contract). So these trace the way discovery
+// does; a margin of 0 is a query and correctly gets the single point.
+static hop::collision<T> sweep_patch(HopBspTraceable<T> &t, std::shared_ptr<hop::solid<T>> s,
+                                     V from, V motion, T margin = (T)0.02) {
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(from, motion);
+	c.reset();
+	t.trace_solid(c, s.get(), V {}, hop::mat3<T>(), seg, margin);
+	return c;
+}
+
+static void test_manifold_gives_a_resting_box_four_corners() {
+	auto t = load(make_floor_map());       // floor top at GoldSrc z=0 => Godot y=0
+	auto box = make_spinning_box(0.2, 0.05, 0.2);
+	// Drop it onto the floor: it lands flat, so all four corners are over solid.
+	const hop::collision<T> c = sweep_patch(*t, box, vec(0, 0.4, 0), vec(0, -0.5, 0));
+	const int n = c.patch_count;
+	assert(n == 4 && "a box landing flat on a floor has a four-corner patch");
+
+	// Every point on the floor, every normal up, and all four distinct. "On the floor"
+	// means within the speculative margin of it: discovery finds a contact before the
+	// surfaces touch, which is the whole point of the margin.
+	for (int i = 0; i < n; ++i) {
+		assert(c.patch[i].impact.y >= -1e-3 && c.patch[i].impact.y <= 0.03);
+		assert(approx_v(c.patch[i].normal, 0, 1, 0));
+		for (int j = i + 1; j < n; ++j) {
+			const V &a = c.patch[i].impact, &b = c.patch[j].impact;
+			assert(!(approx(a.x, b.x, 1e-4) && approx(a.z, b.z, 1e-4)) &&
+			       "patch corners must be distinct");
+			assert(c.patch[i].feature != c.patch[j].feature &&
+			       "each corner needs its own feature id to warm-start from");
+		}
+	}
+	printf("  manifold_gives_a_resting_box_four_corners ok\n");
+}
+
+static void test_manifold_is_not_produced_for_a_body_that_cannot_spin() {
+	auto t = load(make_floor_map());
+	auto box = make_box_solid(0.2, 0.05, 0.2);   // no inertia: lock_rotation's shape
+	const hop::collision<T> c = sweep_patch(*t, box, vec(0, 0.4, 0), vec(0, -0.5, 0));
+	assert(c.patch_count == 0 && "a non-rotating body must stay on the single-point path exactly");
+	printf("  manifold_is_not_produced_for_a_body_that_cannot_spin ok\n");
+}
+
+static void test_manifold_drops_corners_that_overhang() {
+	// Floor occupying x <= 0 only, so a box straddling x=0 has two corners over
+	// solid and two over nothing. It must report the two, and tip over the edge —
+	// not be held up by four corners its bounding box merely implies.
+	const double fmins[3] = { -4096, -4096, -64 }, fmaxs[3] = { 0, 4096, 0 };
+	auto t = load(make_box_map(fmins, fmaxs));
+	auto box = make_spinning_box(0.2, 0.05, 0.2);
+
+	// The axis flips sign between the spaces (godot X maps to -gs X), so the solid
+	// half is Godot x >= 0. Straddle the lip with the box's centre 0.1 inside it:
+	// half-width 0.2 puts one pair of corners at x=+0.3 over solid and the other at
+	// x=-0.1 over nothing. Deliberately NOT centred exactly on x=0 — a box whose
+	// corners sit precisely on the boundary plane is a coin-flip about which side
+	// they count as, and that is a question about plane arithmetic, not about patches.
+	const hop::collision<T> c = sweep_patch(*t, box, vec(0.1, 0.4, 0), vec(0, -0.5, 0));
+	assert(c.patch_count == 2 && "only the supported corners belong in the patch");
+	for (int i = 0; i < c.patch_count; ++i)
+		assert(c.patch[i].impact.x > 0.25 && "the overhanging corners are the dropped ones");
+	printf("  manifold_drops_corners_that_overhang ok\n");
+}
+
+static void test_manifold_is_not_produced_on_an_edge_contact() {
+	// A wall: the box drives into it sideways, so the contact normal is horizontal
+	// while the box is still falling. A four-point coplanar patch on a contact that
+	// is really an edge would fabricate support, so the trace must decline.
+	auto t = load(make_wall_on_floor_map());
+	auto box = make_spinning_box(0.2, 0.05, 0.2);
+
+	// Well above the floor, driving at the wall face (wall is x <= -8 GS above z=72).
+	const hop::collision<T> c = sweep_patch(*t, box, vec(0.5, 2.5, 0), vec(-0.5, 0, 0));
+	const int n = c.patch_count;
+	// Either it hit the wall square (a face patch is legitimate) or it did not hit
+	// at all; what must never happen is a patch on a non-axial normal.
+	for (int i = 0; i < n; ++i) {
+		const V &nn = c.patch[i].normal;
+		const double m = std::max({ std::fabs(nn.x), std::fabs(nn.y), std::fabs(nn.z) });
+		assert(m > 0.98 && "a patch may only be reported for a near-axial face contact");
+	}
+	printf("  manifold_is_not_produced_on_an_edge_contact ok\n");
+}
+
+static void test_manifold_corners_straddle_the_representative_point() {
+	// The single point still has to be right: it is what every existing reader uses.
+	// The patch surrounds it, so their centroid should land back on it.
+	auto t = load(make_floor_map());
+	auto box = make_spinning_box(0.2, 0.05, 0.2);
+	const hop::collision<T> c = sweep_patch(*t, box, vec(0, 0.4, 0), vec(0, -0.5, 0));
+	assert(c.patch_count == 4);
+
+	V sum = vec(0, 0, 0);
+	for (int i = 0; i < c.patch_count; ++i) hop::add(sum, c.patch[i].impact);
+	hop::mul(sum, (T)0.25);
+	assert(approx_v(sum, c.impact.x, c.impact.y, c.impact.z, 1e-3) &&
+	       "the patch centroid is the representative point it widens");
+	printf("  manifold_corners_straddle_the_representative_point ok\n");
+}
+
+
+// --- end to end ------------------------------------------------------------
+//
+// Every test above calls trace_solid directly, which verifies the producer and
+// nothing else. This one runs the simulator: a plate dropped on a BSP floor, wired
+// the way hop-godot wires it (the traceable is a shape on a static solid, reached
+// through collide.h's test_solid — NOT through the manager, whose trace_solid is a
+// no-op here). If the patch does not reach the touch cache, this is what catches it.
+
+static std::shared_ptr<hop::simulator<T>> make_world_with_floor(
+    std::unique_ptr<HopBspTraceable<T>> trace, std::shared_ptr<hop::solid<T>> &world_out) {
+	auto sim = std::make_shared<hop::simulator<T>>();
+	sim->set_gravity(vec(0, -20, 0));
+	// As HopSpaceData wires it. hop's own default is sweep_slide, which is the mode
+	// hop-godot gives KINEMATIC bodies only; anything dynamic — every body that can
+	// tumble, and so the only kind a patch is for — resolves speculatively.
+	sim->set_default_contact_mode(hop::contact_mode::speculative);
+	auto world = std::make_shared<hop::solid<T>>();
+	world->set_infinite_mass();
+	world->set_coefficient_of_gravity(T {});
+	world->add_shape(std::make_shared<hop::shape<T>>(std::move(trace)));
+	sim->add_solid(world);
+	world_out = world;
+	return sim;
+}
+
+static void test_a_query_gets_no_patch() {
+	// margin 0 is the public query contract. It must cost nothing extra and say what
+	// it always said: one contact.
+	auto t = load(make_floor_map());
+	auto box = make_spinning_box(0.2, 0.05, 0.2);
+	const hop::collision<T> c = sweep_patch(*t, box, vec(0, 0.4, 0), vec(0, -0.5, 0), T {});
+	assert(c.patch_count == 0 && "a query must not pay for a patch it cannot use");
+	printf("  a_query_gets_no_patch ok\n");
+}
+
+static void test_solver_receives_the_patch() {
+	auto blob = make_floor_map();
+	auto trace = std::make_unique<HopBspTraceable<T>>();
+	assert(trace->build(blob.data(), blob.size(), 0, (T)SCALE, hopbsp::BLOCK_SOLID));
+	std::shared_ptr<hop::solid<T>> world;
+	auto sim = make_world_with_floor(std::move(trace), world);
+
+	auto plate = make_box_solid(0.2, 0.05, 0.2);
+	plate->set_mass((T)1);
+	plate->set_inertia(vec((T)1, (T)1, (T)1));
+	plate->set_position(vec(0, 0.4, 0));
+	sim->add_solid(plate);
+
+	for (int i = 0; i < 120; ++i) sim->update((T)(1.0 / 60.0));
+
+	// It settled on the floor rather than through it: half-height up, give or take.
+	const double y = (double)plate->get_position().y;
+	assert(y > 0.03 && y < 0.09);
+
+	// And the solver is holding the patch, not one point at the centre. Only slots
+	// refreshed on the LAST tick count: a body that changes which face it rests on
+	// leaves its old corners behind as stale slots, which the solver skips and the
+	// cache ages out, so counting every slot would overcount what was resolved.
+	int newest = -1;
+	for (int i = 0; i < plate->get_touch_count(); ++i) {
+		const auto &t = plate->get_touch(i);
+		if (t.partner == world.get() && t.last_tick > newest) newest = t.last_tick;
+	}
+	int rows = 0, distinct_features = 0;
+	int seen[16] = { 0 };
+	for (int i = 0; i < plate->get_touch_count(); ++i) {
+		const auto &t = plate->get_touch(i);
+		if (t.partner != world.get() || t.last_tick != newest) continue;
+		++rows;
+		bool dup = false;
+		for (int k = 0; k < distinct_features; ++k) if (seen[k] == t.feature) dup = true;
+		if (!dup && distinct_features < 16) seen[distinct_features++] = t.feature;
+	}
+	assert(rows > 1 && "the patch must reach the touch cache, not just the traceable");
+	assert(distinct_features == rows && "each patch point needs its own slot to warm-start");
+	printf("  solver_receives_the_patch ok (y=%.4f, %d live rows of %d slots)\n",
+	       y, rows, plate->get_touch_count());
+}
+
+static void test_solver_keeps_one_row_for_a_body_that_cannot_spin() {
+	auto blob = make_floor_map();
+	auto trace = std::make_unique<HopBspTraceable<T>>();
+	assert(trace->build(blob.data(), blob.size(), 0, (T)SCALE, hopbsp::BLOCK_SOLID));
+	std::shared_ptr<hop::solid<T>> world;
+	auto sim = make_world_with_floor(std::move(trace), world);
+
+    auto plate = make_box_solid(0.2, 0.05, 0.2);
+	plate->set_mass((T)1);   // no inertia: the locked-rotation shape
+	plate->set_position(vec(0, 0.4, 0));
+	sim->add_solid(plate);
+
+	for (int i = 0; i < 120; ++i) sim->update((T)(1.0 / 60.0));
+
+	int rows = 0;
+	for (int i = 0; i < plate->get_touch_count(); ++i)
+		if (plate->get_touch(i).partner == world.get()) ++rows;
+	assert(rows == 1 && "a body that cannot use a lever arm stays on one contact row");
+	printf("  solver_keeps_one_row_for_a_body_that_cannot_spin ok\n");
+}
+
+
+// --- oriented hull expansion ----------------------------------------------
+//
+// The hull is expanded by the mover's reach along each plane normal. Taking that
+// reach from the LOCAL AABB means a box sweeps the same volume however it is turned,
+// so a plate stood on its edge stops as if it were still lying flat and sinks in to
+// its own half-thickness. These check it stops where the ROTATED box actually reaches.
+
+static hop::mat3<T> rot_about(V axis, double degrees) {
+	hop::mat3<T> m;
+	hop::set_mat3_from_axis_angle(m, axis, (T)(degrees * 3.14159265358979323846 / 180.0));
+	return m;
+}
+
+static void test_rotated_box_stops_at_its_rotated_reach() {
+	auto t = load(make_floor_map());   // floor top at Godot y = 0
+	// A plate: wide and thin. Turned 45 degrees about Z its downward reach becomes
+	// (hx + hy)/sqrt(2) — much more than the hy it reaches lying flat.
+	const double hx = 0.2, hy = 0.05;
+	auto box = make_box_solid((T)hx, (T)hy, (T)0.2);
+	box->set_orientation(rot_about(vec(0, 0, 1), 45.0));
+
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 0.9, 0), vec(0, -1.2, 0));
+	c.reset();
+	t->trace_solid(c, box.get(), V {}, hop::mat3<T>(), seg, T {});
+	assert(c.time < (T)1);
+
+	const double stop_y = 0.9 - 1.2 * (double)c.time;
+	const double flat_reach = hy;
+	const double turned_reach = (hx + hy) * 0.70710678;
+	assert(std::fabs(stop_y - turned_reach) < 0.01 &&
+	       "a turned box must stop at the reach it actually has");
+	assert(stop_y > flat_reach + 0.05 && "and that is well clear of its flat reach");
+	printf("  rotated_box_stops_at_its_rotated_reach ok (y=%.4f, flat would be %.4f)\n",
+	       stop_y, flat_reach);
+}
+
+static void test_unrotated_box_is_unchanged_by_the_oriented_path() {
+	// Identity orientation must take the pre-rotation path exactly — no drift, no
+	// "nearly the same". This is the guard on every body in the game today.
+	auto t = load(make_floor_map());
+	auto spun = make_box_solid(0.2, 0.05, 0.2);
+	spun->set_orientation(hop::mat3<T>());          // explicitly identity
+	auto plain = make_box_solid(0.2, 0.05, 0.2);    // never touched
+
+	hop::collision<T> a, b;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 0.4, 0), vec(0, -0.5, 0));
+	a.reset(); t->trace_solid(a, spun.get(), V {}, hop::mat3<T>(), seg, T {});
+	b.reset(); t->trace_solid(b, plain.get(), V {}, hop::mat3<T>(), seg, T {});
+	assert(a.time == b.time && "identity orientation must be bit-identical");
+	assert(a.impact.y == b.impact.y && a.normal.y == b.normal.y);
+	printf("  unrotated_box_is_unchanged_by_the_oriented_path ok\n");
+}
+
+static void test_rotated_box_reach_is_symmetric_about_the_turn() {
+	// +45 and -45 about the same axis reach equally far down: the support function is
+	// an absolute value, so sign must not matter. Catches a dropped fabs.
+	auto t = load(make_floor_map());
+	double stops[2];
+	for (int k = 0; k < 2; ++k) {
+		auto box = make_box_solid(0.2, 0.05, 0.2);
+		box->set_orientation(rot_about(vec(0, 0, 1), k ? -45.0 : 45.0));
+		hop::collision<T> c;
+		hop::segment<T> seg;
+		seg.set_start_dir(vec(0, 0.9, 0), vec(0, -1.2, 0));
+		c.reset();
+		t->trace_solid(c, box.get(), V {}, hop::mat3<T>(), seg, T {});
+		stops[k] = 0.9 - 1.2 * (double)c.time;
+	}
+	assert(std::fabs(stops[0] - stops[1]) < 1e-6 && "turn direction must not change reach");
+	printf("  rotated_box_reach_is_symmetric_about_the_turn ok\n");
+}
+
 int main() {
 	printf("test_bsp_traceable\n");
 	test_blob_roundtrip();
@@ -988,6 +1082,17 @@ int main() {
 	test_touching_sweep_reports_the_margin_gap();
 	test_sky_is_passable_but_maskable();
 	test_float_instantiation();
+	test_manifold_gives_a_resting_box_four_corners();
+	test_manifold_is_not_produced_for_a_body_that_cannot_spin();
+	test_manifold_drops_corners_that_overhang();
+	test_manifold_is_not_produced_on_an_edge_contact();
+	test_manifold_corners_straddle_the_representative_point();
+	test_a_query_gets_no_patch();
+	test_solver_receives_the_patch();
+	test_solver_keeps_one_row_for_a_body_that_cannot_spin();
+	test_rotated_box_stops_at_its_rotated_reach();
+	test_unrotated_box_is_unchanged_by_the_oriented_path();
+	test_rotated_box_reach_is_symmetric_about_the_turn();
 	printf("all bsp traceable tests passed\n");
 	return 0;
 }

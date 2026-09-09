@@ -2330,6 +2330,17 @@ void HopPhysicsServer::_step(float p_step) {
 			// A body hop does not spin dynamically carries ω as scripted motion (the
 			// kinematic-carry path writes it); damping that would be a behaviour change.
 			if (!body->hop_solid->rotates_dynamically()) return;
+			// set_angular_velocity activates the body. Damping one that is already
+			// turning slower than the sleep threshold would therefore reset its
+			// deactivation counter every step, and it could never sleep — the counter
+			// needs 32 consecutive still ticks and never reached 2. Below that speed the
+			// damp is invisible anyway, so leave it alone and let the body settle.
+			// Without this a damped gib rolls forever; with it, it sleeps in ~3 s.
+			HopSpaceData *space = space_owner.get_or_null(body->space_rid);
+			if (space && space->simulator &&
+			    hop::length(body->hop_solid->get_angular_velocity()) <
+			        space->simulator->get_deactivate_speed())
+				return;
 			const float f = 1.0f - body->angular_damp * fdt;
 			hop::vec3<hop_scalar> w = body->hop_solid->get_angular_velocity();
 			if (f <= 0.0f) {

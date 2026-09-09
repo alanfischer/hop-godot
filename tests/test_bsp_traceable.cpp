@@ -866,14 +866,31 @@ static std::shared_ptr<hop::simulator<T>> world_with_floor(
 	return sim;
 }
 
-// A gib: an 18cm rod, 2cm across, free to turn.
-static std::shared_ptr<hop::solid<T>> make_rod(T half_len, T radius) {
-	hop::capsule<T> c(vec(-half_len, 0, 0), vec(2 * half_len, 0, 0), radius);
+// A gib: an 18cm rod, 2cm across, free to turn. `axis` is which local axis the spine
+// runs along — Godot authors capsules along Y, this file's own fixtures along X, and the
+// trace must not care which.
+static std::shared_ptr<hop::solid<T>> make_rod_on(int axis, T half_len, T radius) {
+	V from = vec(0, 0, 0), dir = vec(0, 0, 0);
+	if (axis == 0) { from = vec(-half_len, 0, 0); dir = vec(2 * half_len, 0, 0); }
+	else if (axis == 1) { from = vec(0, -half_len, 0); dir = vec(0, 2 * half_len, 0); }
+	else { from = vec(0, 0, -half_len); dir = vec(0, 0, 2 * half_len); }
+	hop::capsule<T> c(from, dir, radius);
 	auto s = std::make_shared<hop::solid<T>>();
 	s->add_shape(std::make_shared<hop::shape<T>>(c));
 	s->set_mass((T)1);
-	s->set_inertia(vec((T)0.002, (T)0.004, (T)0.004));
+	// About its OWN spine a rod barely resists turning; across it, much more. Handing
+	// every rod the X-spine tensor gives a Y- or Z-authored one its small moment about
+	// the wrong axis, so it tumbles in a way no rod of that shape would.
+	V I = vec((T)0.004, (T)0.004, (T)0.004);
+	if (axis == 0) I.x = (T)0.002;
+	else if (axis == 1) I.y = (T)0.002;
+	else I.z = (T)0.002;
+	s->set_inertia(I);
 	return s;
+}
+
+static std::shared_ptr<hop::solid<T>> make_rod(T half_len, T radius) {
+	return make_rod_on(0, half_len, radius);
 }
 
 static double settle(std::shared_ptr<hop::simulator<T>> sim, std::shared_ptr<hop::solid<T>> body) {
@@ -924,6 +941,70 @@ static void test_a_level_rod_lies_still() {
 	const double y = (double)rod->get_position().y;
 	assert(y > 0.004 && y < 0.02 && "resting on its radius, not sunk into the floor");
 	printf("  a_level_rod_lies_still ok (w=%.3f, y=%.4f)\n", w, y);
+	// What this does NOT yet cover, so nobody reads it as more than it is. A rod that
+	// arrives ALREADY level settles and sleeps; one that has to topple from near
+	// vertical does not. It cartwheels, because one contact point cannot hold a rod
+	// down along its length — a lying rod touches along a LINE, and only a line can
+	// resist turning about the surface normal or about the spine. Same limit as a flat
+	// box being held at a single point in the middle of its face; a capsule feels it
+	// sooner because it has no face to be held by. Wants trace_solid to report a
+	// contact SET, which it cannot yet do.
+}
+
+// The spine may be authored along ANY local axis. Godot builds capsules along Y and
+// this file's fixtures along X, and reading the spine out of a fixed local slot gives
+// one of them a zero-length spine — the contact then lands under the centre, the lever
+// arm vanishes, and a gib in the game stands exactly as it had before while an
+// X-authored test capsule passes.
+//
+// Asked of the TRACE rather than of a settled simulation, deliberately. Three rods with
+// the same geometry pointed the same way in the world are the same object, so they must
+// stop at the same height, exactly — a claim with one answer. Dropping them and looking
+// at where they end up cannot make that claim: a rod toppling from near-vertical does
+// not settle here at all (see the note on test_a_level_rod_lies_still), so the run would
+// be reporting a tumble rather than the thing under test.
+static void test_a_rod_reaches_the_same_whichever_axis_its_spine_runs_along() {
+	auto t = load(make_floor_map());
+	const double half_len = 0.09, radius = 0.01;
+	// One world direction for the spine, 60 degrees off vertical, so the reach is a
+	// genuine mix of length and roundness rather than either one alone.
+	const double ang = 60.0 * 3.14159265358979323846 / 180.0;
+	const V want = vec((T)std::sin(ang), (T)std::cos(ang), (T)0);
+	const double expect = half_len * std::cos(ang) + radius;
+
+	double stops[3];
+	for (int axis = 0; axis < 3; ++axis) {
+		auto rod = make_rod_on(axis, (T)half_len, (T)radius);
+		// Turn the rod's own spine axis onto `want`: rotate about their cross product
+		// by the angle between them.
+		V unit = vec(axis == 0 ? 1 : 0, axis == 1 ? 1 : 0, axis == 2 ? 1 : 0);
+		V cross = vec(unit.y * want.z - unit.z * want.y,
+		              unit.z * want.x - unit.x * want.z,
+		              unit.x * want.y - unit.y * want.x);
+		hop::mat3<T> m;
+		if (hop::length(cross) < (T)1e-9) {
+			m = hop::mat3<T>();
+		} else {
+			hop::mul(cross, (T)(1.0 / hop::length(cross)));
+			const double dot = (double)(unit.x * want.x + unit.y * want.y + unit.z * want.z);
+			hop::set_mat3_from_axis_angle(m, cross, (T)std::acos(dot < -1 ? -1 : dot > 1 ? 1 : dot));
+		}
+		rod->set_orientation(m);
+
+		hop::collision<T> c;
+		hop::segment<T> seg;
+		seg.set_start_dir(vec(0, 0.6, 0), vec(0, -0.8, 0));
+		c.reset();
+		t->trace_solid(c, rod.get(), V {}, hop::mat3<T>(), seg, T {});
+		assert(c.time < (T)1 && "a tilted rod must reach the floor");
+		stops[axis] = 0.6 - 0.8 * (double)c.time;
+		assert(std::fabs(stops[axis] - expect) < 0.004 &&
+		       "and stop at |n.spine| * half + radius, whatever axis it was authored on");
+	}
+	assert(std::fabs(stops[0] - stops[1]) < 1e-6 && std::fabs(stops[0] - stops[2]) < 1e-6 &&
+	       "the same rod pointed the same way is the same rod");
+	printf("  a_rod_reaches_the_same_whichever_axis_its_spine_runs_along ok "
+	       "(%.4f / %.4f / %.4f, want %.4f)\n", stops[0], stops[1], stops[2], expect);
 }
 
 // The expansion itself: a capsule is pushed out by |n.axis| * half + radius, so lying
@@ -982,6 +1063,7 @@ int main() {
 	test_a_capsule_stops_at_its_own_reach();
 	test_a_tilted_rod_falls_over();
 	test_a_level_rod_lies_still();
+	test_a_rod_reaches_the_same_whichever_axis_its_spine_runs_along();
 	printf("all bsp traceable tests passed\n");
 	return 0;
 }

@@ -251,6 +251,9 @@ struct sweep_skin {
 	bool oriented = false;
 	double axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
 	double hext[3] = { 0, 0, 0 };
+	// Rounds the shape off: support becomes (box support + radius), which is exactly a
+	// capsule when only one hext is non-zero. 0 for a box.
+	double radius = 0;
 };
 
 // How far the mover's box reaches past its centre along `pl`'s normal: the amount
@@ -277,7 +280,8 @@ template <typename N> inline double obb_support(const N n[3], const double axes[
 
 // The mover's reach along a direction, however it is shaped.
 template <typename N> inline double skin_support(const sweep_skin &skin, const N n[3]) {
-	return skin.oriented ? obb_support(n, skin.axes, skin.hext) : axis_support(n, skin.half);
+	if (!skin.oriented) return axis_support(n, skin.half);
+	return obb_support(n, skin.axes, skin.hext) + skin.radius;
 }
 
 // How far the mover reaches past its centre along `pl`'s normal: how far that plane
@@ -403,10 +407,12 @@ inline sweep_skin box_skin(const double half[3], double grow) {
 
 // A skin for a box rotated in this hull's frame: `axes` its unit axes in GoldSrc
 // space, `hext` its extents along them. Per-axis support is derived once, here.
-inline sweep_skin obb_skin(const double axes[3][3], const double hext[3], double grow) {
+inline sweep_skin obb_skin(const double axes[3][3], const double hext[3], double radius,
+                           double grow) {
 	sweep_skin s;
 	s.grow = grow;
 	s.oriented = true;
+	s.radius = radius;
 	for (int j = 0; j < 3; ++j) {
 		s.hext[j] = hext[j];
 		for (int i = 0; i < 3; ++i) s.axes[j][i] = axes[j][i];
@@ -417,8 +423,8 @@ inline sweep_skin obb_skin(const double axes[3][3], const double hext[3], double
 			const double a = axes[j][i] < 0 ? -axes[j][i] : axes[j][i];
 			sum += a * hext[j];
 		}
-		s.half[i] = sum;
-		if (sum != 0.0) s.boxed = true;
+		s.half[i] = sum + radius;
+		if (s.half[i] != 0.0) s.boxed = true;
 	}
 	return s;
 }
@@ -762,6 +768,7 @@ public:
 		bool oriented = false;
 		double obb_axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
 		double obb_hext[3] = { 0, 0, 0 };
+		double obb_radius = 0;
 
 		if (hi == 0) {
 			// Hull 0 is the point hull, and GoldSrc's low-corner alignment is a poor
@@ -784,7 +791,7 @@ public:
 			}
 			// A rotated box reaches further on some axes and less on others; the local
 			// AABB knows neither.
-			oriented = mover_obb(s, orientation, obb_axes, obb_hext);
+			oriented = mover_shape(s, orientation, obb_axes, obb_hext, obb_radius);
 		} else {
 			// The three sized hulls are boxes a mover is meant to match, and there
 			// GoldSrc's own rule is right: trace (origin + mins - clip_mins), aligning
@@ -858,7 +865,7 @@ public:
 		// One skin for the whole trace, so a rotated mover cannot be expanded one way
 		// on the main sweep and another on a retry.
 		const hopbsp::sweep_skin skin = oriented
-			? hopbsp::obb_skin(obb_axes, obb_hext, margin_gs)
+			? hopbsp::obb_skin(obb_axes, obb_hext, obb_radius, margin_gs)
 			: hopbsp::box_skin(half, margin_gs);
 		if (oriented) {
 			for (int i = 0; i < 3; ++i) half[i] = skin.half[i];
@@ -1061,11 +1068,35 @@ public:
 		const double box_half[3] = { (box_maxs[0] - box_mins[0]) * 0.5,
 		                             (box_maxs[1] - box_mins[1]) * 0.5,
 		                             (box_maxs[2] - box_mins[2]) * 0.5 };
-		const double reach = oriented ? hopbsp::obb_support(ht.normal, obb_axes, obb_hext)
-		                              : hopbsp::axis_support(ht.normal, box_half);
 		double w[3];
-		for (int i = 0; i < 3; ++i)
-			w[i] = ht.endpos[i] - ht.normal[i] * reach;
+		if (skin.radius > 0 && s != nullptr && s->rotates_dynamically()) {
+			// A ROUND mover touches at a point, and that point is its support in -n:
+			// along the spine to whichever end faces the surface, then out by the
+			// radius. Down-the-normal is the right answer for a shape whose contact is
+			// a face the trace cannot resolve — it deliberately yields no torque, which
+			// is what stopped a box's corner spinning it up. A capsule has no such
+			// ambiguity, and centring its contact is what lets a rod stand on its end
+			// forever: the arm is vertical, so gravity can never tip it.
+			double org[3];
+			for (int i = 0; i < 3; ++i) org[i] = ht.endpos[i] - offset[i];
+			const double along = -(ht.normal[0] * skin.axes[0][0] +
+			                       ht.normal[1] * skin.axes[0][1] +
+			                       ht.normal[2] * skin.axes[0][2]);
+			// Scaled by the tilt, not a bare sign. The spine's support in -n is its
+			// lower END while tilted, but as it comes level BOTH ends support equally
+			// and the honest representative is the middle — a bare sign picks an
+			// arbitrary end there and hands a level rod a lever arm it does not have,
+			// which spins it up exactly as a box's corner did. |along| <= 1, so this is
+			// the end when upright and the centre when level.
+			const double reach_spine = skin.hext[0] * along;
+			for (int i = 0; i < 3; ++i)
+				w[i] = org[i] + skin.axes[0][i] * reach_spine - ht.normal[i] * skin.radius;
+		} else {
+			const double reach = oriented ? hopbsp::skin_support(skin, ht.normal)
+			                              : hopbsp::axis_support(ht.normal, box_half);
+			for (int i = 0; i < 3; ++i)
+				w[i] = ht.endpos[i] - ht.normal[i] * reach;
+		}
 		hop::vec3<T> impact_local = gs_to_godot(w[0], w[1], w[2]);
 		hop::vec3<T> ignored;
 		to_world(impact_local, n_local, position, orientation, result.impact, ignored);
@@ -1262,37 +1293,53 @@ private:
 	// rotated box's centre, as trace_solid_rotated already does.
 	//
 	// False when already axis-aligned here, so an unrotated body is bit-identical.
-	bool mover_obb(hop::solid<T> *s, const hop::mat3<T> &orientation,
-	               double axes[3][3], double hext[3]) const {
+	bool mover_shape(hop::solid<T> *s, const hop::mat3<T> &orientation,
+	                 double axes[3][3], double hext[3], double &radius) const {
 		if (s == nullptr) return false;
 		const auto &shapes = s->get_shapes();
 		if (shapes.size() != 1) return false;
 		hop::shape<T> *sh = shapes[0].get();
-		if (sh->get_type() != hop::shape_type::box) return false;
+		const bool is_capsule = sh->get_type() == hop::shape_type::capsule;
+		if (!is_capsule && sh->get_type() != hop::shape_type::box) return false;
 
 		const hop::vec3<T> &lp = sh->get_local_position();
-		const hop::aa_box<T> &b = sh->get_box();
-		hop::vec3<T> centre;
-		hop::add(centre, b.mins, b.maxs);
-		hop::mul(centre, hop::scalar_traits<T>::half());
+		if (!(lp.x == T {} && lp.y == T {} && lp.z == T {})) return false;
+
+		hop::vec3<T> centre, half_ext;
+		radius = 0;
+		if (is_capsule) {
+			// A capsule is a segment with a radius: its support is the segment's
+			// (|n.axis| * half_length) plus the radius, which the plane offset carries
+			// exactly. Nothing here has to approximate it as a box.
+			const hop::capsule<T> &c = sh->get_capsule();
+			hop::vec3<T> spine_half(c.direction);
+			hop::mul(spine_half, hop::scalar_traits<T>::half());
+			hop::add(centre, c.origin, spine_half);
+			half_ext.set(spine_half);
+			radius = (double)c.radius * inv_scale_;
+		} else {
+			const hop::aa_box<T> &b = sh->get_box();
+			hop::add(centre, b.mins, b.maxs);
+			hop::mul(centre, hop::scalar_traits<T>::half());
+			hop::sub(half_ext, b.maxs, b.mins);
+			hop::mul(half_ext, hop::scalar_traits<T>::half());
+		}
 		// Off-centre in the solid's frame: the rotation would move the trace point.
-		if (!(centre.x == T {} && centre.y == T {} && centre.z == T {} &&
-		      lp.x == T {} && lp.y == T {} && lp.z == T {}))
-			return false;
+		if (!(centre.x == T {} && centre.y == T {} && centre.z == T {})) return false;
 
 		// Q is identity exactly when Rm == orientation (orthonormal), so the common
 		// unrotated case is settled by a compare, before any matrix products.
 		hop::mat3<T> Rm;
 		hop::mul(Rm, s->get_orientation(), sh->get_local_rotation());
-		if (Rm == orientation) return false;  // axis-aligned here: nothing to honour
+		// A box already square-on to this hull is exactly what the AABB path traces, so
+		// hand it back and stay bit-identical. A capsule is never that: its roundness
+		// has to be carried whatever its attitude, or it is traced as a brick.
+		if (!is_capsule && Rm == orientation) return false;
 
 		hop::mat3<T> Rt, Q;
 		hop::transpose(Rt, orientation);
 		hop::mul(Q, Rt, Rm);
 
-		hop::vec3<T> half_ext;
-		hop::sub(half_ext, b.maxs, b.mins);
-		hop::mul(half_ext, hop::scalar_traits<T>::half());
 		const double h[3] = { (double)half_ext.x, (double)half_ext.y, (double)half_ext.z };
 
 		// mat3 is column-major, so column j IS box axis j. Godot (x,y,z) -> GoldSrc

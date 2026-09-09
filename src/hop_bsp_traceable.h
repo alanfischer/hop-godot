@@ -230,6 +230,12 @@ struct mover_basis {
 	double axis[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
 	double hext[3] = { 0, 0, 0 };
 	double radius = 0;
+	// Support along each of the hull's OWN axes. An axial plane's normal is a world
+	// axis, so its offset is one of these three and never a dot product — and axial
+	// planes are the overwhelming majority in a BSP, which is what keeps an oriented
+	// trace costing about what an axis-aligned one does. Also the mover's world-aligned
+	// bound, which is what the eject budget and the six-axis probes measure with.
+	double axial[3] = { 0, 0, 0 };
 	bool oriented = false;
 };
 
@@ -310,14 +316,15 @@ inline void box_support_point(const double n[3], const double half[3],
 // of which ask "how far does the mover reach THAT way" in hull axes rather than the
 // mover's own.
 inline void box_world_half(const double half[3], const mover_basis &b, double out[3]) {
-	if (!b.oriented) {
-		for (int i = 0; i < 3; ++i) out[i] = half[i];
-		return;
-	}
+	for (int i = 0; i < 3; ++i) out[i] = b.oriented ? b.axial[i] : half[i];
+}
+
+// Fill the axial cache. Called once, when the basis is built.
+inline void set_axial(mover_basis &b) {
 	for (int i = 0; i < 3; ++i) {
 		double e[3] = { 0, 0, 0 };
 		e[i] = 1.0;
-		out[i] = box_support(e, half, b);
+		b.axial[i] = box_support(e, b.hext, b);
 	}
 }
 
@@ -359,7 +366,7 @@ struct sweep_skin {
 // only for an axis-aligned mover, since a turned box does not line up with them.
 inline double plane_offset(const hop_bsp::BSPPlane &pl, const double half[3],
                            const mover_basis &b) {
-	if (!b.oriented && pl.type < 3) return half[pl.type];
+	if (pl.type < 3) return b.oriented ? b.axial[pl.type] : half[pl.type];
 	return box_support(pl.normal, half, b);
 }
 
@@ -1261,6 +1268,7 @@ private:
 			}
 		}
 		b.oriented = true;
+		hopbsp::set_axial(b);
 		return b;
 	}
 

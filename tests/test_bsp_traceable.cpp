@@ -26,201 +26,7 @@ using T = double;
 using V = hop::vec3<T>;
 using namespace hop_bsp;
 
-static const double SCALE = 0.025;  // WizardWars' GameConsts.SCALE_FACTOR
-
-static V vec(T x, T y, T z) { V v; v.set(x, y, z); return v; }
-static bool approx(T a, T b, T tol = 1e-3) { return std::fabs(a - b) < tol; }
-static bool approx_v(const V &v, T x, T y, T z, T tol = 1e-3) {
-	return approx(v.x, x, tol) && approx(v.y, y, tol) && approx(v.z, z, tol);
-}
-
-// --- synthetic blob authoring ---------------------------------------------
-
-struct BlobBuilder {
-	std::vector<BSPPlane> planes;
-	std::vector<BSPNode> nodes;
-	std::vector<BSPClipNode> clipnodes;
-	std::vector<BSPLeaf> leafs;
-	std::vector<BSPModel> models;
-
-	std::vector<uint8_t> build() const {
-		std::vector<uint8_t> out(sizeof(BSPHeader), 0);
-		BSPHeader hdr {};
-		hdr.version = HLBSP_VERSION;
-
-		auto put = [&](int idx, const void *data, size_t sz) {
-			if (sz == 0) return;
-			hdr.lumps[idx].fileofs = (int32_t)out.size();
-			hdr.lumps[idx].filelen = (int32_t)sz;
-			const uint8_t *p = (const uint8_t *)data;
-			out.insert(out.end(), p, p + sz);
-		};
-		put(LUMP_PLANES, planes.data(), planes.size() * sizeof(BSPPlane));
-		put(LUMP_NODES, nodes.data(), nodes.size() * sizeof(BSPNode));
-		put(LUMP_CLIPNODES, clipnodes.data(), clipnodes.size() * sizeof(BSPClipNode));
-		put(LUMP_LEAFS, leafs.data(), leafs.size() * sizeof(BSPLeaf));
-		put(LUMP_MODELS, models.data(), models.size() * sizeof(BSPModel));
-
-		memcpy(out.data(), &hdr, sizeof(BSPHeader));
-		return out;
-	}
-};
-
-// Six axis planes bounding [mins, maxs], appended to `planes`. Returns the index
-// of the first. Plane k*2 is the lower bound on axis k, k*2+1 the upper.
-static int add_box_planes(BlobBuilder &b, const double mins[3], const double maxs[3]) {
-	int first = (int)b.planes.size();
-	for (int axis = 0; axis < 3; ++axis) {
-		for (int hi = 0; hi < 2; ++hi) {
-			BSPPlane p {};
-			p.normal[axis] = 1.0f;
-			p.dist = (float)(hi ? maxs[axis] : mins[axis]);
-			p.type = axis;  // axial — exercises the fast `p[type] - dist` path
-			b.planes.push_back(p);
-		}
-	}
-	return first;
-}
-
-// A solid axis-aligned box brush as a 6-deep tree. Descending "inward" on every
-// plane lands in SOLID; stepping outside any one of them lands in EMPTY.
-//
-// Leaf convention (matching a real BSP): leaf 0 is the solid leaf.
-//
-// `outside` overrides where "not in this box" goes, so brushes can be chained into a
-// union: give brush A the root of brush B and the tree reads "solid if inside A, else
-// test B" — which is what lets a fixture have a leaf bounded by another brush's face.
-// Returns the root node/clipnode index of the brush just added.
-static int add_box_brush(BlobBuilder &b, const double mins[3], const double maxs[3],
-                         bool as_nodes, int contents = CONTENTS_SOLID,
-                         int outside = 1) {  // 1 = "use the default empty child"
-	const int p0 = add_box_planes(b, mins, maxs);
-	const int base = as_nodes ? (int)b.nodes.size() : (int)b.clipnodes.size();
-
-	if (as_nodes && b.leafs.empty()) {
-		BSPLeaf solid {}; solid.contents = contents;
-		BSPLeaf empty {}; empty.contents = CONTENTS_EMPTY;
-		b.leafs.push_back(solid);
-		b.leafs.push_back(empty);
-	}
-	// hull 0 addresses leafs as -(leaf+1); hulls 1..3 store the contents directly.
-	const int SOLID_CHILD = as_nodes ? -1 : contents;
-	const int EMPTY_CHILD = outside != 1 ? outside : (as_nodes ? -2 : CONTENTS_EMPTY);
-
-	for (int i = 0; i < 6; ++i) {
-		const bool upper = (i % 2) == 1;
-		const int inward = (i == 5) ? SOLID_CHILD : (base + i + 1);
-		int child0, child1;
-		if (upper) { child0 = EMPTY_CHILD; child1 = inward; }
-		else       { child0 = inward;      child1 = EMPTY_CHILD; }
-		if (as_nodes) {
-			BSPNode n {};
-			n.planenum = p0 + i;
-			n.children[0] = (int16_t)child0;
-			n.children[1] = (int16_t)child1;
-			b.nodes.push_back(n);
-		} else {
-			BSPClipNode n {};
-			n.planenum = p0 + i;
-			n.children[0] = (int16_t)child0;
-			n.children[1] = (int16_t)child1;
-			b.clipnodes.push_back(n);
-		}
-	}
-	return base;
-}
-
-// One model whose hull 0 is a box brush and whose hulls 1..3 are that same brush
-// expanded by each engine hull size — exactly what the map compiler bakes.
-static std::vector<uint8_t> make_box_map(const double mins[3], const double maxs[3],
-                                         int contents = CONTENTS_SOLID) {
-	BlobBuilder b;
-	BSPModel m {};
-	for (int i = 0; i < 3; ++i) { m.mins[i] = (float)mins[i]; m.maxs[i] = (float)maxs[i]; }
-
-	m.headnode[0] = 0;
-	add_box_brush(b, mins, maxs, /*as_nodes=*/true, contents);
-
-	for (int h = 1; h < 4; ++h) {
-		double emins[3], emaxs[3];
-		for (int i = 0; i < 3; ++i) {
-			emins[i] = mins[i] - hopbsp::HULL_SIZES[h].maxs[i];
-			emaxs[i] = maxs[i] - hopbsp::HULL_SIZES[h].mins[i];
-		}
-		m.headnode[h] = (int32_t)b.clipnodes.size();
-		add_box_brush(b, emins, emaxs, /*as_nodes=*/false, contents);
-	}
-	b.models.push_back(m);
-	return b.build();
-}
-
-// A floor with a wall standing on it, as a union of two brushes, sized so that in
-// hull 1 the wall's solid begins exactly where the floor's ends (z = 36 — the floor
-// top at 0, raised by the hull's 36-unit half-height).
-//
-// That seam is not contrived: it is where every standing player's trace point lives.
-// A hull-1 mover is traced as the point at feet + 36, so a player resting on a floor
-// sits EXACTLY on that floor's expanded top plane, and if they are pushed into a wall
-// rising off that floor, the leaf they land in is bounded by that plane at distance
-// zero. ww_golem's cockpit is this shape (deck at z=-112, seam at -76).
-static std::vector<uint8_t> make_wall_on_floor_map() {
-	// Floor: everything below z = 0. Wall: everything at x <= -8 above z = 72.
-	// Expanded for hull h the floor tops out at -HULL.mins.z and the wall starts at
-	// 72 - -HULL.mins.z, which meet for hull 1 (36) — the case under test. For the
-	// other hulls they simply overlap, which is just as solid.
-	const double fmins[3] = { -4096, -4096, -4096 }, fmaxs[3] = { 4096, 4096, 0 };
-	const double wmins[3] = { -4096, -4096, 72 }, wmaxs[3] = { -8, 4096, 4096 };
-
-	BlobBuilder b;
-	BSPModel m {};
-	for (int i = 0; i < 3; ++i) { m.mins[i] = (float)fmins[i]; m.maxs[i] = (float)wmaxs[i]; }
-	m.maxs[0] = (float)fmaxs[0];
-	m.maxs[1] = (float)fmaxs[1];
-
-	// Floor first so the wall can point its "outside" children at it.
-	const int f0 = add_box_brush(b, fmins, fmaxs, /*as_nodes=*/true);
-	m.headnode[0] = add_box_brush(b, wmins, wmaxs, /*as_nodes=*/true, CONTENTS_SOLID, f0);
-
-	for (int h = 1; h < 4; ++h) {
-		double efmins[3], efmaxs[3], ewmins[3], ewmaxs[3];
-		for (int i = 0; i < 3; ++i) {
-			efmins[i] = fmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
-			efmaxs[i] = fmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
-			ewmins[i] = wmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
-			ewmaxs[i] = wmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
-		}
-		const int ef = add_box_brush(b, efmins, efmaxs, /*as_nodes=*/false);
-		m.headnode[h] = add_box_brush(b, ewmins, ewmaxs, /*as_nodes=*/false, CONTENTS_SOLID, ef);
-	}
-	b.models.push_back(m);
-	return b.build();
-}
-
-// A wide, thin slab centred on the GoldSrc origin: a floor whose top face sits at
-// z = 0, i.e. Godot y = 0.
-static std::vector<uint8_t> make_floor_map() {
-	const double mins[3] = { -512, -512, -64 };
-	const double maxs[3] = { 512, 512, 0 };
-	return make_box_map(mins, maxs);
-}
-
-static std::unique_ptr<HopBspTraceable<T>> load(const std::vector<uint8_t> &blob,
-                                                int blocking = hopbsp::BLOCK_SOLID) {
-	auto t = std::make_unique<HopBspTraceable<T>>();
-	bool ok = t->build(blob.data(), blob.size(), 0, (T)SCALE, blocking);
-	assert(ok && "blob failed to parse");
-	(void)ok;
-	return t;
-}
-
-static std::shared_ptr<hop::solid<T>> make_box_solid(T hx, T hy, T hz) {
-	hop::aa_box<T> b;
-	b.mins = vec(-hx, -hy, -hz);
-	b.maxs = vec(hx, hy, hz);
-	auto s = std::make_shared<hop::solid<T>>();
-	s->add_shape(std::make_shared<hop::shape<T>>(b));
-	return s;
-}
+#include "bsp_fixtures.h"
 
 // Sweep `s` from `from` along `motion` and return what it hit. Every solid test
 // below is one of these plus its assertions; a zero `motion` is the static
@@ -954,6 +760,269 @@ static void test_touching_sweep_reports_the_margin_gap() {
 	printf("  touching_sweep_reports_the_margin_gap ok\n");
 }
 
+
+// --- oriented hull expansion ----------------------------------------------
+//
+// The hull is expanded by the mover's reach along each plane normal. Taking that
+// reach from the LOCAL AABB means a box sweeps the same volume however it is turned,
+// so a plate stood on its edge stops as if it were still lying flat and sinks in to
+// its own half-thickness. These check it stops where the ROTATED box actually reaches.
+
+static hop::mat3<T> rot_about(V axis, double degrees) {
+	hop::mat3<T> m;
+	hop::set_mat3_from_axis_angle(m, axis, (T)(degrees * 3.14159265358979323846 / 180.0));
+	return m;
+}
+
+static void test_rotated_box_stops_at_its_rotated_reach() {
+	auto t = load(make_floor_map());   // floor top at Godot y = 0
+	// A plate: wide and thin. Turned 45 degrees about Z its downward reach becomes
+	// (hx + hy)/sqrt(2) — much more than the hy it reaches lying flat.
+	// A body that can TURN, i.e. one with inertia: rotates_dynamically() is the gate on
+	// the oriented path. A body that cannot turn has an attitude that never changes, so
+	// tracing it as its axis-aligned bound costs nothing and keeps it off hull 0, which
+	// an oriented mover is forced onto — that is what keeps a yawing player on the
+	// sized hull it is built for.
+	const double hx = 0.2, hy = 0.05;
+	auto box = make_spinning_box((T)hx, (T)hy, (T)0.2);
+	box->set_orientation(rot_about(vec(0, 0, 1), 45.0));
+
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 0.9, 0), vec(0, -1.2, 0));
+	c.reset();
+	t->trace_solid(c, box.get(), V {}, hop::mat3<T>(), seg, T {});
+	assert(c.time < (T)1);
+
+	const double stop_y = 0.9 - 1.2 * (double)c.time;
+	const double flat_reach = hy;
+	const double turned_reach = (hx + hy) * 0.70710678;
+	assert(std::fabs(stop_y - turned_reach) < 0.01 &&
+	       "a turned box must stop at the reach it actually has");
+	assert(stop_y > flat_reach + 0.05 && "and that is well clear of its flat reach");
+	printf("  rotated_box_stops_at_its_rotated_reach ok (y=%.4f, flat would be %.4f)\n",
+	       stop_y, flat_reach);
+}
+
+static void test_unrotated_box_is_unchanged_by_the_oriented_path() {
+	// Identity orientation must take the pre-rotation path exactly — no drift, no
+	// "nearly the same". This is the guard on every body in the game today.
+	auto t = load(make_floor_map());
+	auto spun = make_spinning_box(0.2, 0.05, 0.2);  // eligible for the oriented path
+	spun->set_orientation(hop::mat3<T>());          // explicitly identity
+	auto plain = make_box_solid(0.2, 0.05, 0.2);    // never touched
+
+	hop::collision<T> a, b;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 0.4, 0), vec(0, -0.5, 0));
+	a.reset(); t->trace_solid(a, spun.get(), V {}, hop::mat3<T>(), seg, T {});
+	b.reset(); t->trace_solid(b, plain.get(), V {}, hop::mat3<T>(), seg, T {});
+	assert(a.time == b.time && "identity orientation must be bit-identical");
+	assert(a.impact.y == b.impact.y && a.normal.y == b.normal.y);
+	printf("  unrotated_box_is_unchanged_by_the_oriented_path ok\n");
+}
+
+static void test_rotated_box_reach_is_symmetric_about_the_turn() {
+	// +45 and -45 about the same axis reach equally far down: the support function is
+	// an absolute value, so sign must not matter. Catches a dropped fabs.
+	auto t = load(make_floor_map());
+	double stops[2];
+	for (int k = 0; k < 2; ++k) {
+		auto box = make_spinning_box(0.2, 0.05, 0.2);
+		box->set_orientation(rot_about(vec(0, 0, 1), k ? -45.0 : 45.0));
+		hop::collision<T> c;
+		hop::segment<T> seg;
+		seg.set_start_dir(vec(0, 0.9, 0), vec(0, -1.2, 0));
+		c.reset();
+		t->trace_solid(c, box.get(), V {}, hop::mat3<T>(), seg, T {});
+		stops[k] = 0.9 - 1.2 * (double)c.time;
+	}
+	assert(std::fabs(stops[0] - stops[1]) < 1e-6 && "turn direction must not change reach");
+	printf("  rotated_box_reach_is_symmetric_about_the_turn ok\n");
+}
+
+// --- end to end ------------------------------------------------------------
+//
+// Everything above calls trace_solid directly, which verifies the trace and nothing
+// else. These run the simulator, wired as hop-godot wires it: the traceable is a shape
+// on a static solid, reached through collide.h's test_solid — not through the manager,
+// whose trace_solid is a no-op here.
+
+static std::shared_ptr<hop::simulator<T>> world_with_floor(
+    std::shared_ptr<hop::solid<T>> &world_out, std::vector<uint8_t> &blob) {
+	auto sim = std::make_shared<hop::simulator<T>>();
+	sim->set_gravity(vec(0, -20, 0));
+	// hop's own default is sweep_slide, which hop-godot gives KINEMATIC bodies only;
+	// anything dynamic resolves speculatively.
+	sim->set_default_contact_mode(hop::contact_mode::speculative);
+	auto tr = std::make_unique<HopBspTraceable<T>>();
+	assert(tr->build(blob.data(), blob.size(), 0, (T)SCALE, hopbsp::BLOCK_SOLID));
+	auto world = std::make_shared<hop::solid<T>>();
+	world->set_infinite_mass();
+	world->set_coefficient_of_gravity(T {});
+	world->add_shape(std::make_shared<hop::shape<T>>(std::move(tr)));
+	sim->add_solid(world);
+	world_out = world;
+	return sim;
+}
+
+// A gib: an 18cm rod, 2cm across, free to turn. `axis` is which local axis the spine
+// runs along — Godot authors capsules along Y, this file's own fixtures along X, and the
+// trace must not care which.
+static std::shared_ptr<hop::solid<T>> make_rod_on(int axis, T half_len, T radius) {
+	V from = vec(0, 0, 0), dir = vec(0, 0, 0);
+	if (axis == 0) { from = vec(-half_len, 0, 0); dir = vec(2 * half_len, 0, 0); }
+	else if (axis == 1) { from = vec(0, -half_len, 0); dir = vec(0, 2 * half_len, 0); }
+	else { from = vec(0, 0, -half_len); dir = vec(0, 0, 2 * half_len); }
+	hop::capsule<T> c(from, dir, radius);
+	auto s = std::make_shared<hop::solid<T>>();
+	s->add_shape(std::make_shared<hop::shape<T>>(c));
+	s->set_mass((T)1);
+	// About its OWN spine a rod barely resists turning; across it, much more. Handing
+	// every rod the X-spine tensor gives a Y- or Z-authored one its small moment about
+	// the wrong axis, so it tumbles in a way no rod of that shape would.
+	V I = vec((T)0.004, (T)0.004, (T)0.004);
+	if (axis == 0) I.x = (T)0.002;
+	else if (axis == 1) I.y = (T)0.002;
+	else I.z = (T)0.002;
+	s->set_inertia(I);
+	return s;
+}
+
+static std::shared_ptr<hop::solid<T>> make_rod(T half_len, T radius) {
+	return make_rod_on(0, half_len, radius);
+}
+
+static double settle(std::shared_ptr<hop::simulator<T>> sim, std::shared_ptr<hop::solid<T>> body) {
+	for (int i = 0; i < 240; ++i) sim->update((T)(1.0 / 60.0));
+	V ax;
+	hop::mul(ax, body->get_orientation(), vec(1, 0, 0));
+	return std::fabs((double)ax.y);
+}
+
+// THE behaviour this change exists for. Before it, every mover was traced as its local
+// AABB and contacted under its own centre, so the lever arm was vertical whatever the
+// attitude and gravity had nothing to turn: a rod stood at 60 degrees for four seconds
+// with w == 0.
+static void test_a_tilted_rod_falls_over() {
+	auto blob = make_floor_map();
+	std::shared_ptr<hop::solid<T>> world;
+	auto sim = world_with_floor(world, blob);
+	auto rod = make_rod(0.09, 0.01);
+	hop::mat3<T> m;
+	hop::set_mat3_from_axis_angle(m, vec(0, 0, 1), (T)(60.0 * 3.14159265358979323846 / 180.0));
+	rod->set_orientation(m);
+	rod->set_position(vec(0, 0.35, 0));
+	sim->add_solid(rod);
+
+	const double tilt = settle(sim, rod);
+	assert(tilt < 0.3 && "a rod dropped on its end falls over");
+	const double y = (double)rod->get_position().y;
+	assert(y > 0.0 && y < 0.03 && "and comes to rest on its own radius");
+	printf("  a_tilted_rod_falls_over ok (|axis.y|=%.3f, y=%.4f)\n", tilt, y);
+}
+
+// And one already lying down STAYS still. Its contact runs along the spine there, so a
+// support point taken as a bare sign(n.axis) picks an arbitrary END and hands a level
+// rod a lever arm it does not have — it spins up and sinks, which is the box-corner
+// failure in capsule form. Scaling the spine support by tilt is what keeps this at rest.
+static void test_a_level_rod_lies_still() {
+	auto blob = make_floor_map();
+	std::shared_ptr<hop::solid<T>> world;
+	auto sim = world_with_floor(world, blob);
+	auto rod = make_rod(0.09, 0.01);
+	rod->set_position(vec(0, 0.05, 0));
+	sim->add_solid(rod);
+
+	const double tilt = settle(sim, rod);
+	assert(tilt < 0.05 && "a level rod stays level");
+	const double w = (double)hop::length(rod->get_angular_velocity());
+	assert(w < 0.5 && "and does not spin itself up");
+	const double y = (double)rod->get_position().y;
+	assert(y > 0.004 && y < 0.02 && "resting on its radius, not sunk into the floor");
+	printf("  a_level_rod_lies_still ok (w=%.3f, y=%.4f)\n", w, y);
+	// What this does NOT yet cover, so nobody reads it as more than it is. A rod that
+	// arrives ALREADY level settles and sleeps; one that has to topple from near
+	// vertical does not. It cartwheels, because one contact point cannot hold a rod
+	// down along its length — a lying rod touches along a LINE, and only a line can
+	// resist turning about the surface normal or about the spine. Same limit as a flat
+	// box being held at a single point in the middle of its face; a capsule feels it
+	// sooner because it has no face to be held by. Wants trace_solid to report a
+	// contact SET, which it cannot yet do.
+}
+
+// The spine may be authored along ANY local axis. Godot builds capsules along Y and
+// this file's fixtures along X, and reading the spine out of a fixed local slot gives
+// one of them a zero-length spine — the contact then lands under the centre, the lever
+// arm vanishes, and a gib in the game stands exactly as it had before while an
+// X-authored test capsule passes.
+//
+// Asked of the TRACE rather than of a settled simulation, deliberately. Three rods with
+// the same geometry pointed the same way in the world are the same object, so they must
+// stop at the same height, exactly — a claim with one answer. Dropping them and looking
+// at where they end up cannot make that claim: a rod toppling from near-vertical does
+// not settle here at all (see the note on test_a_level_rod_lies_still), so the run would
+// be reporting a tumble rather than the thing under test.
+static void test_a_rod_reaches_the_same_whichever_axis_its_spine_runs_along() {
+	auto t = load(make_floor_map());
+	const double half_len = 0.09, radius = 0.01;
+	// One world direction for the spine, 60 degrees off vertical, so the reach is a
+	// genuine mix of length and roundness rather than either one alone.
+	const double ang = 60.0 * 3.14159265358979323846 / 180.0;
+	const V want = vec((T)std::sin(ang), (T)std::cos(ang), (T)0);
+	const double expect = half_len * std::cos(ang) + radius;
+
+	double stops[3];
+	for (int axis = 0; axis < 3; ++axis) {
+		auto rod = make_rod_on(axis, (T)half_len, (T)radius);
+		// Turn the rod's own spine axis onto `want`: rotate about their cross product
+		// by the angle between them.
+		V unit = vec(axis == 0 ? 1 : 0, axis == 1 ? 1 : 0, axis == 2 ? 1 : 0);
+		V cross = vec(unit.y * want.z - unit.z * want.y,
+		              unit.z * want.x - unit.x * want.z,
+		              unit.x * want.y - unit.y * want.x);
+		hop::mat3<T> m;
+		if (hop::length(cross) < (T)1e-9) {
+			m = hop::mat3<T>();
+		} else {
+			hop::mul(cross, (T)(1.0 / hop::length(cross)));
+			const double dot = (double)(unit.x * want.x + unit.y * want.y + unit.z * want.z);
+			hop::set_mat3_from_axis_angle(m, cross, (T)std::acos(dot < -1 ? -1 : dot > 1 ? 1 : dot));
+		}
+		rod->set_orientation(m);
+
+		hop::collision<T> c;
+		hop::segment<T> seg;
+		seg.set_start_dir(vec(0, 0.6, 0), vec(0, -0.8, 0));
+		c.reset();
+		t->trace_solid(c, rod.get(), V {}, hop::mat3<T>(), seg, T {});
+		assert(c.time < (T)1 && "a tilted rod must reach the floor");
+		stops[axis] = 0.6 - 0.8 * (double)c.time;
+		assert(std::fabs(stops[axis] - expect) < 0.004 &&
+		       "and stop at |n.spine| * half + radius, whatever axis it was authored on");
+	}
+	assert(std::fabs(stops[0] - stops[1]) < 1e-6 && std::fabs(stops[0] - stops[2]) < 1e-6 &&
+	       "the same rod pointed the same way is the same rod");
+	printf("  a_rod_reaches_the_same_whichever_axis_its_spine_runs_along ok "
+	       "(%.4f / %.4f / %.4f, want %.4f)\n", stops[0], stops[1], stops[2], expect);
+}
+
+// The expansion itself: a capsule is pushed out by |n.axis| * half + radius, so lying
+// along X its downward reach is the radius alone, not half its length.
+static void test_a_capsule_stops_at_its_own_reach() {
+	auto t = load(make_floor_map());
+	auto rod = make_rod(0.09, 0.01);
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 0.6, 0), vec(0, -0.8, 0));
+	c.reset();
+	t->trace_solid(c, rod.get(), V {}, hop::mat3<T>(), seg, T {});
+	assert(c.time < (T)1);
+	const double stop_y = 0.6 - 0.8 * (double)c.time;
+	assert(std::fabs(stop_y - 0.01) < 0.005 && "a level capsule stops on its radius");
+	printf("  a_capsule_stops_at_its_own_reach ok (y=%.4f)\n", stop_y);
+}
+
 int main() {
 	printf("test_bsp_traceable\n");
 	test_blob_roundtrip();
@@ -988,6 +1057,13 @@ int main() {
 	test_touching_sweep_reports_the_margin_gap();
 	test_sky_is_passable_but_maskable();
 	test_float_instantiation();
+	test_rotated_box_stops_at_its_rotated_reach();
+	test_unrotated_box_is_unchanged_by_the_oriented_path();
+	test_rotated_box_reach_is_symmetric_about_the_turn();
+	test_a_capsule_stops_at_its_own_reach();
+	test_a_tilted_rod_falls_over();
+	test_a_level_rod_lies_still();
+	test_a_rod_reaches_the_same_whichever_axis_its_spine_runs_along();
 	printf("all bsp traceable tests passed\n");
 	return 0;
 }

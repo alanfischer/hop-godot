@@ -28,3 +28,16 @@ endfunction()
 add_hop_godot_test(test_trimesh_traceable)
 add_hop_godot_test(test_bsp_traceable)
 add_hop_godot_test(test_broadphase_capacity)
+
+# Benchmarks are built but not registered with ctest — they report timings, they
+# do not pass or fail. Build explicitly: cmake --build <dir> --target bench_bsp_traceable
+function(add_hop_godot_bench name)
+    add_executable(${name} EXCLUDE_FROM_ALL ${name}.cpp)
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../extern/hop/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../extern/hop
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    target_compile_options(${name} PRIVATE -O2)
+endfunction()
+
+add_hop_godot_bench(bench_bsp_traceable)

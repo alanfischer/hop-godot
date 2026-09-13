@@ -1834,13 +1834,25 @@ void HopPhysicsServer::_joint_clear(const RID &p_joint) {
 	j->type = PhysicsServer3D::JOINT_TYPE_MAX;
 }
 
-void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, const Vector3 &p_local_A, const RID &p_body_B, const Vector3 &p_local_B) {
-	HopJointData *j = joint_owner.get_or_null(p_joint);
-	if (!j) return;
+// hop reads a NEGATIVE span as "no limit", which is what keeps a plain pin a plain pin.
+// Godot cannot express that, so a span it hands over at or beyond half a turn is treated as
+// the same thing: a cone that wide cannot be reached (a swing angle is at most pi by
+// construction) and paying for the rows would be waste.
+static void push_cone_twist_params(HopJointData *j) {
+	if (!j->hop_constraint) return;
+	const float unlimited = 3.1415927f;
+	j->hop_constraint->set_swing_span(to_hop_scalar(j->cone_swing_span >= unlimited ? -1.0f : j->cone_swing_span));
+	j->hop_constraint->set_twist_span(to_hop_scalar(j->cone_twist_span >= unlimited ? -1.0f : j->cone_twist_span));
+	j->hop_constraint->set_limit_bias(to_hop_scalar(j->cone_bias));
+	j->hop_constraint->set_limit_softness(to_hop_scalar(j->cone_softness));
+	j->hop_constraint->set_limit_relaxation(to_hop_scalar(j->cone_relaxation));
+}
 
-	_joint_clear(p_joint);
+std::shared_ptr<hop::constraint<hop_scalar>> HopPhysicsServer::_make_rigid_joint(
+		HopJointData *j, const RID &p_body_A, const RID &p_body_B,
+		const Vector3 &p_local_A, const Vector3 &p_local_B) {
+	_joint_clear(j->self_rid);
 
-	j->type = PhysicsServer3D::JOINT_TYPE_PIN;
 	j->body_a = p_body_A;
 	j->body_b = p_body_B;
 	j->local_a = p_local_A;
@@ -1848,7 +1860,7 @@ void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, 
 
 	HopBodyData *ba = body_owner.get_or_null(p_body_A);
 	HopBodyData *bb = body_owner.get_or_null(p_body_B);
-	if (!ba || !bb || !ba->hop_solid || !bb->hop_solid) return;
+	if (!ba || !bb || !ba->hop_solid || !bb->hop_solid) return nullptr;
 
 	j->hop_constraint = std::make_shared<hop::constraint<hop_scalar>>(ba->hop_solid, bb->hop_solid);
 	// A rigid pin, not a stiff spring (hop Phase 12). The spring this used to build —
@@ -1859,10 +1871,11 @@ void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, 
 	// lets it sleep (see constraint::is_loaded).
 	j->hop_constraint->set_type(hop::constraint<hop_scalar>::type::rigid);
 	j->hop_constraint->set_rest_length(to_hop_scalar(0.0f));
-	// The three pin params Godot exposes, which until now were stored and never read.
+	// The three pin params Godot exposes, which until Phase 12 were stored and never read.
 	// They map straight onto the rigid solve; the clamp in particular is the safety valve
 	// that turns a solver blow-up into a visibly floppy corpse rather than a body launched
-	// out of the map.
+	// out of the map. A cone-twist has no pin params of its own in Godot's API, so it runs
+	// the ball-socket half on these defaults and drives its limits from the cone knobs.
 	j->hop_constraint->set_damping_constant(to_hop_scalar(j->pin_damping));
 	j->hop_constraint->set_bias(to_hop_scalar(j->pin_bias));
 	j->hop_constraint->set_impulse_clamp(to_hop_scalar(j->pin_impulse_clamp));
@@ -1876,6 +1889,14 @@ void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, 
 	if (space) {
 		space->simulator->add_constraint(j->hop_constraint);
 	}
+	return j->hop_constraint;
+}
+
+void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, const Vector3 &p_local_A, const RID &p_body_B, const Vector3 &p_local_B) {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return;
+	_make_rigid_joint(j, p_body_A, p_body_B, p_local_A, p_local_B);
+	j->type = PhysicsServer3D::JOINT_TYPE_PIN;
 }
 
 void HopPhysicsServer::_pin_joint_set_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param, float p_value) {
@@ -1930,9 +1951,9 @@ Vector3 HopPhysicsServer::_pin_joint_get_local_b(const RID &p_joint) const {
 	return j ? j->local_b : Vector3();
 }
 
-// Hinge, slider, cone twist, 6DOF — all stubs. Deliberately still stubs after Phase 12:
-// a pin-only ragdoll is what the corpse work asked for, knees bending backwards included,
-// and angular limits become their own phase if watching one says we need them.
+// Hinge, slider, 6DOF — still stubs. A cone-twist with a narrow twist span is close enough
+// to a hinge for a corpse (see the ragdoll builder's joint table), and nothing in the game
+// wants a slider.
 void HopPhysicsServer::_joint_make_hinge(const RID &p_joint, const RID &p_body_A, const Transform3D &p_hinge_A, const RID &p_body_B, const Transform3D &p_hinge_B) {}
 void HopPhysicsServer::_joint_make_hinge_simple(const RID &p_joint, const RID &p_body_A, const Vector3 &p_pivot_A, const Vector3 &p_axis_A, const RID &p_body_B, const Vector3 &p_pivot_B, const Vector3 &p_axis_B) {}
 void HopPhysicsServer::_hinge_joint_set_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param, float p_value) {}
@@ -1942,9 +1963,59 @@ bool HopPhysicsServer::_hinge_joint_get_flag(const RID &p_joint, PhysicsServer3D
 void HopPhysicsServer::_joint_make_slider(const RID &p_joint, const RID &p_body_A, const Transform3D &p_local_ref_A, const RID &p_body_B, const Transform3D &p_local_ref_B) {}
 void HopPhysicsServer::_slider_joint_set_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param, float p_value) {}
 float HopPhysicsServer::_slider_joint_get_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param) const { return 0.0f; }
-void HopPhysicsServer::_joint_make_cone_twist(const RID &p_joint, const RID &p_body_A, const Transform3D &p_local_ref_A, const RID &p_body_B, const Transform3D &p_local_ref_B) {}
-void HopPhysicsServer::_cone_twist_joint_set_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param, float p_value) {}
-float HopPhysicsServer::_cone_twist_joint_get_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param) const { return 0.0f; }
+// A cone-twist is a pin plus angular limits (hop Phase 13), so it builds the same rigid
+// constraint _joint_make_pin does and then hands hop the spans and the joint's rest frames.
+// The anchors come from the transforms' origins and the frames from their bases — Godot
+// gives both halves of the joint in one Transform3D per body.
+//
+// Worth knowing before trying to centre a cone off a joint's rest pose: through a
+// PhysicalBone3D you cannot. _reload_joint derives BOTH transforms from one world frame
+// (local_a = parent.global^-1 * global * joint_offset, local_b = joint_offset), so rotating
+// joint_offset turns both and the relative rest orientation stays identity. A cone built
+// this way is always symmetric about the pose the ragdoll was created in. A caller driving
+// the server directly can of course hand the two frames whatever it likes.
+void HopPhysicsServer::_joint_make_cone_twist(const RID &p_joint, const RID &p_body_A, const Transform3D &p_local_ref_A, const RID &p_body_B, const Transform3D &p_local_ref_B) {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return;
+
+	// The anchors are the transforms' origins, exactly as the pin's are; the bases are the
+	// joint's rest frame in each body, which is the half a pin does not have.
+	auto c = _make_rigid_joint(j, p_body_A, p_body_B, p_local_ref_A.origin, p_local_ref_B.origin);
+	j->type = PhysicsServer3D::JOINT_TYPE_CONE_TWIST;
+	if (!c) return;
+	c->set_frame_a(to_hop_orientation(p_local_ref_A.basis));
+	c->set_frame_b(to_hop_orientation(p_local_ref_B.basis));
+	push_cone_twist_params(j);
+}
+
+void HopPhysicsServer::_cone_twist_joint_set_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param, float p_value) {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return;
+	switch (p_param) {
+		case PhysicsServer3D::CONE_TWIST_JOINT_SWING_SPAN: j->cone_swing_span = p_value; break;
+		case PhysicsServer3D::CONE_TWIST_JOINT_TWIST_SPAN: j->cone_twist_span = p_value; break;
+		case PhysicsServer3D::CONE_TWIST_JOINT_BIAS: j->cone_bias = p_value; break;
+		case PhysicsServer3D::CONE_TWIST_JOINT_SOFTNESS: j->cone_softness = p_value; break;
+		case PhysicsServer3D::CONE_TWIST_JOINT_RELAXATION: j->cone_relaxation = p_value; break;
+		default: return;
+	}
+	// Godot sets the params AFTER making the joint, so they have to be pushed on every set
+	// and not only at creation — the same shape as the pin's.
+	push_cone_twist_params(j);
+}
+
+float HopPhysicsServer::_cone_twist_joint_get_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param) const {
+	HopJointData *j = joint_owner.get_or_null(p_joint);
+	if (!j) return 0.0f;
+	switch (p_param) {
+		case PhysicsServer3D::CONE_TWIST_JOINT_SWING_SPAN: return j->cone_swing_span;
+		case PhysicsServer3D::CONE_TWIST_JOINT_TWIST_SPAN: return j->cone_twist_span;
+		case PhysicsServer3D::CONE_TWIST_JOINT_BIAS: return j->cone_bias;
+		case PhysicsServer3D::CONE_TWIST_JOINT_SOFTNESS: return j->cone_softness;
+		case PhysicsServer3D::CONE_TWIST_JOINT_RELAXATION: return j->cone_relaxation;
+		default: return 0.0f;
+	}
+}
 void HopPhysicsServer::_joint_make_generic_6dof(const RID &p_joint, const RID &p_body_A, const Transform3D &p_local_ref_A, const RID &p_body_B, const Transform3D &p_local_ref_B) {
 	HopJointData *j = joint_owner.get_or_null(p_joint);
 	if (!j) return;

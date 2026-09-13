@@ -26,6 +26,15 @@ struct HopJointData {
 	float pin_damping = 1.0f;
 	float pin_impulse_clamp = 0.0f;
 
+	// Cone-twist data. Godot's own defaults, which it will also set explicitly right after
+	// _joint_make_cone_twist — the spans arrive in RADIANS even though PhysicalBone3D's
+	// inspector shows degrees.
+	float cone_swing_span = 0.7853982f;  // 45 degrees
+	float cone_twist_span = 3.1415927f;  // 180 degrees
+	float cone_bias = 0.3f;
+	float cone_softness = 0.8f;
+	float cone_relaxation = 1.0f;
+
 	// 6DOF spring data
 	bool linear_spring_enabled = false;
 	float linear_spring_stiffness = 0.0f;

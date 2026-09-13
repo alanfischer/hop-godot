@@ -1851,9 +1851,21 @@ void HopPhysicsServer::_joint_make_pin(const RID &p_joint, const RID &p_body_A, 
 	if (!ba || !bb || !ba->hop_solid || !bb->hop_solid) return;
 
 	j->hop_constraint = std::make_shared<hop::constraint<hop_scalar>>(ba->hop_solid, bb->hop_solid);
-	j->hop_constraint->set_spring_constant(to_hop_scalar(100.0f));
-	j->hop_constraint->set_damping_constant(to_hop_scalar(10.0f));
+	// A rigid pin, not a stiff spring (hop Phase 12). The spring this used to build —
+	// k=100, damping=10 — was a force, and a force spring holding a limb chain up SAGS by
+	// construction: it needs a stretch to produce any force at all. hop's Pass-B solver
+	// enforces the pin instead, driving the relative anchor velocity to zero and taking the
+	// residual separation out positionally, which is what a ragdoll needs and also what
+	// lets it sleep (see constraint::is_loaded).
+	j->hop_constraint->set_type(hop::constraint<hop_scalar>::type::rigid);
 	j->hop_constraint->set_rest_length(to_hop_scalar(0.0f));
+	// The three pin params Godot exposes, which until now were stored and never read.
+	// They map straight onto the rigid solve; the clamp in particular is the safety valve
+	// that turns a solver blow-up into a visibly floppy corpse rather than a body launched
+	// out of the map.
+	j->hop_constraint->set_damping_constant(to_hop_scalar(j->pin_damping));
+	j->hop_constraint->set_bias(to_hop_scalar(j->pin_bias));
+	j->hop_constraint->set_impulse_clamp(to_hop_scalar(j->pin_impulse_clamp));
 	// Pin at the joint's anchor points, not the body centers. Godot's local_A/local_B
 	// are offsets in each body's local frame — exactly hop's local anchors. Off-center
 	// anchors now also torque a dynamic body via their lever arm (hop Phase 10).
@@ -1874,6 +1886,12 @@ void HopPhysicsServer::_pin_joint_set_param(const RID &p_joint, PhysicsServer3D:
 		case PhysicsServer3D::PIN_JOINT_DAMPING: j->pin_damping = p_value; break;
 		case PhysicsServer3D::PIN_JOINT_IMPULSE_CLAMP: j->pin_impulse_clamp = p_value; break;
 		default: break;
+	}
+	// Godot sets params after making the joint, so push them through to a live constraint.
+	if (j->hop_constraint) {
+		j->hop_constraint->set_damping_constant(to_hop_scalar(j->pin_damping));
+		j->hop_constraint->set_bias(to_hop_scalar(j->pin_bias));
+		j->hop_constraint->set_impulse_clamp(to_hop_scalar(j->pin_impulse_clamp));
 	}
 }
 
@@ -1912,7 +1930,9 @@ Vector3 HopPhysicsServer::_pin_joint_get_local_b(const RID &p_joint) const {
 	return j ? j->local_b : Vector3();
 }
 
-// Hinge, slider, cone twist, 6DOF — all stubs
+// Hinge, slider, cone twist, 6DOF — all stubs. Deliberately still stubs after Phase 12:
+// a pin-only ragdoll is what the corpse work asked for, knees bending backwards included,
+// and angular limits become their own phase if watching one says we need them.
 void HopPhysicsServer::_joint_make_hinge(const RID &p_joint, const RID &p_body_A, const Transform3D &p_hinge_A, const RID &p_body_B, const Transform3D &p_hinge_B) {}
 void HopPhysicsServer::_joint_make_hinge_simple(const RID &p_joint, const RID &p_body_A, const Vector3 &p_pivot_A, const Vector3 &p_axis_A, const RID &p_body_B, const Vector3 &p_pivot_B, const Vector3 &p_axis_B) {}
 void HopPhysicsServer::_hinge_joint_set_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param, float p_value) {}
@@ -2014,6 +2034,9 @@ int32_t HopPhysicsServer::_joint_get_solver_priority(const RID &p_joint) const {
 	return j ? j->solver_priority : 1;
 }
 
+// Stored and never read — nothing in hop pairs bodies by joint. Moot for a ragdoll, whose
+// bones sit on collision layer 0 and never pair with each other in the first place, but do
+// not assume it works if you wire up a joint between two colliding bodies.
 void HopPhysicsServer::_joint_disable_collisions_between_bodies(const RID &p_joint, bool p_disable) {
 	HopJointData *j = joint_owner.get_or_null(p_joint);
 	if (j) j->disable_collisions = p_disable;

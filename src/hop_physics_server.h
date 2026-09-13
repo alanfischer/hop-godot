@@ -258,6 +258,13 @@ public:
 	// === Joint API ===
 	RID _joint_create() override;
 	void _joint_clear(const RID &p_joint) override;
+	// The ball-socket half every joint hop can build shares: a rigid constraint between two
+	// bodies at two local anchors, carrying the three pin params, registered on the space.
+	// A cone-twist is this plus limits, so both makers call it instead of keeping two copies
+	// of the bootstrap in step. Returns null if either body cannot be simulated.
+	std::shared_ptr<hop::constraint<hop_scalar>> _make_rigid_joint(
+		HopJointData *j, const RID &p_body_A, const RID &p_body_B,
+		const Vector3 &p_local_A, const Vector3 &p_local_B);
 	void _joint_make_pin(const RID &p_joint, const RID &p_body_A, const Vector3 &p_local_A, const RID &p_body_B, const Vector3 &p_local_B) override;
 	void _pin_joint_set_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param, float p_value) override;
 	float _pin_joint_get_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param) const override;

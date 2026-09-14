@@ -25,6 +25,7 @@ void HopBodyData::create_hop_solid() {
 		hop_solid->set_coefficient_of_gravity(to_hop_scalar(gravity_scale));
 	}
 	hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(linear_damp));
+	hop_solid->set_coefficient_of_angular_damping(to_hop_scalar(angular_damp));
 
 	hop_solid->set_collision_scope(collision_layer);
 	hop_solid->set_collide_with_scope(collision_mask);
@@ -73,6 +74,7 @@ void HopBodyData::sync_to_hop() {
 		hop_solid->set_coefficient_of_gravity(to_hop_scalar(gravity_scale));
 	}
 	hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(linear_damp));
+	hop_solid->set_coefficient_of_angular_damping(to_hop_scalar(angular_damp));
 
 	hop_solid->set_collision_scope(collision_layer);
 	hop_solid->set_collide_with_scope(collision_mask);

@@ -542,8 +542,38 @@ std::unique_ptr<HopBspTraceable<hop_scalar>> HopPhysicsServer::try_build_bsp_hul
 	return traceable;
 }
 
+// The only thing that stops a sphere rolling forever on flat ground. A sphere touches
+// the floor at exactly one point however the manifold is built, so no amount of contact
+// clipping holds it still, and hop's mu_roll — a torque opposing the spin at the
+// contact, bounded by mu_roll*N*r, able only to remove spin — is the standard answer.
+// It is opt-in in hop (0 by default) because no other shape here needs it.
+//
+// Godot has nothing to map it from: PhysicsMaterial carries friction, bounce and the
+// combine flags and no rolling term. So the value is ours, and it is applied to exactly
+// the bodies it describes — dynamic, and spherical in every enabled shape.
+//
+// hop averages the pair's coefficients and a floor contributes 0, so a contact sees
+// half of this. At this value a 20 cm stone rolling at 5 m/s runs ~5 m before it stops
+// and one at 18 m/s ~18 m: it comes to rest without looking braked.
+static constexpr float SPHERE_ROLLING_FRICTION = 0.02f;
+
+void HopPhysicsServer::apply_rolling_friction(HopBodyData *body) {
+	if (!body || !body->hop_solid) return;
+	bool rolls = !body->is_static_or_kinematic();
+	int enabled = 0;
+	for (const auto &entry : body->shapes) {
+		if (entry.disabled) continue;
+		++enabled;
+		HopShapeData *sd = shape_owner.get_or_null(entry.shape_rid);
+		if (!sd || sd->type != PhysicsServer3D::SHAPE_SPHERE) { rolls = false; break; }
+	}
+	body->hop_solid->set_coefficient_of_rolling_friction(
+			rolls && enabled > 0 ? to_hop_scalar(SPHERE_ROLLING_FRICTION) : hop_scalar{});
+}
+
 void HopPhysicsServer::rebuild_body_shapes(HopBodyData *body) {
 	if (!body || !body->hop_solid) return;
+	apply_rolling_friction(body);   // reads the shape list, so it answers to every early exit below
 	body->hop_solid->remove_all_shapes();
 
 	// The game turns a brush entity intangible by disabling its CollisionShape3Ds
@@ -746,6 +776,7 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 
 		// KINEMATIC (player) → sweep-and-slide; STATIC/RIGID → speculative solve.
 		apply_contact_mode(body);
+		apply_rolling_friction(body);
 
 		// Re-register with the BVH manager — static/dynamic classification may have changed.
 		if (body->space_rid.is_valid()) {
@@ -934,7 +965,10 @@ void HopPhysicsServer::_body_set_param(const RID &p_body, PhysicsServer3D::BodyP
 			body->linear_damp = p_value;
 			if (body->hop_solid) body->hop_solid->set_coefficient_of_effective_drag(to_hop_scalar(body->linear_damp));
 		} break;
-		case PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP: body->angular_damp = p_value; break;
+		case PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP: {
+			body->angular_damp = p_value;
+			if (body->hop_solid) body->hop_solid->set_coefficient_of_angular_damping(to_hop_scalar(body->angular_damp));
+		} break;
 		default: break;
 	}
 }
@@ -2406,45 +2440,6 @@ void HopPhysicsServer::_step(float p_step) {
 				body->linear_velocity = to_godot(vel);
 				body->angular_velocity = to_godot(omega);
 			}
-		});
-	}
-
-	// Angular damping, the way Godot's own integrator does it: w *= max(0, 1 - damp*dt),
-	// applied once per step just before integration. hop's only drag is a fluid force on
-	// LINEAR velocity, so without this BODY_PARAM_ANGULAR_DAMP was stored and never read —
-	// a body given spin kept every bit of it for as long as it lived. Debris is what
-	// notices: a gib is thrown with a random tumble and set to damp out of it, and under
-	// hop it span at its launch rate until it faded, where the same gib settles under
-	// GodotPhysics3D.
-	//
-	// Body damp only, no area override, matching what the linear path resolves above.
-	{
-		const float fdt = p_step > 0.0f ? p_step : (1.0f / 60.0f);
-		body_owner.for_each([&](HopBodyData *body) {
-			if (!body->hop_solid || body->is_static_or_kinematic()) return;
-			if (body->angular_damp <= 0.0f) return;
-			// A body hop does not spin dynamically carries ω as scripted motion (the
-			// kinematic-carry path writes it); damping that would be a behaviour change.
-			if (!body->hop_solid->rotates_dynamically()) return;
-			// set_angular_velocity activates the body. Damping one that is already
-			// turning slower than the sleep threshold would therefore reset its
-			// deactivation counter every step, and it could never sleep — the counter
-			// needs 32 consecutive still ticks and never reached 2. Below that speed the
-			// damp is invisible anyway, so leave it alone and let the body settle.
-			// Without this a damped gib rolls forever; with it, it sleeps in ~3 s.
-			HopSpaceData *space = space_owner.get_or_null(body->space_rid);
-			if (space && space->simulator &&
-			    hop::length(body->hop_solid->get_angular_velocity()) <
-			        space->simulator->get_deactivate_speed())
-				return;
-			const float f = 1.0f - body->angular_damp * fdt;
-			hop::vec3<hop_scalar> w = body->hop_solid->get_angular_velocity();
-			if (f <= 0.0f) {
-				w.reset();
-			} else {
-				hop::mul(w, scalar_from_float<hop_scalar>(f));
-			}
-			body->hop_solid->set_angular_velocity(w);
 		});
 	}
 

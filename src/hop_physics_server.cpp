@@ -1045,6 +1045,8 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 		} break;
 		case PhysicsServer3D::BODY_STATE_CAN_SLEEP: {
 			body->can_sleep = p_value;
+			if (body->hop_solid)
+				body->hop_solid->set_stay_active(!body->can_sleep);
 		} break;
 		default: break;
 	}

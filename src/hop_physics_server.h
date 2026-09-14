@@ -74,6 +74,8 @@ public:
 	// AABB + mass (so a RigidBody3D spins without the game setting inertia), unless
 	// the game set BODY_PARAM_INERTIA explicitly (custom_inertia).
 	void update_body_inertia(HopBodyData *body);
+	// Rolling resistance for the one shape that needs it — see the definition.
+	void apply_rolling_friction(HopBodyData *body);
 	void add_body_to_space(HopBodyData *body, HopSpaceData *space);
 	void remove_body_from_space(HopBodyData *body);
 

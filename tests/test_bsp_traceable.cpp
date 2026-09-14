@@ -1023,6 +1023,70 @@ static void test_a_capsule_stops_at_its_own_reach() {
 	printf("  a_capsule_stops_at_its_own_reach ok (y=%.4f)\n", stop_y);
 }
 
+// --- contact manifolds ------------------------------------------------------
+//
+// The reason the phase touches the BSP path at all: a corpse lies on LEVEL GEOMETRY,
+// and level geometry is a traceable shape on a solid. Fixing solid-vs-solid alone would
+// not move the game a millimetre.
+//
+// A traceable has no face polygon to clip against, so each corner of the mover's
+// contacting face is probed straight down the contact normal onto the real hull. That
+// is what makes the ledge case below work: a corner over thin air finds nothing and is
+// dropped, where clipping to an infinite contact plane would hold the box up on nothing.
+
+static void test_a_tilted_box_on_a_bsp_floor_gets_a_patch_and_sleeps() {
+	auto blob = make_floor_map();
+	std::shared_ptr<hop::solid<T>> world;
+	auto sim = world_with_floor(world, blob);
+	auto box = make_spinning_box(0.08, 0.08, 0.08);
+	hop::mat3<T> m;
+	hop::set_mat3_from_axis_angle(m, vec(0.5774, 0.5774, 0.5774), (T)0.05);
+	box->set_orientation(m);
+	box->set_position(vec(0, 0.5, 0));
+	sim->add_solid(box);
+
+	int slept_at = -1;
+	for (int i = 0; i < 400; ++i) {
+		sim->update((T)(1.0 / 60.0));
+		if (slept_at < 0 && !box->active())
+			slept_at = i;
+	}
+	int points = 0;
+	for (int k = 0; k < box->get_touch_count(); ++k)
+		points += box->get_touch(k).point_count;
+	if (hop::max_manifold_points > 1)
+		assert(points == 4 && "four corners of the box's bottom face are on the floor");
+	assert(slept_at >= 0 && slept_at < 300 && "and it comes to rest");
+	assert(hop::length(box->get_angular_velocity()) == T {} && "dead still, not frozen mid-turn");
+	printf("  a_tilted_box_on_a_bsp_floor_gets_a_patch_and_sleeps ok (%d points, asleep at %d)\n",
+	       points, slept_at);
+}
+
+// Hang the box off the edge of the floor brush and the corners over thin air must NOT be
+// reported. This is the whole reason each corner is PROBED against the real hull rather
+// than clipped to the contact plane: an infinite plane would hold an overhanging body up
+// on nothing and it would never tip.
+static void test_corners_over_a_ledge_are_not_reported() {
+	auto blob = make_floor_map();
+	std::shared_ptr<hop::solid<T>> world;
+	auto sim = world_with_floor(world, blob);
+	// make_floor_map's slab spans +-512 GoldSrc units about the origin, which at
+	// SCALE (0.025) is +-12.8 m. Sit the box astride the +x edge, half on and half off.
+	const T edge = (T)(512.0 * SCALE);
+	auto box = make_spinning_box(0.08, 0.08, 0.08);
+	box->set_position(vec(edge - (T)0.04, (T)0.081, 0));
+	sim->add_solid(box);
+	for (int i = 0; i < 20; ++i)
+		sim->update((T)(1.0 / 60.0));
+	int points = 0;
+	for (int k = 0; k < box->get_touch_count(); ++k)
+		points += box->get_touch(k).point_count;
+	assert(points >= 1 && "the supported half is still in contact");
+	if (hop::max_manifold_points > 1)
+		assert(points <= 2 && "but the corners hanging over the edge are not");
+	printf("  test_corners_over_a_ledge_are_not_reported ok (%d points at the edge)\n", points);
+}
+
 int main() {
 	printf("test_bsp_traceable\n");
 	test_blob_roundtrip();
@@ -1064,6 +1128,8 @@ int main() {
 	test_a_tilted_rod_falls_over();
 	test_a_level_rod_lies_still();
 	test_a_rod_reaches_the_same_whichever_axis_its_spine_runs_along();
+	test_a_tilted_box_on_a_bsp_floor_gets_a_patch_and_sleeps();
+	test_corners_over_a_ledge_are_not_reported();
 	printf("all bsp traceable tests passed\n");
 	return 0;
 }

@@ -76,6 +76,12 @@ void HopBodyData::sync_to_hop() {
 
 	hop_solid->set_collision_scope(collision_layer);
 	hop_solid->set_collide_with_scope(collision_mask);
+	// can_sleep was stored and never read. Harmless while nothing hop simulated ever
+	// slept; now that resting bodies do, a body Godot says must stay awake has to be
+	// pinned active or it deactivates out from under the game. Unconditional, not
+	// `if (!can_sleep)`: a one-way latch could never release a body the game later
+	// allows to sleep again.
+	hop_solid->set_stay_active(!can_sleep);
 }
 
 void HopBodyData::sync_from_hop() {

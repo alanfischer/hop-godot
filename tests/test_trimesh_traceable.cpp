@@ -455,6 +455,53 @@ static void test_box_mover_vs_rotated_mesh() {
 	printf("  box vs rotated mesh (static): normal.x=%.2f depth=%.3f\n", st.normal.x, st.depth);
 }
 
+// --- Contact manifold against a mesh --------------------------------------
+//
+// A trimesh has no face polygon to clip against — it is a soup — so each corner of the
+// mover's contacting face is probed straight down the contact normal onto the real
+// triangles. The seam between two coplanar triangles is the case worth naming: it used
+// to be suppressed as a duplicate normal, and with a manifold a box lying across it
+// legitimately reports points on BOTH.
+static void test_a_box_on_a_mesh_floor_gets_a_patch() {
+	std::vector<V> v; std::vector<Tri> t;
+	flat_quad(v, t, true);  // UP-facing floor at y = 0
+	auto mesh = make_mesh(v, t);
+
+	hop::simulator<T> sim;
+	sim.set_gravity(vec(0, -20, 0));
+	sim.set_default_contact_mode(hop::contact_mode::speculative);
+	auto world = std::make_shared<hop::solid<T>>();
+	world->set_infinite_mass();
+	world->set_coefficient_of_gravity(T {});
+	world->add_shape(std::make_shared<hop::shape<T>>(std::move(mesh)));
+	sim.add_solid(world);
+	world->set_collision_scope(1);
+	world->set_collide_with_scope(0);
+
+	// Astride the seam: flat_quad splits its quad along the (-5,-5)->(5,5) diagonal, so
+	// a box at the origin sits on both triangles at once.
+	auto box = make_box((T)0.5, (T)0.5, (T)0.5);
+	box->set_mass((T)1);
+	box->set_inertia(vec((T)0.1, (T)0.1, (T)0.1));
+	box->set_position(vec(0, (T)0.6, 0));
+	sim.add_solid(box);
+	box->set_contact_mode(hop::contact_mode::speculative);
+	box->set_collision_scope(0);
+	box->set_collide_with_scope(1);
+
+	for (int i = 0; i < 300; ++i)
+		sim.update((T)(1.0 / 60.0));
+	int points = 0;
+	for (int k = 0; k < box->get_touch_count(); ++k)
+		points += box->get_touch(k).point_count;
+	if (hop::max_manifold_points > 1)
+		assert(points == 4 && "a box lying flat on a mesh is held at four corners");
+	assert(!box->active() && "and it sleeps");
+	assert(hop::length(box->get_angular_velocity()) == T {} && "dead still");
+	printf("  a_box_on_a_mesh_floor_gets_a_patch ok (%d points, y=%.4f)\n",
+	       points, (double)box->get_position().y);
+}
+
 int main() {
 	printf("test_trimesh_traceable:\n");
 	test_recovery_front_face();
@@ -469,6 +516,7 @@ int main() {
 	test_step_drop_not_rejected();
 	test_contact_point_on_surface();
 	test_box_mover_vs_rotated_mesh();
+	test_a_box_on_a_mesh_floor_gets_a_patch();
 	printf("ALL PASSED\n");
 	return 0;
 }

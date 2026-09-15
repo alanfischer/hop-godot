@@ -28,6 +28,19 @@ using namespace hop_bsp;
 
 #include "bsp_fixtures.h"
 
+// Drop `s` straight down onto the floor and return the height it comes to rest at. A
+// reach test is one of these plus one assertion; `floor_rot` tilts the geometry itself.
+static double stop_height(HopBspTraceable<T> &t, std::shared_ptr<hop::solid<T>> s,
+                          hop::mat3<T> floor_rot = hop::mat3<T>()) {
+	hop::collision<T> c;
+	hop::segment<T> seg;
+	seg.set_start_dir(vec(0, 2, 0), vec(0, -4, 0));
+	c.reset();
+	t.trace_solid(c, s.get(), V {}, floor_rot, seg, T {});
+	assert(c.time < (T)1 && "it reaches the floor");
+	return 2.0 - 4.0 * (double)c.time;
+}
+
 // Sweep `s` from `from` along `motion` and return what it hit. Every solid test
 // below is one of these plus its assertions; a zero `motion` is the static
 // overlap query.
@@ -1007,6 +1020,72 @@ static void test_a_rod_reaches_the_same_whichever_axis_its_spine_runs_along() {
 	       "(%.4f / %.4f / %.4f, want %.4f)\n", stops[0], stops[1], stops[2], expect);
 }
 
+// A ball is the one mover a hull can carry exactly without knowing its attitude: every
+// plane is pushed out by the same radius. Traced as its bounding box — which is what it
+// got until this case existed — it rests on the CUBE's reach, exact on a level floor and
+// badly high on anything sloped. The control is a capsule of the same radius with a hair
+// of spine, which has always taken the exact rounded path, so the two must now agree.
+static void test_a_ball_rests_on_its_radius_at_any_angle() {
+	auto t = load(make_floor_map());
+	const double R = 0.1;
+	auto ball = std::make_shared<hop::solid<T>>();
+	ball->add_shape(std::make_shared<hop::shape<T>>(hop::sphere<T>(vec(0, 0, 0), (T)R)));
+	ball->set_mass((T)1);
+	ball->set_inertia(vec((T)0.004, (T)0.004, (T)0.004));
+
+	auto pill = std::make_shared<hop::solid<T>>();  // the same ball with 1mm of spine
+	pill->add_shape(std::make_shared<hop::shape<T>>(
+		hop::capsule<T>(vec((T)-0.0005, 0, 0), vec((T)0.001, 0, 0), (T)R)));
+	pill->set_mass((T)1);
+	pill->set_inertia(vec((T)0.004, (T)0.004, (T)0.004));
+
+	for (double deg : { 0.0, 20.0, 45.0 }) {
+		const hop::mat3<T> floor_rot = rot_about(vec(0, 0, 1), deg);
+		const double got = stop_height(*t, ball, floor_rot);
+		const double want = stop_height(*t, pill, floor_rot);
+		assert(std::fabs(got - want) < 0.002 &&
+		       "a ball stops where a rounded mover of its radius does, at any slope");
+		printf("  a_ball_rests_on_its_radius_at_any_angle[%2.0f deg] ok (ball %.4f, control %.4f)\n",
+		       deg, got, want);
+	}
+}
+
+// Where the turn actually comes from in the game. Godot authors every capsule along Y
+// and puts the rotation on the COLLIDER, which arrives here as the shape's own
+// local_rotation (hop_shape_data.cpp) with the BODY still unrotated — a ragdoll bone
+// whose hitbox is long along X is exactly that. The hull is expanded by the spine, so
+// the spine has to carry the shape's rotation as well as the body's: read raw, a rod
+// lying flat is expanded as though it were standing on its end and stops a half-length
+// above the floor instead of on its radius.
+static void test_a_rods_spine_follows_its_colliders_rotation() {
+	auto t = load(make_floor_map());
+	const double half_len = 0.09, radius = 0.01;
+	auto rod = make_rod_on(1, (T)half_len, (T)radius);  // authored along Y, as Godot does
+	// The collider lays it down along X, exactly as a CollisionShape3D's basis would.
+	rod->get_shapes()[0]->set_local_rotation(rot_about(vec(0, 0, 1), -90.0));
+
+	const double stop_y = stop_height(*t, rod);
+	assert(std::fabs(stop_y - radius) < 0.005 &&
+	       "a rod laid down by its collider rests on its radius, not on its length");
+	printf("  a_rods_spine_follows_its_colliders_rotation ok (y=%.4f)\n", stop_y);
+}
+
+// And the same claim for a box, which is why the collider's turn is folded into the
+// mover's rotation ONCE for every shape rather than inside the capsule's own helper: a
+// turn is a turn whichever of the two carries it. Asked as an equality, so it holds
+// whatever the reach works out to.
+static void test_a_box_turned_by_its_collider_reaches_the_same() {
+	auto t = load(make_floor_map());
+	auto by_body = make_spinning_box(0.2, 0.05, 0.2);
+	by_body->set_orientation(rot_about(vec(0, 0, 1), 45.0));
+	auto by_collider = make_spinning_box(0.2, 0.05, 0.2);
+	by_collider->get_shapes()[0]->set_local_rotation(rot_about(vec(0, 0, 1), 45.0));
+
+	const double body = stop_height(*t, by_body), collider = stop_height(*t, by_collider);
+	assert(std::fabs(body - collider) < 1e-9 && "the same box turned the same way is the same box");
+	printf("  a_box_turned_by_its_collider_reaches_the_same ok (%.4f both ways)\n", body);
+}
+
 // The expansion itself: a capsule is pushed out by |n.axis| * half + radius, so lying
 // along X its downward reach is the radius alone, not half its length.
 static void test_a_capsule_stops_at_its_own_reach() {
@@ -1060,6 +1139,45 @@ static void test_a_tilted_box_on_a_bsp_floor_gets_a_patch_and_sleeps() {
 	assert(hop::length(box->get_angular_velocity()) == T {} && "dead still, not frozen mid-turn");
 	printf("  a_tilted_box_on_a_bsp_floor_gets_a_patch_and_sleeps ok (%d points, asleep at %d)\n",
 	       points, slept_at);
+}
+
+// The same claim for the shape the game actually lies on a map floor: a corpse's limb,
+// authored along Y and laid down by its collider. A capsule was refused a manifold
+// against a traceable outright — the pair test admitted polytopes only — so it rested on
+// the single swept contact, which cannot level anything, and a ragdoll built out of
+// capsules would not settle on a BSP floor while the same ragdoll settled on a box.
+static void test_a_rod_on_a_bsp_floor_is_held_at_both_ends_and_sleeps() {
+	auto blob = make_floor_map();
+	std::shared_ptr<hop::solid<T>> world;
+	auto sim = world_with_floor(world, blob);
+	auto rod = make_rod_on(1, (T)0.09, (T)0.01);  // Y-authored, as Godot builds them
+	hop::mat3<T> lay;
+	hop::set_mat3_from_axis_angle(lay, vec(0, 0, 1), (T)(-90.0 * 3.14159265358979323846 / 180.0));
+	rod->get_shapes()[0]->set_local_rotation(lay);
+	// The collider turned the geometry, so the spine now lies along world X and the small
+	// moment belongs there. Godot derives a PhysicalBone3D's tensor from the collider,
+	// which lands in the same place.
+	rod->set_inertia(vec((T)0.002, (T)0.004, (T)0.004));
+	rod->set_position(vec(0, 0.2, 0));
+	sim->add_solid(rod);
+
+	int slept_at = -1;
+	for (int i = 0; i < 600; ++i) {
+		sim->update((T)(1.0 / 60.0));
+		if (slept_at < 0 && !rod->active())
+			slept_at = i;
+	}
+	int points = 0;
+	for (int k = 0; k < rod->get_touch_count(); ++k)
+		points += rod->get_touch(k).point_count;
+	if (hop::max_manifold_points > 1)
+		assert(points == 2 && "both ends of the spine are on the floor");
+	assert(slept_at >= 0 && slept_at < 500 && "and it comes to rest");
+	assert(hop::length(rod->get_angular_velocity()) == T {} && "dead still, not frozen mid-roll");
+	const double y = (double)rod->get_position().y;
+	assert(y > 0.004 && y < 0.02 && "lying on its radius, not sunk and not floating");
+	printf("  a_rod_on_a_bsp_floor_is_held_at_both_ends_and_sleeps ok (%d points, asleep at %d, y=%.4f)\n",
+	       points, slept_at, y);
 }
 
 // Hang the box off the edge of the floor brush and the corners over thin air must NOT be
@@ -1125,10 +1243,14 @@ int main() {
 	test_unrotated_box_is_unchanged_by_the_oriented_path();
 	test_rotated_box_reach_is_symmetric_about_the_turn();
 	test_a_capsule_stops_at_its_own_reach();
+	test_a_ball_rests_on_its_radius_at_any_angle();
+	test_a_rods_spine_follows_its_colliders_rotation();
+	test_a_box_turned_by_its_collider_reaches_the_same();
 	test_a_tilted_rod_falls_over();
 	test_a_level_rod_lies_still();
 	test_a_rod_reaches_the_same_whichever_axis_its_spine_runs_along();
 	test_a_tilted_box_on_a_bsp_floor_gets_a_patch_and_sleeps();
+	test_a_rod_on_a_bsp_floor_is_held_at_both_ends_and_sleeps();
 	test_corners_over_a_ledge_are_not_reported();
 	printf("all bsp traceable tests passed\n");
 	return 0;

@@ -1231,12 +1231,23 @@ private:
 			hop::mul(rel, Rt, Rm);
 			Rm = rel;
 		}
+		// Then the COLLIDER's own turn, which is where the game's rotations actually
+		// live: Godot authors a capsule along Y and a box axis-aligned, and puts the
+		// attitude on the shape as local_rotation (hop_shape_data.cpp). Folded in here,
+		// once, `Rm` is the mover's axes full stop and every case below reads it the
+		// same way — hop_triangle_collision.h composes the same product for the same
+		// reason. A shape with no turn of its own multiplies through exactly.
+		if (const hop::shape<T> *only = single_centred_shape(s)) {
+			hop::mat3<T> full;
+			hop::mul(full, Rm, only->get_local_rotation());
+			Rm = full;
+		}
 
 		// A capsule has to be carried at EVERY attitude, including square-on: traced as
 		// its bounding box it is a brick, and a brick has corners a capsule does not.
 		// A box square-on to the hull is exactly what the plain AABB path already
 		// traces, so it stays on it and stays bit-identical.
-		const bool round = single_centred_capsule(s, Rm, b);
+		const bool round = single_centred_capsule(s, Rm, b) || single_centred_sphere(s, b);
 		if (!round && Rm == identity) return b;
 
 		if (!round) {
@@ -1272,15 +1283,30 @@ private:
 		return b;
 	}
 
-	// Half-extents of a solid that IS one centred, unrotated-in-its-own-frame box, in
-	// GoldSrc axis order. False for anything else.
-	bool single_centred_box_hext(hop::solid<T> *s, double hext[3]) const {
+	// The one shape a solid is made of, if it is made of exactly one and that one sits on
+	// the body's own origin. Everything the hull can carry exactly is of this form: an
+	// expanded hull holds ONE symmetric offset per plane, which an off-centre shape (or a
+	// second shape) has no way to be. The three cases below all start here.
+	hop::shape<T> *single_centred_shape(hop::solid<T> *s, hop::shape_type want) const {
+		hop::shape<T> *sh = single_centred_shape(s);
+		return (sh != nullptr && sh->get_type() == want) ? sh : nullptr;
+	}
+
+	hop::shape<T> *single_centred_shape(hop::solid<T> *s) const {
 		const auto &shapes = s->get_shapes();
-		if (shapes.size() != 1) return false;
+		if (shapes.size() != 1) return nullptr;
 		hop::shape<T> *sh = shapes[0].get();
-		if (sh->get_type() != hop::shape_type::box) return false;
 		const hop::vec3<T> &lp = sh->get_local_position();
-		if (!(lp.x == T {} && lp.y == T {} && lp.z == T {})) return false;
+		if (!(lp.x == T {} && lp.y == T {} && lp.z == T {})) return nullptr;
+		return sh;
+	}
+
+	// Half-extents of a solid that IS one centred box, in GoldSrc axis order. False for
+	// anything else. The caller pairs these with Rm's columns, which carry the box's own
+	// rotation, so the extents stay in the shape's frame where they are authored.
+	bool single_centred_box_hext(hop::solid<T> *s, double hext[3]) const {
+		hop::shape<T> *sh = single_centred_shape(s, hop::shape_type::box);
+		if (sh == nullptr) return false;
 		const hop::aa_box<T> &box = sh->get_box();
 		hop::vec3<T> centre;
 		hop::add(centre, box.mins, box.maxs);
@@ -1288,6 +1314,24 @@ private:
 		hext[0] = 0.5 * (double)(box.maxs.x - box.mins.x) * inv_scale_;
 		hext[1] = 0.5 * (double)(box.maxs.z - box.mins.z) * inv_scale_;
 		hext[2] = 0.5 * (double)(box.maxs.y - box.mins.y) * inv_scale_;
+		return true;
+	}
+
+	// A solid that IS one centred sphere: no spine at all, the whole shape in `radius`.
+	// A sphere is the one mover a hull can hold exactly without knowing which way it is
+	// turned, so this takes no basis and cares about no rotation — every plane is pushed
+	// out by the same radius. Traced as its bounding box instead (which is what it got
+	// before), a ball rests on the box's corner reach: exact on a level floor, and a
+	// whole 58% of its radius high on a 45-degree slope.
+	bool single_centred_sphere(hop::solid<T> *s, hopbsp::mover_basis &b) const {
+		hop::shape<T> *sh = single_centred_shape(s, hop::shape_type::sphere);
+		if (sh == nullptr) return false;
+		const hop::sphere<T> &sp = sh->get_sphere();
+		if (!(sp.origin.x == T {} && sp.origin.y == T {} && sp.origin.z == T {})) return false;
+		if (sp.radius <= T {}) return false;
+		// No axes and no extents to write: mover_basis is born with the identity and
+		// zeroes, and a ball is the same reach whichever way it is turned.
+		b.radius = (double)sp.radius * inv_scale_;
 		return true;
 	}
 
@@ -1301,13 +1345,8 @@ private:
 	// exactly as it did before while the other axis's test passes.
 	bool single_centred_capsule(hop::solid<T> *s, const hop::mat3<T> &Rm,
 	                            hopbsp::mover_basis &b) const {
-		const auto &shapes = s->get_shapes();
-		if (shapes.size() != 1) return false;
-		hop::shape<T> *sh = shapes[0].get();
-		if (sh->get_type() != hop::shape_type::capsule) return false;
-		const hop::vec3<T> &lp = sh->get_local_position();
-		if (!(lp.x == T {} && lp.y == T {} && lp.z == T {})) return false;
-
+		hop::shape<T> *sh = single_centred_shape(s, hop::shape_type::capsule);
+		if (sh == nullptr) return false;
 		const hop::capsule<T> &c = sh->get_capsule();
 		hop::vec3<T> spine_half(c.direction);
 		hop::mul(spine_half, hop::scalar_traits<T>::half());

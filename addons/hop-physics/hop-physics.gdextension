@@ -19,3 +19,5 @@ linux.debug.x86_64 = "res://addons/hop-physics/bin/libhop-physics.linux.template
 linux.release.x86_64 = "res://addons/hop-physics/bin/libhop-physics.linux.template_release.x86_64.so"
 linux.debug.arm64 = "res://addons/hop-physics/bin/libhop-physics.linux.template_release.arm64.so"
 linux.release.arm64 = "res://addons/hop-physics/bin/libhop-physics.linux.template_release.arm64.so"
+android.debug.arm64 = "res://addons/hop-physics/bin/libhop-physics.android.template_release.arm64.so"
+android.release.arm64 = "res://addons/hop-physics/bin/libhop-physics.android.template_release.arm64.so"

@@ -30,6 +30,12 @@ struct HopBodyData {
 	uint64_t object_instance_id = 0;
 
 	Transform3D transform;
+	// Where the next kinematic sweep starts from: this body's transform as of the
+	// last step. _step sweeps a KINEMATIC body from here to `transform` by
+	// prescribing a velocity for one step, and it has to keep that start point
+	// itself — the solid cannot hold it, because the solid has to stand at the
+	// body's CURRENT place for a query made between two steps to find it there.
+	Transform3D sweep_prev_transform;
 	// Godot-facing velocities. A dynamic body's linear_velocity tracks the hop solid;
 	// angular_velocity is script-set only (hop has no dynamic spin yet). For a
 	// KINEMATIC mover, _step publishes its per-frame motion here (v = Δorigin/dt, ω

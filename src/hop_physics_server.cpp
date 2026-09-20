@@ -750,25 +750,14 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 	const bool was_kinematic = body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC;
 	body->mode = p_mode;
 
+	// Becoming KINEMATIC: the first sweep starts from where the body is now, not from
+	// wherever it last was under another mode — a body that has been simulating, or one
+	// posed bone by bone before it is handed over, would otherwise be swept across that
+	// whole gap in one step and arrive carrying the velocity to match.
+	if (!was_kinematic && p_mode == PhysicsServer3D::BODY_MODE_KINEMATIC)
+		body->sweep_prev_transform = body->transform;
+
 	if (body->hop_solid) {
-		// Leaving KINEMATIC: hand hop the transform it was never given. A kinematic
-		// body's transform writes are withheld from the solid so the pre-step loop can
-		// sweep it instead (see _body_set_state), so the solid only catches up ON A
-		// STEP — and a body that has not been stepped since it was placed is still
-		// wherever its solid was last left.
-		//
-		// Godot's PhysicalBone3D poses every bone and THEN makes it rigid, so a ragdoll
-		// that starts simulating on the tick it was built handed hop a rig that was
-		// still somewhere else. hop resolved that on the first step as a position
-		// correction: metres of bone travel with no velocity behind it and a spin an
-		// order of magnitude past what was thrown. It only ever looked right when the
-		// rig happened to be built inside a physics tick, which bought it one sweep
-		// before the throw — so the same corpse came out different on a client that
-		// rebuilt it from a spawn packet between two ticks, from identical inputs.
-		if (was_kinematic && p_mode != PhysicsServer3D::BODY_MODE_KINEMATIC) {
-			body->hop_solid->set_position(to_hop(body->transform.origin));
-			body->hop_solid->set_orientation(to_hop_orientation(body->transform.basis));
-		}
 		if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
 			body->hop_solid->set_infinite_mass();
 			body->hop_solid->set_coefficient_of_gravity(scalar_from_int<hop_scalar>(0));
@@ -1047,30 +1036,31 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 			Transform3D old_transform = body->transform;
 			body->transform = p_value;
 			if (body->hop_solid) {
-				if (body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC) {
-					// Do NOT teleport kinematic bodies in hop here.  The pre-step
-					// loop in _step computes velocity = delta / dt so the body
-					// sweeps through space and pushes dynamic bodies in its path.
-				} else {
-					body->hop_solid->set_position(to_hop(body->transform.origin));
+				// Place the solid now, in every mode. A KINEMATIC body is still swept
+				// by _step rather than teleported — _step keeps the start point of the
+				// sweep in sweep_prev_transform and rewinds the solid to it — but
+				// between two steps the solid has to stand where the body stands: a
+				// shape query, a ray or an area pairing that runs in the frame a body
+				// was placed would otherwise look for it at the last place it was
+				// stepped, and miss it.
+				body->hop_solid->set_position(to_hop(body->transform.origin));
 
-					// Static rotation: a rotation change just updates the solid's
-					// orientation (cheap — no geometry rebake; the narrowphase honors
-					// it directly). Scale is still baked into the shapes, so a scale
-					// change requires a rebuild.
-					if (!body->transform.basis.is_equal_approx(old_transform.basis)) {
-						if (!body->transform.basis.get_scale().is_equal_approx(
-						        old_transform.basis.get_scale())) {
-							rebuild_body_shapes(body);
-						}
-						body->hop_solid->set_orientation(
-						    to_hop_orientation(body->transform.basis));
+				// Static rotation: a rotation change just updates the solid's
+				// orientation (cheap — no geometry rebake; the narrowphase honors
+				// it directly). Scale is still baked into the shapes, so a scale
+				// change requires a rebuild.
+				if (!body->transform.basis.is_equal_approx(old_transform.basis)) {
+					if (!body->transform.basis.get_scale().is_equal_approx(
+					        old_transform.basis.get_scale())) {
+						rebuild_body_shapes(body);
 					}
+					body->hop_solid->set_orientation(
+					    to_hop_orientation(body->transform.basis));
+				}
 
-					// set_position calls activate() — re-deactivate static bodies
-					if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
-						body->hop_solid->deactivate();
-					}
+				// set_position calls activate() — re-deactivate static bodies
+				if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
+					body->hop_solid->deactivate();
 				}
 			}
 		} break;
@@ -2390,7 +2380,12 @@ void HopPhysicsServer::_step(float p_step) {
 			if (!body->hop_solid || body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
 			if (!body->space_rid.is_valid()) return;
 
-			hop::vec3<hop_scalar> old_pos = body->hop_solid->get_position();
+			// The sweep runs from where the body was at the last step to where Godot
+			// has since put it. Both ends are read off the body, never off the solid:
+			// the solid was moved to the new place the moment the body was (so a query
+			// between steps finds it there), which is also why the sweep has to rewind
+			// it below before prescribing the velocity that carries it back.
+			hop::vec3<hop_scalar> old_pos = to_hop(body->sweep_prev_transform.origin);
 			hop::vec3<hop_scalar> new_pos = to_hop(body->transform.origin);
 			hop::vec3<hop_scalar> delta;
 			hop::sub(delta, new_pos, old_pos);
@@ -2405,7 +2400,7 @@ void HopPhysicsServer::_step(float p_step) {
 			// (world-frame delta) → axis-angle → ω = axis·θ/dt. hop snapshots
 			// orientation per frame rather than integrating ω, so we also commit
 			// the new orientation here; the post-step snap-back zeroes ω again.
-			hop::mat3<hop_scalar> old_R = body->hop_solid->get_orientation();
+			hop::mat3<hop_scalar> old_R = to_hop_orientation(body->sweep_prev_transform.basis);
 			hop::mat3<hop_scalar> new_R = to_hop_orientation(body->transform.basis);
 			hop::vec3<hop_scalar> omega;  // zero unless the body actually rotated
 			hop_scalar angle {};
@@ -2449,6 +2444,7 @@ void HopPhysicsServer::_step(float p_step) {
 				vel.x = delta.x * inv_dt;
 				vel.y = delta.y * inv_dt;
 				vel.z = delta.z * inv_dt;
+				body->hop_solid->set_position(old_pos);  // rewind: the step is the move
 				body->hop_solid->set_velocity(vel);
 				body->hop_solid->set_angular_velocity(omega);
 				body->hop_solid->activate();
@@ -2477,6 +2473,7 @@ void HopPhysicsServer::_step(float p_step) {
 		body->hop_solid->set_position(to_hop(body->transform.origin));
 		body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
 		body->hop_solid->set_angular_velocity(hop::vec3<hop_scalar>{});
+		body->sweep_prev_transform = body->transform;  // this step's target is the next one's start
 	});
 
 	// Sync positions from hop to Godot

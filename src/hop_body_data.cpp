@@ -48,6 +48,7 @@ void HopBodyData::sync_to_hop() {
 	if (!hop_solid) return;
 
 	hop_solid->set_position(to_hop(transform.origin));
+	sweep_prev_transform = transform;  // placed, not moved: no sweep from wherever it was
 	// Static rotation: the body's world orientation (rotation only — scale is
 	// baked into the shapes by rebuild_body_shapes). hop has no angular dynamics;
 	// this is a fixed pose the narrowphase respects.

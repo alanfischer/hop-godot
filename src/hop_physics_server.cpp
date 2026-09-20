@@ -747,9 +747,28 @@ RID HopPhysicsServer::_body_get_space(const RID &p_body) const {
 void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMode p_mode) {
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body) return;
+	const bool was_kinematic = body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC;
 	body->mode = p_mode;
 
 	if (body->hop_solid) {
+		// Leaving KINEMATIC: hand hop the transform it was never given. A kinematic
+		// body's transform writes are withheld from the solid so the pre-step loop can
+		// sweep it instead (see _body_set_state), so the solid only catches up ON A
+		// STEP — and a body that has not been stepped since it was placed is still
+		// wherever its solid was last left.
+		//
+		// Godot's PhysicalBone3D poses every bone and THEN makes it rigid, so a ragdoll
+		// that starts simulating on the tick it was built handed hop a rig that was
+		// still somewhere else. hop resolved that on the first step as a position
+		// correction: metres of bone travel with no velocity behind it and a spin an
+		// order of magnitude past what was thrown. It only ever looked right when the
+		// rig happened to be built inside a physics tick, which bought it one sweep
+		// before the throw — so the same corpse came out different on a client that
+		// rebuilt it from a spawn packet between two ticks, from identical inputs.
+		if (was_kinematic && p_mode != PhysicsServer3D::BODY_MODE_KINEMATIC) {
+			body->hop_solid->set_position(to_hop(body->transform.origin));
+			body->hop_solid->set_orientation(to_hop_orientation(body->transform.basis));
+		}
 		if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) {
 			body->hop_solid->set_infinite_mass();
 			body->hop_solid->set_coefficient_of_gravity(scalar_from_int<hop_scalar>(0));

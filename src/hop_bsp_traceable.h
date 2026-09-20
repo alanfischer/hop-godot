@@ -133,6 +133,9 @@ inline constexpr int blocking_bit(int contents) {
 	return (contents >= 0 || contents < -30) ? 1 : (1 << (-contents));
 }
 inline constexpr int BLOCK_SOLID = blocking_bit(hop_bsp::CONTENTS_SOLID);
+// Every bit blocking_bit can produce for a real contents value (-1..-15). Bit 0 is its
+// marker for a corrupt value, and must never end up in a mask of places a mover may be.
+inline constexpr int CONTENTS_BITS = 0xFFFE;
 
 struct hull_trace {
 	double fraction = 1.0;
@@ -553,22 +556,34 @@ inline hull_trace hull_sweep_off_surface(const hull &h, const double start[3],
 // Sweeping outward from `p` instead would start inside solid — Quake's startsolid,
 // which reports no surface and no distance, and is the whole reason a point already
 // embedded has to be handled separately in the first place.
+// How far `p` has to travel along `dir` to stop being inside solid — the distance to the
+// FIRST free space that way, within `limit`.
+//
+// It is measured by sweeping OUT from p with the blocking set inverted, so what stops the
+// ordinary hull walk is free space rather than solid. Reading it off a sweep that runs the
+// other way — from the far end of the budget back toward p, which is how this began, since
+// a forward trace out of solid is the one case Quake's walk has nothing to say about — gets
+// the wrong surface whenever a SECOND solid stands between p and the end of the budget: the
+// backward sweep stops on the far side of the outermost one and calls the whole span the
+// depth. ww_2fort's lifts are the case that showed it. A player standing on the deck has the
+// hull of the ropes above them, a clear 33 units over their head, and the moment the rising
+// deck put them one centimetre inside, the way out measured 48 units instead of one — so
+// move_and_slide's recovery launched them a metre and a quarter into the air, and the lift
+// read that as a rider it could not lift clear and reversed.
+//
+// Shrunk by STUCK_SLOP for the same reason hull_push_out is (see there): a candidate that
+// lands ON a floor is a place the mover can be, and rejecting it leaves only candidates that
+// exit the model completely.
 inline double hull_inside_distance(const hull &h, int root, const double p[3],
                                    const double dir[3], double limit, int blocking) {
 	const double away[3] = {
 		p[0] + dir[0] * limit, p[1] + dir[1] * limit, p[2] + dir[2] * limit
 	};
-	// Shrunk by STUCK_SLOP for the same reason hull_push_out is (see there): a
-	// candidate that lands ON a floor is a place the mover can be, and rejecting it
-	// leaves only candidates that exit the model completely.
-	if ((blocking & blocking_bit(hull_point_contents_biased(h, root, away, -STUCK_SLOP))) != 0)
-		return -1.0;
-	hull_trace tr = hull_sweep_stuck_band(h, away, p, blocking);
-	if (!tr.hit) return -1.0;
-	// The crosspoint sits DIST_EPSILON on the empty side, so the surface is that much
-	// further in than where the trace stopped.
-	const double d = limit * (1.0 - tr.fraction) - DIST_EPSILON;
-	return d > 0.0 ? d : 0.0;
+	hull_trace tr = hull_sweep_stuck_band(h, p, away, ~blocking & CONTENTS_BITS);
+	if (!tr.hit) return -1.0;  // nothing but solid this way, as far as the budget reaches
+	// The crosspoint sits DIST_EPSILON on the near side of the plane it stopped at, which
+	// here is the inside, so the free space starts that much further out.
+	return limit * tr.fraction + DIST_EPSILON;
 }
 
 // The shortest push that actually gets `p` OUT of blocking contents (`normal`,

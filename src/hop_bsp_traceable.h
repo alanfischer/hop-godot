@@ -143,6 +143,26 @@ struct hull_trace {
 	double normal[3] = { 0, 0, 0 };
 	bool allsolid = true;  // every point along the trace was inside blocking contents
 	bool hit = false;      // fraction < 1 and `normal` is meaningful
+	// Where a segment that STARTED in blocking contents left them again — the
+	// solid->empty crossing, the mirror of the empty->solid one `hit` describes.
+	//
+	// Quake has no use for it, so its walk steps over the crossing without a glance:
+	// the far side is non-blocking, so it just recurses on. Everything needed was
+	// already in hand at that moment, which is why recording it costs one branch.
+	//
+	// Only the FIRST exit is kept, and only when the start was inside solid — a
+	// segment that begins in open air sets `exited` false however many brushes it
+	// crosses, because leaving a brush it entered mid-flight is what `hit` and a
+	// second trace are for.
+	// No exit_point: it is the segment at `exit_fraction` by construction, and this struct is
+	// built on every sweep the movement kernel runs.
+	bool exited = false;        // exit_* are meaningful
+	double exit_fraction = 1.0;
+	// Faces OUT of the solid, i.e. roughly along the direction of travel — the
+	// opposite convention to `normal`, which faces back against it. Deliberate: an
+	// impact normal is what you bounce off, an exit normal is what the surface looks
+	// like from the side you emerge on, which is what an exit decal or puff wants.
+	double exit_normal[3] = { 0, 0, 0 };
 };
 
 // Signed distance of `p` from a plane. Solid is the back side (d < 0).
@@ -429,8 +449,21 @@ inline bool recursive_hull_check(const hull &h, int num, double p1f, double p2f,
 		return false;
 
 	if ((blocking & blocking_bit(
-	         hull_point_contents_biased(h, h.child(num, side ^ 1), mid, skin.bias))) == 0)
+	         hull_point_contents_biased(h, h.child(num, side ^ 1), mid, skin.bias))) == 0) {
+		// The far side is open and everything walked so far was solid: this plane is
+		// where the segment gets OUT. `tr.allsolid` is the test for "still inside what
+		// we started in" — it is cleared by the first non-blocking leaf, and the
+		// near-side recursion above has already visited this split's leaves, so it is
+		// true here only if the start was buried and has stayed buried until now.
+		if (tr.allsolid && !tr.exited) {
+			tr.exited = true;
+			tr.exit_fraction = midf;
+			// Out of the solid, so the opposite sign to the impact normal below.
+			const double s = (side == 0) ? -1.0 : 1.0;
+			for (int i = 0; i < 3; ++i) tr.exit_normal[i] = pl.normal[i] * s;
+		}
 		return recursive_hull_check(h, h.child(num, side ^ 1), midf, p2f, mid, p2, blocking, tr, skin);
+	}
 
 	if (tr.allsolid) return false;  // never got out of the solid area
 
@@ -579,11 +612,50 @@ inline double hull_inside_distance(const hull &h, int root, const double p[3],
 	const double away[3] = {
 		p[0] + dir[0] * limit, p[1] + dir[1] * limit, p[2] + dir[2] * limit
 	};
-	hull_trace tr = hull_sweep_stuck_band(h, p, away, ~blocking & CONTENTS_BITS);
+	// Unbiased, deliberately. The stuck band exists so a mover resting exactly ON a
+	// surface is not called buried, and hull_push_out has already applied it to decide
+	// whether to probe at all -- so by here the point is genuinely at least STUCK_SLOP
+	// deep. Carrying the band into the PROBE instead shrinks every brush by the slop,
+	// which leaves a phantom shell of free space just inside every face, and the probe
+	// then reports an exit a fraction of a unit away in a direction that does not leave
+	// the solid at all.
+	//
+	// Measured on the wall-on-floor fixture, which is the shape that bites: a trace point
+	// at the seam where the wall's expanded solid begins exactly where the floor's ends
+	// sat 28 units inside the wall, and the band offered a 0.03-unit "exit" straight DOWN
+	// into the floor. Being the shortest, it won -- and the push-out came back pointing
+	// into the floor the mover was standing on, which is the golem-cockpit dead end
+	// test_push_out_picks_a_direction_that_exits describes.
+	hull_trace tr = hull_sweep(h, p, away, ~blocking & CONTENTS_BITS);
 	if (!tr.hit) return -1.0;  // nothing but solid this way, as far as the budget reaches
 	// The crosspoint sits DIST_EPSILON on the near side of the plane it stopped at, which
 	// here is the inside, so the free space starts that much further out.
-	return limit * tr.fraction + DIST_EPSILON;
+	//
+	const double d_true = limit * tr.fraction + DIST_EPSILON;
+
+	// Confirm it really is open air there. The sweep can stop at a plane the point is
+	// already sitting ON: a contents descent sends distance zero to the FRONT child, so
+	// at a brush seam the floor's expanded top plane reads as empty at exactly its own
+	// height, and a probe heading DOWN off that seam looks like it reaches free space a
+	// hundredth of a unit away when it is in fact going deeper into the floor. Being the
+	// shortest, that phantom then wins the search.
+	//
+	// hull_push_out's contract is that every candidate is "a direction we have just traced
+	// to open air". This is what makes that true rather than nearly true, at one contents
+	// descent per axis on a path that only runs when something is genuinely embedded.
+	const double at[3] = {
+		p[0] + dir[0] * d_true, p[1] + dir[1] * d_true, p[2] + dir[2] * d_true
+	};
+	if ((blocking & blocking_bit(hull_point_contents(h, root, at))) != 0)
+		return -1.0;
+
+	// Less the band, which is where it belongs: the geometry is probed as it really is,
+	// and the mover is left STUCK_SLOP inside rather than resolved to exactly zero overlap
+	// -- deliberately, so a body resting on a surface does not flip between stuck and free
+	// (see STUCK_SLOP, and test_solid_starting_stuck_reports_overlap, which pins the
+	// reported depth at the true penetration less the band).
+	const double d = d_true - STUCK_SLOP;
+	return d > 0.0 ? d : 0.0;
 }
 
 // The shortest push that actually gets `p` OUT of blocking contents (`normal`,
@@ -769,14 +841,73 @@ public:
 
 		// A ray is a point mover: hull 0, no offset.
 		hopbsp::hull_trace ht = hopbsp::hull_sweep(hulls_[0], s, e, blocking_);
-		if (!ht.hit || (T)ht.fraction >= result.time) return;
-		if (hopbsp::stopped_against_sky(hulls_[0], ht, blocking_)) return;
 
-		result.time = (T)ht.fraction;
-		hop::vec3<T> hit_local = gs_to_godot(ht.endpos[0], ht.endpos[1], ht.endpos[2]);
-		hop::vec3<T> n_local = gs_dir_to_godot(ht.normal[0], ht.normal[1], ht.normal[2]);
-		to_world(hit_local, n_local, position, orientation, result.point, result.normal);
-		result.impact = result.point;
+		// What it crossed wins, when it crossed anything -- but the report says whether the
+		// segment also began buried, instead of making the caller infer it from the time.
+		// For a BSP both are routinely true: one solid holds the whole map, so a ray from
+		// inside a wall that goes on to hit a farther brush has a real crossing to report
+		// AND a real "you started in solid" to declare.
+		if (ht.hit && (T)ht.fraction < result.time
+				&& !hopbsp::stopped_against_sky(hulls_[0], ht, blocking_)) {
+			result.started_inside = ht.allsolid || ht.exited;
+			result.time = (T)ht.fraction;
+			hop::vec3<T> hit_local = gs_to_godot(ht.endpos[0], ht.endpos[1], ht.endpos[2]);
+			hop::vec3<T> hn_local = gs_dir_to_godot(ht.normal[0], ht.normal[1], ht.normal[2]);
+			to_world(hit_local, hn_local, position, orientation, result.point, result.normal);
+			result.impact = result.point;
+			return;
+		}
+
+		// Nothing crossed. A segment that STARTED inside blocking contents reports the
+		// overlap instead -- which is the rule the primitives in hop::collide.h follow:
+		// report the nearest thing the segment meets. From inside a CONVEX shape nothing is
+		// nearer than the overlap at t 0, which is why a box or a sphere reports it
+		// unconditionally. A BSP is not convex, so a ray starting in one brush may cross a
+		// second further along, and that crossing is nearer than nothing at all.
+		//
+		// Reporting the overlap INSTEAD of the crossing was tried and is wrong, measurably:
+		// the whole world is one BSP solid, and HopDirectSpaceState::_intersect_ray skips a
+		// solid whose report is t <= 0 unless the caller passed hit_from_inside -- so an
+		// overlap that replaces the sweep makes the skip discard the entire world, and the
+		// farther brush with it. test_ray_from_inside_still_reports_a_farther_brush is that
+		// case: two slabs with a gap, a ray starting in the first.
+		//
+		// Quake reports neither: its walk answers a start in solid with `allsolid` and no
+		// impact plane, and `allsolid` never reached the caller, so "I am buried" and "the
+		// path is clear" were one answer. That is what had intersect_point -- whose whole job
+		// is "is this point inside something" -- calling every point inside world geometry
+		// empty, and what let a siege monster placed inside ww_2fort's spawn-room wall be
+		// tested, cleared, and dropped through to the room below.
+		//
+		// The sweep has already answered whether the start was buried, so the descent below
+		// runs only when an overlap is actually going to be reported: `allsolid` means it
+		// never left solid, `exited` means it started there and got out (that branch only
+		// fires while allsolid). A ray starting in open air pays nothing for any of this.
+		if (!(ht.allsolid || ht.exited) || T {} >= result.time)
+			return;
+
+		// The overlap carries the nearest bounding plane of the containing leaf, as a depth
+		// and an outward normal. A BSP leaf is convex, so that is the same answer
+		// hop::trace_convex_solid gives from inside a convex_solid. The warning on
+		// hull_nearest_leaf_plane is about a different job -- ejecting a mover with extent,
+		// where hull_push_out's verified axis probes are wanted instead.
+		//
+		// Hull 0 is the point hull, where sky is not blocking contents, so a start inside a
+		// sky brush reads as empty and wants no stopped_against_sky of its own.
+		double start_n[3], start_depth = 0;
+		if (!hopbsp::hull_nearest_leaf_plane(hulls_[0], hulls_[0].root, s, blocking_,
+				start_n, start_depth))
+			return;
+		result.time = T {};
+		result.started_inside = true;
+		result.depth = (T)(start_depth * scale_);
+		// Only the normal needs carrying out of the traceable's frame; the contact point is
+		// the query point itself, exactly, rather than a round trip through GoldSrc units.
+		result.normal = to_world_dir(gs_dir_to_godot(start_n[0], start_n[1], start_n[2]),
+				orientation);
+		result.point.set(seg.origin);
+		result.impact.set(seg.origin);
+		return;
 	}
 
 	void trace_solid(hop::collision<T> &result,
@@ -1205,6 +1336,17 @@ private:
 			lo = rel;
 			ld = dir;
 		}
+	}
+
+	// Just the rotation half of to_world, for a report whose contact point is the query
+	// point itself and so needs no round trip through the traceable's frame.
+	hop::vec3<T> to_world_dir(const hop::vec3<T> &n_local, const hop::mat3<T> &orientation) const {
+		static const hop::mat3<T> identity;
+		if (orientation == identity)
+			return n_local;
+		hop::vec3<T> out;
+		hop::mul(out, orientation, n_local);
+		return out;
 	}
 
 	void to_world(const hop::vec3<T> &p_local, const hop::vec3<T> &n_local,

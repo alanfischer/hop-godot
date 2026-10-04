@@ -106,7 +106,13 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 			// server-side puppet (co-located with the local player and not in the exclude list):
 			// every use press came back empty, so no dragon, door or button could be triggered.
 			// Same rule the area loop below already applies.
-			if (!p_hit_from_inside && to_godot_float(col.time) <= 0.0f) continue;
+			//
+			// What is skipped is a report whose CONTACT is the start overlap — `started_inside`
+			// says the segment began buried, and a zero time says this report is about that
+			// rather than about something crossed later. Inferring it from the time alone also
+			// caught an ordinary contact at fraction zero, which is a different thing.
+			if (!p_hit_from_inside && col.started_inside && to_godot_float(col.time) <= 0.0f)
+				continue;
 			hop::merge_collision(result, col, space->simulator->get_epsilon(), space->simulator->get_average_normals());
 		}
 	}
@@ -134,7 +140,7 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 			if (t >= to_godot_float(result.time)) continue;
 			// A ray starting inside an area only counts when hit_from_inside is set;
 			// skip it rather than the whole query so a farther hit still reports.
-			if (!p_hit_from_inside && t <= 0.0f) continue;
+			if (!p_hit_from_inside && col.started_inside && t <= 0.0f) continue;
 			if (!UtilityFunctions::is_instance_id_valid((int64_t)area->object_instance_id)) continue;
 			if (!get_collider_safe(area->object_instance_id)) continue;
 
@@ -144,7 +150,8 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 	}
 
 	if (to_godot_float(result.time) >= 1.0f) return false;
-	if (!p_hit_from_inside && to_godot_float(result.time) <= 0.0f) return false;
+	if (!p_hit_from_inside && result.started_inside && to_godot_float(result.time) <= 0.0f)
+		return false;
 
 	if (p_result) {
 		p_result->position = to_godot(result.point);
@@ -209,8 +216,12 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 			if (!body || is_body_excluded_from_query(body->self_rid)) continue;
 
 			hop::collision<hop_scalar> col;
+			col.reset();
 			space->simulator->trace_segment(col, seg, s->get_collision_scope());
-			if (to_godot_float(col.time) >= 1.0f) continue;
+			// Asks the question directly rather than reading it out of a fraction. Not a
+			// behaviour change: a zero-length segment cannot cross anything, so `time < 1`
+			// already meant exactly "inside" here. It says what it means instead.
+			if (!col.started_inside) continue;
 
 			if (p_results) {
 				p_results[result_count].rid = body->self_rid;
@@ -225,10 +236,11 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 	if (p_collide_with_areas && server && result_count < p_max_results) {
 		// Narrow-phase confirm using hop's native point-query form: a zero-length
 		// segment at the point.  test_segment dispatches per shape type (box/sphere/
-		// capsule/convex_solid/traceable) and reports t==0 when the point is inside —
-		// no AABB assumptions, unlike a bounding-box containment test which false-
-		// positives on thin or concave brushes (e.g. shallow water, whose bounding
-		// box towers over the actual surface).
+		// capsule/convex_solid/traceable) and sets `started_inside` when the point is
+		// inside — no AABB assumptions, unlike a bounding-box containment test which
+		// false-positives on thin or concave brushes (e.g. shallow water, whose bounding
+		// box towers over the actual surface).  This is the branch the game's own point
+		// queries use: water, ladders and hurt volumes are all Area3Ds.
 		hop::segment<hop_scalar> zseg;
 		zseg.set_start_end(hp, hp);
 
@@ -236,7 +248,7 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 			[&](hop::solid<hop_scalar> *area_solid) -> bool {
 				hop::collision<hop_scalar> col;
 				space->simulator->test_segment(col, zseg, area_solid);
-				return to_godot_float(col.time) < 1.0f;
+				return col.started_inside;
 			},
 			[&](const RID &rid) -> bool { return is_body_excluded_from_query(rid); });
 	}

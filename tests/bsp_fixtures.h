@@ -137,6 +137,39 @@ inline std::vector<uint8_t> make_box_map(const double mins[3], const double maxs
 	return b.build();
 }
 
+// Two brushes unioned into one model, with brush B pointing its "outside" children at A, and
+// the hull 1..3 expansion of both written once. Shared by the fixtures below the way
+// make_floor_map shares make_box_map.
+inline std::vector<uint8_t> make_two_brush_map(const double amins[3], const double amaxs[3],
+                                               const double bmins[3], const double bmaxs[3],
+                                               const double model_mins[3],
+                                               const double model_maxs[3]) {
+	BlobBuilder b;
+	BSPModel m {};
+	for (int i = 0; i < 3; ++i) {
+		m.mins[i] = (float)model_mins[i];
+		m.maxs[i] = (float)model_maxs[i];
+	}
+
+	// A first, so B can point its "outside" children at it.
+	const int a0 = add_box_brush(b, amins, amaxs, /*as_nodes=*/true);
+	m.headnode[0] = add_box_brush(b, bmins, bmaxs, /*as_nodes=*/true, CONTENTS_SOLID, a0);
+
+	for (int h = 1; h < 4; ++h) {
+		double eamins[3], eamaxs[3], ebmins[3], ebmaxs[3];
+		for (int i = 0; i < 3; ++i) {
+			eamins[i] = amins[i] - hopbsp::HULL_SIZES[h].maxs[i];
+			eamaxs[i] = amaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
+			ebmins[i] = bmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
+			ebmaxs[i] = bmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
+		}
+		const int ea = add_box_brush(b, eamins, eamaxs, /*as_nodes=*/false);
+		m.headnode[h] = add_box_brush(b, ebmins, ebmaxs, /*as_nodes=*/false, CONTENTS_SOLID, ea);
+	}
+	b.models.push_back(m);
+	return b.build();
+}
+
 // A floor with a wall standing on it, as a union of two brushes, sized so that in
 // hull 1 the wall's solid begins exactly where the floor's ends (z = 36 — the floor
 // top at 0, raised by the hull's 36-unit half-height).
@@ -153,30 +186,25 @@ inline std::vector<uint8_t> make_wall_on_floor_map() {
 	// other hulls they simply overlap, which is just as solid.
 	const double fmins[3] = { -4096, -4096, -4096 }, fmaxs[3] = { 4096, 4096, 0 };
 	const double wmins[3] = { -4096, -4096, 72 }, wmaxs[3] = { -8, 4096, 4096 };
+	const double mmins[3] = { fmins[0], fmins[1], fmins[2] };
+	const double mmaxs[3] = { fmaxs[0], fmaxs[1], wmaxs[2] };
+	return make_two_brush_map(fmins, fmaxs, wmins, wmaxs, mmins, mmaxs);
+}
 
-	BlobBuilder b;
-	BSPModel m {};
-	for (int i = 0; i < 3; ++i) { m.mins[i] = (float)fmins[i]; m.maxs[i] = (float)wmaxs[i]; }
-	m.maxs[0] = (float)fmaxs[0];
-	m.maxs[1] = (float)fmaxs[1];
-
-	// Floor first so the wall can point its "outside" children at it.
-	const int f0 = add_box_brush(b, fmins, fmaxs, /*as_nodes=*/true);
-	m.headnode[0] = add_box_brush(b, wmins, wmaxs, /*as_nodes=*/true, CONTENTS_SOLID, f0);
-
-	for (int h = 1; h < 4; ++h) {
-		double efmins[3], efmaxs[3], ewmins[3], ewmaxs[3];
-		for (int i = 0; i < 3; ++i) {
-			efmins[i] = fmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
-			efmaxs[i] = fmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
-			ewmins[i] = wmins[i] - hopbsp::HULL_SIZES[h].maxs[i];
-			ewmaxs[i] = wmaxs[i] - hopbsp::HULL_SIZES[h].mins[i];
-		}
-		const int ef = add_box_brush(b, efmins, efmaxs, /*as_nodes=*/false);
-		m.headnode[h] = add_box_brush(b, ewmins, ewmaxs, /*as_nodes=*/false, CONTENTS_SOLID, ef);
-	}
-	b.models.push_back(m);
-	return b.build();
+// Two parallel slabs with a gap between them, perpendicular to GoldSrc x:
+//   solid x 0..40,  empty x 40..120,  solid x 120..160.
+//
+// The shape that decides whether a trace starting in solid may report what it crosses
+// LATER. One wall cannot ask the question -- leaving a brush is solid->empty, which the
+// hull walk never reports -- so a second brush past the gap is needed to have a hit to
+// lose. GoldSrc x maps to Godot -x at SCALE, so slab A is Godot x 0..-1, the gap -1..-3,
+// slab B -3..-4.
+inline std::vector<uint8_t> make_two_slabs_map() {
+	const double amins[3] = { 0, -4096, -4096 }, amaxs[3] = { 40, 4096, 4096 };
+	const double bmins[3] = { 120, -4096, -4096 }, bmaxs[3] = { 160, 4096, 4096 };
+	const double mmins[3] = { amins[0], amins[1], amins[2] };
+	const double mmaxs[3] = { bmaxs[0], bmaxs[1], bmaxs[2] };
+	return make_two_brush_map(amins, amaxs, bmins, bmaxs, mmins, mmaxs);
 }
 
 // A wide, thin slab centred on the GoldSrc origin: a floor whose top face sits at
@@ -194,6 +222,26 @@ inline std::unique_ptr<HopBspTraceable<T>> load(const std::vector<uint8_t> &blob
 	assert(ok && "blob failed to parse");
 	(void)ok;
 	return t;
+}
+
+// Hull 0 of a fixture blob, for a test that drives the hull walk directly rather than going
+// through a traceable (hull_trace is what carries the walk's answer, and HopBspTraceable does
+// not surface it). `keep` holds the parsed map alive for as long as the hull is used.
+inline hopbsp::hull fixture_hull0(const std::vector<uint8_t> &blob,
+                                  std::shared_ptr<hopbsp::map_data> &keep) {
+	keep = std::make_shared<hopbsp::map_data>();
+	bool ok = keep->load(blob.data(), blob.size());
+	assert(ok && "blob failed to parse");
+	(void)ok;
+	const auto &view = keep->view;
+	hopbsp::hull h {};
+	h.planes = view.planes;
+	h.leafs = view.leafs;
+	h.leaf_count = view.leaf_count;
+	h.nodes = view.nodes;
+	h.node_count = view.node_count;
+	h.root = view.models[0].headnode[0];
+	return h;
 }
 
 inline std::shared_ptr<hop::solid<T>> make_box_solid(T hx, T hy, T hz) {

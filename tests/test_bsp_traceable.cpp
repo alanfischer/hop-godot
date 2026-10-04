@@ -138,11 +138,182 @@ static void test_ray_misses() {
 
 static void test_ray_from_inside_solid() {
 	auto t = load(make_floor_map());
-	hop::collision<T> c = ray(*t, vec(0, -0.8, 0), vec(0, 4, 0));  // starts inside the slab
-	// Quake semantics: a trace that starts solid reports no impact plane — it must
-	// not fabricate one, or a stuck body gets shoved by a garbage normal.
-	assert(c.time == 1.0);
+	// A ray that STARTS inside solid reports the overlap, direction regardless. Quake
+	// instead reports allsolid and leaves the trace clear, because its callers check
+	// that flag and refuse the move; hop's `collision` carries no such flag, so "clear"
+	// read as "the whole path is free" — the same hole that had intersect_point calling
+	// every point inside the world empty.
+	//
+	// The old worry here was fabricating an impact plane and shoving a stuck body with
+	// a garbage normal. What is reported is not fabricated: it is the nearest bounding
+	// plane of the convex leaf the start sits in, the same thing trace_convex_solid
+	// reports from inside a convex_solid. And the policy question — whether a caller
+	// WANTS to be told about a surface it starts inside — is settled one level up, by
+	// Godot's hit_from_inside in HopDirectSpaceState::_intersect_ray, which filters
+	// t == 0 hits unless the caller asked for them. An ordinary ray is unaffected.
+	// Depth and normal at this spot are pinned by point_query_in_solid_reports_overlap, which
+	// asks the same map at the same point with a zero-length segment; what is distinct here is
+	// that a segment with LENGTH and DIRECTION gets the same answer.
+	hop::collision<T> c = ray(*t, vec(0, -0.4, 0), vec(0, 4, 0));  // starts inside the slab
+	assert(c.time == 0.0 && "a ray starting in solid must not report a clear path");
+	assert(approx_v(c.normal, 0, 1, 0) && "and names the surface, not a fabrication");
+
+	// And heading the other way, deeper, gives the same answer — the direction does not
+	// decide it. This is the asymmetry that used to split the shapes: box and sphere
+	// stayed quiet when leaving through their nearest face, convex never did, and the
+	// BSP and plane traceables never spoke at all.
+	hop::collision<T> down = ray(*t, vec(0, -0.4, 0), vec(0, -0.4, 0));
+	assert(down.time == 0.0 && "direction does not gate a start-in-solid overlap");
 	printf("  ray_from_inside_solid ok\n");
+}
+
+static void test_point_query_in_solid_reports_overlap() {
+	auto t = load(make_floor_map());
+	// A ZERO-LENGTH segment is a point query, and a point inside the slab has to come
+	// back as inside it. The hull walk cannot say so — it reports allsolid with no
+	// impact plane, which reads identically to a clear path — so the contents test
+	// answers this case directly.
+	//
+	// This is what intersect_point is built on, and before this it answered "nothing
+	// there" for every point inside world geometry: a monster placed inside a wall on
+	// ww_2fort was tested and cleared, then fell through to the room below.
+	// The slab spans y -1.6..0, so -0.4 is 0.4 below its top face and 1.2 above its
+	// bottom one — off the midpoint, where the two faces tie and the nearest-plane
+	// tie-break would decide the normal instead of the geometry.
+	hop::collision<T> c = ray(*t, vec(0, -0.4, 0), vec(0, 0, 0));  // inside the slab
+	assert(c.time == 0.0 && "a point inside solid must report an overlap");
+	// Depth and normal match what a convex_solid reports from inside: the nearest
+	// bounding plane of the convex cell, pointing out of it.
+	assert(approx(c.depth, 0.4, 0.01) && "depth is the distance to the nearest face");
+	assert(approx_v(c.normal, 0, 1, 0) && "and the normal points up out of the floor");
+	assert(approx_v(c.point, 0, -0.4, 0, 0.001) && "the overlap is reported at the query point");
+	printf("  point_query_in_solid_reports_overlap ok\n");
+}
+
+static void test_point_query_in_open_space_reports_nothing() {
+	auto t = load(make_floor_map());
+	// The other half of the contract, and the one that keeps the query useful: open
+	// space must stay empty. A test that only checked the solid case would pass just
+	// as well on an implementation that called everything solid.
+	hop::collision<T> c = ray(*t, vec(0, 2, 0), vec(0, 0, 0));  // well above the floor
+	assert(c.time == 1.0 && "a point in open space is not inside anything");
+	printf("  point_query_in_open_space_reports_nothing ok\n");
+}
+
+static void test_point_query_rides_the_body() {
+	auto t = load(make_floor_map());
+	// The point is carried into the traceable's frame like any other segment: the same
+	// world point is inside the slab only when the body is where the slab is. Without
+	// the to_local carry a point query would answer for a brush at the origin whatever
+	// the body did, which on a rotating func_door is a volume in the wrong place.
+	hop::collision<T> inside = ray(*t, vec(0, 9.6, 0), vec(0, 0, 0), vec(0, 10, 0), hop::mat3<T>());
+	assert(inside.time == 0.0 && "the body sits 10 m up, so 9.6 is inside its slab");
+	assert(approx_v(inside.normal, 0, 1, 0) && "the normal rides the body too");
+	hop::collision<T> outside = ray(*t, vec(0, -0.4, 0), vec(0, 0, 0), vec(0, 10, 0), hop::mat3<T>());
+	assert(outside.time == 1.0 && "and the old spot is empty once the body has moved");
+	printf("  point_query_rides_the_body ok\n");
+}
+
+// Does a trace that STARTS in solid still report a brush it crosses further along?
+//
+// This is the one case a single wall cannot ask. It decides whether reporting the start
+// overlap may REPLACE the sweep: the whole world is one BSP solid, and
+// HopDirectSpaceState::_intersect_ray skips a solid whose report is t <= 0 when the
+// caller did not ask for hit_from_inside — so if the overlap replaces the sweep, the skip
+// discards the entire world and a farther hit goes with it.
+static void test_ray_from_inside_still_reports_a_farther_brush() {
+	auto t = load(make_two_slabs_map());
+	// Start inside slab A (GoldSrc x 20 -> Godot -0.5) and head across the gap at slab B,
+	// whose near face is GoldSrc x 120 -> Godot -3.0.
+	hop::collision<T> c = ray(*t, vec(-0.5, 0, 0), vec(-4.0, 0, 0));
+	assert(c.time > 0.0 && "the crossing is nearer than nothing, so it wins over the overlap");
+	assert(approx(c.point.x, -3.0, 0.01) && "and it is slab B's near face");
+	assert(approx_v(c.normal, 1, 0, 0) && "facing back along the ray");
+	// Both facts, not a choice between them. Reporting the crossing used to mean the
+	// caller could never learn the ray began buried, because "started inside" was only
+	// ever inferred from a zero time — see hop::collision::started_inside.
+	assert(c.started_inside && "and it still declares that it began inside slab A");
+
+	// The other half of the rule: with nothing to cross, the buried start IS the answer.
+	// Shortened so the segment ends inside the gap, never reaching slab B.
+	hop::collision<T> stuck = ray(*t, vec(-0.5, 0, 0), vec(-1.0, 0, 0));
+	assert(stuck.time == 0.0 && "a start in solid with no crossing reports the overlap");
+	assert(stuck.depth > 0.0 && "carrying how deep in it is");
+	assert(stuck.started_inside);
+
+	// And a segment that began in open air says so, whatever it goes on to hit — the
+	// flag is about the origin, not about whether anything was touched.
+	hop::collision<T> outside = ray(*t, vec(-2.0, 0, 0), vec(-2.5, 0, 0));
+	assert(outside.time > 0.0 && !outside.started_inside && "started in the gap");
+	printf("  ray_from_inside_still_reports_a_farther_brush ok\n");
+}
+
+// --- the solid->empty crossing ---------------------------------------------
+
+// Where does a segment LEAVE solid? Quake's walk crosses that boundary without
+// recording it — the far side is non-blocking, so it simply recurses on — which left
+// "tunnel through this wall and tell me where I came out" unanswerable, the thing a
+// wall-piercing projectile needs.
+//
+// Slab A is GoldSrc x 0..40, then a gap, then slab B at 120..160.
+static void test_walk_reports_where_it_leaves_solid() {
+	std::shared_ptr<hopbsp::map_data> keep;
+	hopbsp::hull h = fixture_hull0(make_two_slabs_map(), keep);
+	const double eps = 0.1;   // the walk backs the crosspoint off by DIST_EPSILON
+
+	// Out of slab A, across the gap, into slab B: BOTH crossings come back from the
+	// one walk — the exit from A and the impact on B. That pair is the whole feature.
+	{
+		const double from[3] = { 20, 0, 0 }, to[3] = { 140, 0, 0 };
+		hopbsp::hull_trace tr = hopbsp::hull_sweep(h, from, to, hopbsp::BLOCK_SOLID);
+		assert(tr.exited && "a segment starting in slab A must report leaving it");
+		// exit_point is not stored: the exit is the segment at exit_fraction.
+		const double ex = from[0] + tr.exit_fraction * (to[0] - from[0]);
+		assert(approx(ex, 40.0, eps) && "at slab A's far face");
+		// Out of the solid, so along the direction of travel (+x) — the opposite sign
+		// to an impact normal.
+		assert(approx_v(V { (T)tr.exit_normal[0], (T)tr.exit_normal[1], (T)tr.exit_normal[2] },
+		                1, 0, 0) && "pointing out of the wall, along travel");
+		assert(tr.hit && "and slab B is still the impact");
+		assert(approx(tr.endpos[0], 120.0, eps) && "at slab B's near face");
+	}
+
+	// Stopping in the gap: the exit stands on its own, with no impact behind it.
+	{
+		const double from[3] = { 20, 0, 0 }, to[3] = { 80, 0, 0 };
+		hopbsp::hull_trace tr = hopbsp::hull_sweep(h, from, to, hopbsp::BLOCK_SOLID);
+		assert(tr.exited);
+		assert(approx(from[0] + tr.exit_fraction * (to[0] - from[0]), 40.0, eps));
+		assert(!tr.hit && "nothing is crossed after it");
+	}
+
+	// Travelling the other way, the normal flips with it.
+	{
+		const double from[3] = { 20, 0, 0 }, to[3] = { -60, 0, 0 };
+		hopbsp::hull_trace tr = hopbsp::hull_sweep(h, from, to, hopbsp::BLOCK_SOLID);
+		assert(tr.exited);
+		assert(approx(from[0] + tr.exit_fraction * (to[0] - from[0]), 0.0, eps)
+		       && "slab A's near face");
+		assert(approx_v(V { (T)tr.exit_normal[0], (T)tr.exit_normal[1], (T)tr.exit_normal[2] },
+		                -1, 0, 0) && "still out of the wall, which is now -x");
+	}
+
+	// Starting in open air reports no exit however many brushes it crosses: leaving a
+	// brush it entered mid-flight is what `hit` plus a second trace are for.
+	{
+		const double from[3] = { 80, 0, 0 }, to[3] = { 140, 0, 0 };
+		hopbsp::hull_trace tr = hopbsp::hull_sweep(h, from, to, hopbsp::BLOCK_SOLID);
+		assert(!tr.exited && "it was never inside anything to leave");
+		assert(tr.hit && "but slab B is an ordinary impact");
+	}
+
+	// Buried the whole way: nothing to report, and `allsolid` still says why.
+	{
+		const double from[3] = { 10, 0, 0 }, to[3] = { 30, 0, 0 };
+		hopbsp::hull_trace tr = hopbsp::hull_sweep(h, from, to, hopbsp::BLOCK_SOLID);
+		assert(!tr.exited && !tr.hit && tr.allsolid);
+	}
+	printf("  walk_reports_where_it_leaves_solid ok\n");
 }
 
 static void test_ray_respects_body_position() {
@@ -1213,6 +1384,11 @@ int main() {
 	test_ray_hits_wall();
 	test_ray_misses();
 	test_ray_from_inside_solid();
+	test_point_query_in_solid_reports_overlap();
+	test_point_query_in_open_space_reports_nothing();
+	test_point_query_rides_the_body();
+	test_ray_from_inside_still_reports_a_farther_brush();
+	test_walk_reports_where_it_leaves_solid();
 	test_ray_respects_body_position();
 	test_ray_respects_orientation();
 	test_hull_selection();

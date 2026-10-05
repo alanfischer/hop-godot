@@ -481,6 +481,21 @@ static void test_solid_impact_is_on_the_surface() {
 	// hull surface, which the lever-arm math needs. They must not be the same.
 	assert(approx(c.point.y, 0.9, 0.02));
 	assert(approx(c.impact.y, 0.0, 0.02));
+	// And it is the FACE CENTRE, not a corner of it. Being on the surface pins only the
+	// normal axis; the two tangential ones are what separate the face-centre answer from
+	// the box's support point in -n, and a corner is just as much "on the floor" as the
+	// centre is. Getting this wrong hands a resting body a lever arm running ACROSS the
+	// face, so the impulse holding it up torques it instead — a flat-landed gib spun to
+	// 23 rad/s and kept gaining.
+	//
+	// Asserted here rather than through dynamics on purpose. It used to show up as spin
+	// in test-project/tests/test_bsp_contact_point.gd, but contact manifolds (hop Phase
+	// 14) regenerate a face contact as four clipped corner points every tick, so the
+	// solver no longer reads this witness for a box lying on a floor and the corner
+	// answer became invisible to every dynamics test. This is the level it is still
+	// observable at.
+	assert(approx(c.impact.x, 0.0, 0.02));
+	assert(approx(c.impact.z, 0.0, 0.02));
 	printf("  solid_impact_is_on_the_surface ok\n");
 }
 

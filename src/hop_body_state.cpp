@@ -77,12 +77,28 @@ Vector3 HopDirectBodyState::_get_center_of_mass() const {
 	return body ? body->transform.origin : Vector3();
 }
 
+// Zero is the right answer, not a stub. hop has no centre-of-mass concept at all: a
+// solid's position IS its centre of mass, which is what lets _get_center_of_mass above
+// hand back the body origin directly. So the offset from origin to COM really is zero.
+//
+// It does diverge from Godot, where the auto mode puts the COM at the shapes' centroid
+// and an offset collider therefore has a non-zero local COM. Matching that is not a
+// matter of filling this in — it needs a COM offset on the solid, threaded through
+// integration and every lever arm — and it would move any body whose collider is offset
+// from its origin, the feet-origin player collider included. Left alone deliberately.
 Vector3 HopDirectBodyState::_get_center_of_mass_local() const {
 	return Vector3();
 }
 
+// hop keeps inertia as a DIAGONAL in the body frame, so the principal axes are just the
+// body's orientation. Exact for everything hop can represent — and that is also the
+// limit: a tensor with off-diagonal terms has no home here, so a shape whose true
+// principal axes are not its local ones was already approximated upstream, where
+// update_body_inertia treats the whole collision AABB as a solid box. This reports what
+// hop holds, which is the question the caller is really asking.
 Basis HopDirectBodyState::_get_principal_inertia_axes() const {
-	return Basis();
+	if (!body || !body->hop_solid) return Basis();
+	return to_godot_basis(body->hop_solid->get_orientation());
 }
 
 float HopDirectBodyState::_get_inverse_mass() const {
@@ -90,12 +106,27 @@ float HopDirectBodyState::_get_inverse_mass() const {
 	return 1.0f / body->mass;
 }
 
+// Body-frame reciprocal diagonal, straight off the solid — the same value
+// rotates_dynamically() reads, so a zero here means exactly "this body never spins"
+// (no shapes yet, or lock_rotation, which zeroes the inertia on purpose).
+//
+// These two used to return zero with a "no rotation" comment, left over from before hop
+// integrated angular velocity at all. That stopped being true and the comment outlived
+// it, so Godot's API answered confidently and wrongly for every dynamic body — which
+// costs whoever next probes a body's inertia an hour, as it did during the
+// test_bsp_contact_point investigation.
 Vector3 HopDirectBodyState::_get_inverse_inertia() const {
-	return Vector3(); // no rotation
+	if (!body || !body->hop_solid) return Vector3();
+	return to_godot(body->hop_solid->get_inv_inertia());
 }
 
+// World space, which is what Godot means by the tensor: R·diag(I⁻¹)·Rᵀ. hop already
+// keeps exactly that matrix on the solid — the contact solver needs it per angular pair
+// per iteration — and the orientation writers rebuild it, so this is a read, not a
+// recomputation.
 Basis HopDirectBodyState::_get_inverse_inertia_tensor() const {
-	return Basis(); // no rotation
+	if (!body || !body->hop_solid) return Basis();
+	return to_godot_basis(body->hop_solid->get_inv_inertia_world());
 }
 
 void HopDirectBodyState::_set_linear_velocity(const Vector3 &p_velocity) {

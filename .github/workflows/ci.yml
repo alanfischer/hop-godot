@@ -39,7 +39,7 @@ jobs:
         run: cmake -S tests -B tests/build -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
-        run: cmake --build tests/build --parallel
+        run: cmake --build tests/build --parallel 4
 
       - name: Run
         run: ctest --test-dir tests/build --output-on-failure
@@ -64,7 +64,7 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined,address"
 
       - name: Build
-        run: cmake --build tests/build-san --parallel
+        run: cmake --build tests/build-san --parallel 4
 
       - name: Run
         run: ctest --test-dir tests/build-san --output-on-failure
@@ -75,11 +75,17 @@ jobs:
   #
   # Release, matching engine-tests, because template_release is the only config that
   # ships: hop-physics.gdextension names template_debug zero times, and build.sh builds
-  # Linux and Windows as Release only. Debug was also the expensive way to learn nothing
-  # — godot-cpp's generated bindings are thousands of translation units, and carrying
-  # debug info for all of them OOM-killed the ubuntu runner (every in-flight target
-  # "Terminated" under a bare "The operation was canceled", which reads like an
-  # infrastructure flake) while taking AppleClang past 45 minutes.
+  # Linux and Windows as Release only.
+  #
+  # --parallel takes an explicit 4 for a reason. Bare `--parallel` means "the native
+  # build tool's default", which for Unix Makefiles is `make -j` with NO limit: one
+  # compiler process per ready target, hundreds at once over godot-cpp's generated
+  # bindings. That exhausts the runner's memory and the OOM killer takes the runner
+  # agent with it, which GitHub reports as "The runner has received a shutdown signal"
+  # — indistinguishable from a reclaimed VM, and the reason this looked like a flake
+  # rather than a mistake in this file. Windows survived it (MSBuild's default is
+  # sane) and macOS only crawled, 45 minutes of thrashing instead of dying, so Linux
+  # was the one runner that failed outright.
   build:
     name: Build extension (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -96,7 +102,7 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGODOTCPP_TARGET=template_release
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --config Release --parallel 4
 
   # The tests that need a live PhysicsServer3D: body_test_motion against a real BSP
   # hull, projectile traces, angular damping, kinematic transform freshness, contact

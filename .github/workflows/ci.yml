@@ -28,7 +28,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # extern/hop only. godot-cpp is several minutes of checkout and compile that
       # this tier has no use for.
@@ -52,7 +52,7 @@ jobs:
     name: C++ unit tests (UBSan + ASan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Fetch hop core
         run: git submodule update --init --depth 1 extern/hop
@@ -72,6 +72,14 @@ jobs:
   # Does the GDExtension itself still compile? build.sh cross-compiles every shipping
   # target through Zig; this deliberately uses each runner's native toolchain instead,
   # so the binding layer is checked against stock GCC/AppleClang/MSVC as well.
+  #
+  # Release, matching engine-tests, because template_release is the only config that
+  # ships: hop-physics.gdextension names template_debug zero times, and build.sh builds
+  # Linux and Windows as Release only. Debug was also the expensive way to learn nothing
+  # — godot-cpp's generated bindings are thousands of translation units, and carrying
+  # debug info for all of them OOM-killed the ubuntu runner (every in-flight target
+  # "Terminated" under a bare "The operation was canceled", which reads like an
+  # infrastructure flake) while taking AppleClang past 45 minutes.
   build:
     name: Build extension (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -80,15 +88,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGODOTCPP_TARGET=template_release
 
       - name: Build
-        run: cmake --build build --config Debug --parallel
+        run: cmake --build build --config Release --parallel
 
   # The tests that need a live PhysicsServer3D: body_test_motion against a real BSP
   # hull, projectile traces, angular damping, kinematic transform freshness, contact
@@ -98,7 +106,7 @@ jobs:
     name: Engine tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 

@@ -89,7 +89,6 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 		int count = space->simulator->find_solids_in_aa_box(total, candidates.data(), (int)candidates.size(),
 			(int)p_collision_mask);
 
-		hop::collision<hop_scalar> col;
 		for (int i = 0; i < count; ++i) {
 			hop::solid<hop_scalar> *s = candidates[i];
 			if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
@@ -97,7 +96,10 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 			HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
 			if (body && is_body_excluded_from_query(body->self_rid)) continue;
 
-			col.time = to_hop_scalar(1.0f);
+			// Declared per candidate rather than hoisted and part-reset: restoring only
+			// `time` left started_inside set from whichever earlier solid the segment
+			// began inside, so a later body's contact at t == 0 read as that caller's.
+			hop::collision<hop_scalar> col;
 			space->simulator->test_segment(col, seg, s);
 			// A ray starting inside this solid only counts when hit_from_inside is set. Skip the
 			// SOLID, not the query: merged in, its t<=0 wins as the nearest hit, and the tail guard
@@ -111,8 +113,7 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 			// says the segment began buried, and a zero time says this report is about that
 			// rather than about something crossed later. Inferring it from the time alone also
 			// caught an ordinary contact at fraction zero, which is a different thing.
-			if (!p_hit_from_inside && col.started_inside && to_godot_float(col.time) <= 0.0f)
-				continue;
+			if (!p_hit_from_inside && col.is_start_overlap()) continue;
 			hop::merge_collision(result, col, space->simulator->get_epsilon(), space->simulator->get_average_normals());
 		}
 	}
@@ -140,7 +141,7 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 			if (t >= to_godot_float(result.time)) continue;
 			// A ray starting inside an area only counts when hit_from_inside is set;
 			// skip it rather than the whole query so a farther hit still reports.
-			if (!p_hit_from_inside && col.started_inside && t <= 0.0f) continue;
+			if (!p_hit_from_inside && col.is_start_overlap()) continue;
 			if (!UtilityFunctions::is_instance_id_valid((int64_t)area->object_instance_id)) continue;
 			if (!get_collider_safe(area->object_instance_id)) continue;
 
@@ -150,8 +151,7 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 	}
 
 	if (to_godot_float(result.time) >= 1.0f) return false;
-	if (!p_hit_from_inside && result.started_inside && to_godot_float(result.time) <= 0.0f)
-		return false;
+	if (!p_hit_from_inside && result.is_start_overlap()) return false;
 
 	if (p_result) {
 		p_result->position = to_godot(result.point);
@@ -215,8 +215,9 @@ int32_t HopDirectSpaceState::_intersect_point(const Vector3 &p_position, uint32_
 			HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
 			if (!body || is_body_excluded_from_query(body->self_rid)) continue;
 
-			hop::collision<hop_scalar> col;
-			col.reset();
+			hop::collision<hop_scalar> col;   // fresh per body: its member initialisers are
+			                                  // exactly reset(), and a reused one keeps
+			                                  // started_inside from the previous solid
 			space->simulator->trace_segment(col, seg, s->get_collision_scope());
 			// Asks the question directly rather than reading it out of a fraction. Not a
 			// behaviour change: a zero-length segment cannot cross anything, so `time < 1`
@@ -409,7 +410,6 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 		hop::collision<hop_scalar> result;
 		result.reset();
 
-		hop::collision<hop_scalar> col;
 		for (int i = 0; i < count; ++i) {
 			hop::solid<hop_scalar> *s = candidates[i];
 			if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
@@ -417,7 +417,8 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 			HopBodyData *body = static_cast<HopBodyData *>(s->get_user_data());
 			if (body && is_body_excluded_from_query(body->self_rid)) continue;
 
-			col.time = to_hop_scalar(1.0f);
+			// Per candidate, not hoisted and part-reset -- see the ray loop above.
+			hop::collision<hop_scalar> col;
 			space->simulator->test_segment(col, seg, s);
 			hop::merge_collision(result, col, space->simulator->get_epsilon(), space->simulator->get_average_normals());
 		}

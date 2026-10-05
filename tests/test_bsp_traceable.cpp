@@ -272,7 +272,7 @@ static void test_walk_reports_where_it_leaves_solid() {
 		assert(approx(ex, 40.0, eps) && "at slab A's far face");
 		// Out of the solid, so along the direction of travel (+x) — the opposite sign
 		// to an impact normal.
-		assert(approx_v(V { (T)tr.exit_normal[0], (T)tr.exit_normal[1], (T)tr.exit_normal[2] },
+		assert(approx_v(vec(tr.exit_normal[0], tr.exit_normal[1], tr.exit_normal[2]),
 		                1, 0, 0) && "pointing out of the wall, along travel");
 		assert(tr.hit && "and slab B is still the impact");
 		assert(approx(tr.endpos[0], 120.0, eps) && "at slab B's near face");
@@ -294,7 +294,7 @@ static void test_walk_reports_where_it_leaves_solid() {
 		assert(tr.exited);
 		assert(approx(from[0] + tr.exit_fraction * (to[0] - from[0]), 0.0, eps)
 		       && "slab A's near face");
-		assert(approx_v(V { (T)tr.exit_normal[0], (T)tr.exit_normal[1], (T)tr.exit_normal[2] },
+		assert(approx_v(vec(tr.exit_normal[0], tr.exit_normal[1], tr.exit_normal[2]),
 		                -1, 0, 0) && "still out of the wall, which is now -x");
 	}
 

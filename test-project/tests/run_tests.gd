@@ -12,6 +12,7 @@ const SUITES := [
 	preload("res://tests/test_angular_damp.gd"),
 	preload("res://tests/test_bsp_contact_point.gd"),
 	preload("res://tests/test_kinematic_freshness.gd"),
+	preload("res://tests/test_body_inertia.gd"),
 ]
 
 var _pass := 0

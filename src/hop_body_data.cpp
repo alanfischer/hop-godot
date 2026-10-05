@@ -93,7 +93,7 @@ void HopBodyData::sync_from_hop() {
 
 	transform.origin = to_godot(hop_solid->get_position());
 	linear_velocity = to_godot(hop_solid->get_velocity());
-	// Phase 8: a body that spins dynamically (inv_inertia != 0) has hop integrate
+	// A body that spins dynamically (inv_inertia != 0) has hop integrate
 	// its orientation — write it back (rotation only; re-apply the existing scale,
 	// which hop bakes into geometry) along with ω. Non-spinning dynamic bodies keep
 	// their Godot-authoritative basis untouched, so this is opt-in and adds no churn.
@@ -134,7 +134,7 @@ void HopBodyData::on_collision(const hop::collision<hop_scalar> &c) {
 			ci.collider_shape = 0;
 			// Surface velocity at the contact (v + ω×r), matching the _body_test_motion
 			// path — so a RigidBody3D rider on a rotating platform reads the full carry
-			// velocity, not just the platform's linear motion (Phase 7 rider carry).
+			// velocity, not just the platform's linear motion.
 			ci.collider_velocity = other->velocity_at_local(to_godot(c.impact) - other->transform.origin);
 		}
 	}

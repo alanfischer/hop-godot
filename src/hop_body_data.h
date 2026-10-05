@@ -45,7 +45,7 @@ struct HopBodyData {
 	Vector3 linear_velocity;
 	Vector3 angular_velocity;
 	Vector3 constant_force;
-	Vector3 constant_torque; // applied as a per-step torque on the hop solid (Phase 8)
+	Vector3 constant_torque; // applied as a per-step torque on the hop solid
 	bool custom_inertia = false; // true once the game sets BODY_PARAM_INERTIA explicitly; suppresses auto-compute
 
 	// Rigid-body velocity at a point given relative to this body's origin

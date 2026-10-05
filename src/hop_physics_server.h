@@ -70,7 +70,7 @@ public:
 	// One shared blob per loaded map, keyed by the instance id of the node that
 	// carries it. Weak, so unloading a map frees it.
 	std::unordered_map<uint64_t, std::weak_ptr<hopbsp::map_data>> bsp_maps;
-	// Phase 8: auto-compute a dynamic body's principal inertia from its collision
+	// Auto-compute a dynamic body's principal inertia from its collision
 	// AABB + mass (so a RigidBody3D spins without the game setting inertia), unless
 	// the game set BODY_PARAM_INERTIA explicitly (custom_inertia).
 	void update_body_inertia(HopBodyData *body);

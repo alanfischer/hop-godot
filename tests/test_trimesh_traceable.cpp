@@ -413,9 +413,9 @@ static void test_contact_point_on_surface() {
 }
 
 // --- Test 12: a BOX mover is honored against a ROTATED trimesh ---------------
-// Before Phase 5 the rotated-traceable driver skipped box movers (no rotation-
-// invariant spine), so a box collided as if the mesh were unrotated. The OBB-vs-
-// triangle path now handles it. Setup: a flat floor (xz-plane, +y normal) rotated
+// The rotated-traceable driver once skipped box movers (no rotation-invariant
+// spine), so a box collided as if the mesh were unrotated. The OBB-vs-triangle
+// path handles it. Setup: a flat floor (xz-plane, +y normal) rotated
 // 90° about Z becomes a vertical wall at world x=0 facing -x. An axis-aligned box
 // swept in +x must stop at the wall with a world normal pointing -x and the
 // contact point on the wall (x≈0).

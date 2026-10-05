@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <unordered_map>
 
-// Phase 8: principal-axis inertia of the body's collision AABB treated as a solid
+// Principal-axis inertia of the body's collision AABB treated as a solid
 // box — I = mass/12 · (eᵧ²+e_z², e_x²+e_z², e_x²+eᵧ²) for full extents e. A sensible
 // default for any shape so a dynamic RigidBody3D tumbles; the game can override via
 // BODY_PARAM_INERTIA. A degenerate (zero-extent) bound yields zero inertia → no spin.
@@ -947,7 +947,7 @@ void HopPhysicsServer::_body_set_param(const RID &p_body, PhysicsServer3D::BodyP
 			body->mass = p_value;
 			if (body->hop_solid && !body->is_static_or_kinematic()) {
 				body->hop_solid->set_mass(to_hop_scalar(body->mass));
-				update_body_inertia(body); // Phase 8: keep auto inertia in step with mass
+				update_body_inertia(body); // keep auto inertia in step with mass
 			}
 		} break;
 		case PhysicsServer3D::BODY_PARAM_INERTIA: {
@@ -999,7 +999,7 @@ Variant HopPhysicsServer::_body_get_param(const RID &p_body, PhysicsServer3D::Bo
 
 void HopPhysicsServer::_body_reset_mass_properties(const RID &p_body) {
 	// Godot's "recompute inertia from shapes+mass". Drop any custom inertia and
-	// re-derive (Phase 8); mass itself is handled directly via BODY_PARAM_MASS.
+	// re-derive; mass itself is handled directly via BODY_PARAM_MASS.
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body) return;
 	body->custom_inertia = false;
@@ -1073,7 +1073,7 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 		} break;
 		case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY: {
 			body->angular_velocity = p_value;
-			// Phase 8: a directly-set ω on a dynamic body seeds its integrated spin.
+			// A directly-set ω on a dynamic body seeds its integrated spin.
 			// Kinematic carry ω is still derived from the per-frame orientation delta
 			// in _step (not this setter), so only push for dynamic bodies.
 			if (body->hop_solid && body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC)
@@ -1126,7 +1126,7 @@ void HopPhysicsServer::_body_apply_impulse(const RID &p_body, const Vector3 &p_i
 }
 
 void HopPhysicsServer::_body_apply_torque_impulse(const RID &p_body, const Vector3 &p_impulse) {
-	// Phase 8: an angular impulse J changes angular momentum by J, so Δω = I⁻¹·J.
+	// An angular impulse J changes angular momentum by J, so Δω = I⁻¹·J.
 	// I⁻¹ is diagonal in the body frame, so rotate J in by Rᵀ, divide, rotate back.
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body || !body->hop_solid || body->is_static_or_kinematic() || !body->hop_solid->rotates_dynamically()) return;
@@ -1148,7 +1148,7 @@ void HopPhysicsServer::_body_apply_force(const RID &p_body, const Vector3 &p_for
 }
 
 void HopPhysicsServer::_body_apply_torque(const RID &p_body, const Vector3 &p_torque) {
-	// Phase 8: a one-step world-frame torque; hop integrates ω += I⁻¹·τ·dt and
+	// A one-step world-frame torque; hop integrates ω += I⁻¹·τ·dt and
 	// clears it each step (body-frame conversion handled in integrate_angular).
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body || !body->hop_solid || body->is_static_or_kinematic()) return;
@@ -1908,7 +1908,7 @@ std::shared_ptr<hop::constraint<hop_scalar>> HopPhysicsServer::_make_rigid_joint
 	if (!ba || !bb || !ba->hop_solid || !bb->hop_solid) return nullptr;
 
 	j->hop_constraint = std::make_shared<hop::constraint<hop_scalar>>(ba->hop_solid, bb->hop_solid);
-	// A rigid pin, not a stiff spring (hop Phase 12). The spring this used to build —
+	// A rigid pin, not a stiff spring. The spring this used to build —
 	// k=100, damping=10 — was a force, and a force spring holding a limb chain up SAGS by
 	// construction: it needs a stretch to produce any force at all. hop's Pass-B solver
 	// enforces the pin instead, driving the relative anchor velocity to zero and taking the
@@ -1916,7 +1916,7 @@ std::shared_ptr<hop::constraint<hop_scalar>> HopPhysicsServer::_make_rigid_joint
 	// lets it sleep (see constraint::is_loaded).
 	j->hop_constraint->set_type(hop::constraint<hop_scalar>::type::rigid);
 	j->hop_constraint->set_rest_length(to_hop_scalar(0.0f));
-	// The three pin params Godot exposes, which until Phase 12 were stored and never read.
+	// The three pin params Godot exposes, which the force-spring build stored and never read.
 	// They map straight onto the rigid solve; the clamp in particular is the safety valve
 	// that turns a solver blow-up into a visibly floppy corpse rather than a body launched
 	// out of the map. A cone-twist has no pin params of its own in Godot's API, so it runs
@@ -1926,7 +1926,7 @@ std::shared_ptr<hop::constraint<hop_scalar>> HopPhysicsServer::_make_rigid_joint
 	j->hop_constraint->set_impulse_clamp(to_hop_scalar(j->pin_impulse_clamp));
 	// Pin at the joint's anchor points, not the body centers. Godot's local_A/local_B
 	// are offsets in each body's local frame — exactly hop's local anchors. Off-center
-	// anchors now also torque a dynamic body via their lever arm (hop Phase 10).
+	// anchors also torque a dynamic body via their lever arm.
 	j->hop_constraint->set_local_anchor_a(to_hop(j->local_a));
 	j->hop_constraint->set_local_anchor_b(to_hop(j->local_b));
 
@@ -2008,7 +2008,7 @@ bool HopPhysicsServer::_hinge_joint_get_flag(const RID &p_joint, PhysicsServer3D
 void HopPhysicsServer::_joint_make_slider(const RID &p_joint, const RID &p_body_A, const Transform3D &p_local_ref_A, const RID &p_body_B, const Transform3D &p_local_ref_B) {}
 void HopPhysicsServer::_slider_joint_set_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param, float p_value) {}
 float HopPhysicsServer::_slider_joint_get_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param) const { return 0.0f; }
-// A cone-twist is a pin plus angular limits (hop Phase 13), so it builds the same rigid
+// A cone-twist is a pin plus angular limits, so it builds the same rigid
 // constraint _joint_make_pin does and then hands hop the spans and the joint's rest frames.
 // The anchors come from the transforms' origins and the frames from their bases — Godot
 // gives both halves of the joint in one Transform3D per body.
@@ -2234,7 +2234,7 @@ void HopPhysicsServer::_step(float p_step) {
 		if (body->constant_force.length_squared() > 0.0f) {
 			body->hop_solid->add_force(to_hop(body->constant_force));
 		}
-		// Phase 8: per-step constant torque, and lazy auto-inertia (covers the
+		// Per-step constant torque, and lazy auto-inertia (covers the
 		// shapes-set-after-mass ordering — update_body_inertia is a no-op once set or
 		// when the game pinned a custom inertia).
 		if (body->constant_torque.length_squared() > 0.0f) {

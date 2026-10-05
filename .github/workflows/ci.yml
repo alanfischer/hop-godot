@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes an in-flight run redundant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.7-stable"
+
+jobs:
+  # The traceable glue that depends only on hop core — no godot-cpp, so this needs
+  # neither the engine nor the heavy submodule, and it is the tier that fails fastest.
+  #
+  # No windows-latest: tests/CMakeLists.txt keeps assert() live with a GCC/Clang
+  # `-UNDEBUG`, which MSVC does not accept.
+  cpp-tests:
+    name: C++ unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      # extern/hop only. godot-cpp is several minutes of checkout and compile that
+      # this tier has no use for.
+      - name: Fetch hop core
+        run: git submodule update --init --depth 1 extern/hop
+
+      - name: Configure
+        run: cmake -S tests -B tests/build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build tests/build --parallel 4
+
+      - name: Run
+        run: ctest --test-dir tests/build --output-on-failure
+
+  # The same tests under UBSan + ASan. The traceables index into parsed BSP lumps and
+  # walk node/leaf trees out of map data, so an off-by-one reads neighbouring memory
+  # and returns a plausible-looking trace rather than crashing. -fno-sanitize-recover
+  # makes that a hard failure instead of a quiet wrong answer.
+  sanitizers:
+    name: C++ unit tests (UBSan + ASan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch hop core
+        run: git submodule update --init --depth 1 extern/hop
+
+      - name: Configure
+        run: >
+          cmake -S tests -B tests/build-san -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=undefined,address -fno-sanitize-recover=all -g"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined,address"
+
+      - name: Build
+        run: cmake --build tests/build-san --parallel 4
+
+      - name: Run
+        run: ctest --test-dir tests/build-san --output-on-failure
+
+  # Does the GDExtension itself still compile? build.sh cross-compiles every shipping
+  # target through Zig; this deliberately uses each runner's native toolchain instead,
+  # so the binding layer is checked against stock GCC/AppleClang/MSVC as well.
+  #
+  # Release, matching engine-tests, because template_release is the only config that
+  # ships: hop-physics.gdextension names template_debug zero times, and build.sh builds
+  # Linux and Windows as Release only.
+  #
+  # --parallel takes an explicit 4 for a reason. Bare `--parallel` means "the native
+  # build tool's default", which for Unix Makefiles is `make -j` with NO limit: one
+  # compiler process per ready target, hundreds at once over godot-cpp's generated
+  # bindings. That exhausts the runner's memory and the OOM killer takes the runner
+  # agent with it, which GitHub reports as "The runner has received a shutdown signal"
+  # — indistinguishable from a reclaimed VM, and the reason this looked like a flake
+  # rather than a mistake in this file. Windows survived it (MSBuild's default is
+  # sane) and macOS only crawled, 45 minutes of thrashing instead of dying, so Linux
+  # was the one runner that failed outright.
+  build:
+    name: Build extension (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGODOTCPP_TARGET=template_release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+  # The tests that need a live PhysicsServer3D: body_test_motion against a real BSP
+  # hull, projectile traces, angular damping, kinematic transform freshness, contact
+  # points. Nothing below the engine can reach these, which makes this the only tier
+  # that would have caught the trace and manifold regressions this repo has shipped.
+  engine-tests:
+    name: Engine tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      # Godot's Linux build links X11/font libraries even under --headless; the runner
+      # image does not carry all of them.
+      - name: Install runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1 libxcursor1 libxinerama1 libxi6 libxrandr2
+
+      # Release, not Debug. hop-physics.gdextension points EVERY entry — debug included
+      # — at the template_release library, and src/CMakeLists.txt derives that suffix
+      # from CMAKE_BUILD_TYPE. A Debug build here writes template_debug, the manifest
+      # goes on asking for template_release, and the engine starts with no extension at
+      # all: every case then fails on a missing "Hop Physics" physics engine rather than
+      # on anything about physics.
+      - name: Build the extension
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGODOTCPP_TARGET=template_release
+          cmake --build build -j"$(nproc)"
+
+      - name: Fetch Godot ${{ env.GODOT_VERSION }}
+        run: |
+          url="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          curl -fsSL -o godot.zip "$url"
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_VERSION}_linux.x86_64" godot
+          chmod +x godot
+          ./godot --version
+
+      # run_tests.gd exits non-zero on any failed assertion.
+      - name: Run suites
+        run: ./godot --headless --path test-project -s res://tests/run_tests.gd

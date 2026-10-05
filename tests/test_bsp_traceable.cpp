@@ -489,10 +489,10 @@ static void test_solid_impact_is_on_the_surface() {
 	// 23 rad/s and kept gaining.
 	//
 	// Asserted here rather than through dynamics on purpose. It used to show up as spin
-	// in test-project/tests/test_bsp_contact_point.gd, but contact manifolds (hop Phase
-	// 14) regenerate a face contact as four clipped corner points every tick, so the
-	// solver no longer reads this witness for a box lying on a floor and the corner
-	// answer became invisible to every dynamics test. This is the level it is still
+	// in test-project/tests/test_bsp_contact_point.gd, but contact manifolds regenerate
+	// a face contact as four clipped corner points every tick, so the solver no longer
+	// reads this witness for a box lying on a floor and the corner answer became
+	// invisible to every dynamics test. This is the level it is still
 	// observable at.
 	assert(approx(c.impact.x, 0.0, 0.02));
 	assert(approx(c.impact.z, 0.0, 0.02));
@@ -1290,7 +1290,7 @@ static void test_a_capsule_stops_at_its_own_reach() {
 
 // --- contact manifolds ------------------------------------------------------
 //
-// The reason the phase touches the BSP path at all: a corpse lies on LEVEL GEOMETRY,
+// The reason manifolds touch the BSP path at all: a corpse lies on LEVEL GEOMETRY,
 // and level geometry is a traceable shape on a solid. Fixing solid-vs-solid alone would
 // not move the game a millimetre.
 //

@@ -4,7 +4,7 @@ extends RefCounted
 ##
 ## WHAT TIPS AND WHAT DOES NOT is the whole design here, and it is not a matter of taste.
 ## A face contact is a four-point manifold, one per bottom corner, regenerated every tick
-## by face clipping (hop Phase 14). Friction pulls at the face with a moment of mu*N*h
+## by face clipping. Friction pulls at the face with a moment of mu*N*h
 ## about the centre; the corners answer by redistributing the normal load, worth N*(L/2).
 ## So a dragged box goes over exactly when
 ##

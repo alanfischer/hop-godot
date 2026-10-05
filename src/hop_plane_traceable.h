@@ -32,11 +32,31 @@ public:
 		// common identity case skips the matrix multiply entirely.
 		hop::vec3<T> normal = world_normal(orientation);
 
+		// A start inside the solid half-space is an overlap, whatever the direction --
+		// the contract spelled out in HopBspTraceable::trace_segment. A half-space has
+		// the plainest interior of any shape here and reported nothing in any direction,
+		// because the sweep below cannot be asked it: with the start inside, either
+		// denom is >= 0 and the "moving away or parallel" guard returns, or the solved
+		// t comes out negative and the range test rejects it.
+		//
+		// The solid side is negative, and resting exactly ON the surface is not inside.
+		const T gap = hop::dot(normal, seg.origin) - (distance_ + hop::dot(normal, position));
+		if (gap < T {}) {
+			if (T {} >= result.time)
+				return;
+			result.time = T {};
+			result.started_inside = true;
+			result.depth = -gap;
+			result.point.set(seg.origin);
+			result.normal = normal;
+			return;
+		}
+
 		T denom = hop::dot(normal, seg.direction);
 		if (denom >= T {})
 			return; // Moving away or parallel
 
-		T t = (distance_ + hop::dot(normal, position) - hop::dot(normal, seg.origin)) / denom;
+		T t = -gap / denom;   // the numerator is the signed distance already computed above
 		if (t >= T {} && t <= tr::one() && t < result.time) {
 			result.time = t;
 			hop::mul(result.point, seg.direction, t);

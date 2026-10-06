@@ -70,6 +70,20 @@ public:
 	// One shared blob per loaded map, keyed by the instance id of the node that
 	// carries it. Weak, so unloading a map frees it.
 	std::unordered_map<uint64_t, std::weak_ptr<hopbsp::map_data>> bsp_maps;
+	// How far _body_test_motion must hold a body off a surface for a BSP hull trace
+	// to still answer questions from there, in METRES — DIST_EPSILON converted
+	// through the loaded map's own units→metres scale, and the largest such over the
+	// maps in play. Zero when no BSP hull is loaded (nothing needs the clearance).
+	//
+	// The server cannot derive this: the band is in GoldSrc units and only the
+	// traceable knows the factor. It is recorded on build (try_build_bsp_hull) and
+	// read as a floor on the resting gap — see `touch_eps`.
+	//
+	// Only ever grows, which is deliberate: a map unloading does not make the gap a
+	// body already rests in wrong, and the quantity is sub-millimetre at any sane
+	// scale. If a host ever mixes scales that differ by orders of magnitude, this
+	// wants to become per-space.
+	double bsp_surface_clearance = 0.0;
 	// Auto-compute a dynamic body's principal inertia from its collision
 	// AABB + mass (so a RigidBody3D spins without the game setting inertia), unless
 	// the game set BODY_PARAM_INERTIA explicitly (custom_inertia).

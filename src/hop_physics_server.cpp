@@ -537,6 +537,12 @@ std::unique_ptr<HopBspTraceable<hop_scalar>> HopPhysicsServer::try_build_bsp_hul
 	const int blocking = (int)node->get_meta("bsp_blocking", hopbsp::BLOCK_SOLID);
 	if (!traceable->build(map, model, scalar_from_float<hop_scalar>(scale), blocking)) return nullptr;
 
+	// The resting gap _body_test_motion must leave, now that there is a hull trace to
+	// answer from. Max rather than assignment: a map and its brush entities each build
+	// their own traceable, and a second map can load before the first is freed.
+	bsp_surface_clearance = std::max(bsp_surface_clearance,
+		(double)hopbsp::DIST_EPSILON * (double)scale);
+
 	body->bsp_map = map;    // pin the shared tree for as long as this body lives
 	body->bsp_checked = 2;  // a carrier; the traceable itself is the shape's business
 	return traceable;
@@ -1315,7 +1321,23 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	// GoldSrc avoids this by keeping every trace crosspoint DIST_EPSILON off its plane;
 	// this restores the invariant for positions that did not come from a trace endpoint
 	// (a carry, a snap, a teleport).
+	//
+	// It has to clear DIST_EPSILON, not merely be nonzero. A hull trace whose start sits
+	// inside that band answers EVERY direction with fraction zero — including straight
+	// back out — so a body parked there cannot move, cannot fall, and reports a
+	// zero-depth support normal that its mover reads as standing on the ground. A fixed
+	// 1e-4 m was four times too small at WizardWars' 0.025 m per unit: a monster that
+	// slid flush into a wall was parked 0.004 units off it, inside a band 0.0156 units
+	// wide, and froze there in mid-air for the rest of the round. Measured by shifting a
+	// 32x32x72 hull off three such spots on ww_2fort a step at a time: paralysed at and
+	// below 0.004 units, free from 0.0156 (STUCK_SLOP) onward, in whichever single
+	// direction was open.
+	//
+	// bsp_surface_clearance is DIST_EPSILON in metres for the maps in play, recorded when
+	// their hulls are built, and 0 when nothing uses a BSP hull — the band belongs to that
+	// trace, so bodies that never meet one keep the hair they always had.
 	float touch_eps = std::max(margin * 0.1f, 1e-4f);
+	touch_eps = std::max(touch_eps, (float)bsp_surface_clearance);
 
 	// --- (1) Recovery: iteratively push out of any static overlap ---
 	//

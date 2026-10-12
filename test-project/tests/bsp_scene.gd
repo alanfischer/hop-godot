@@ -30,14 +30,24 @@ static func to_gs(v: Vector3) -> Vector3:
 	return Vector3(-v.x / S, v.z / S, v.y / S)
 
 
-## A map node with `blob` mounted on it, added to `tree`, with one static carrier for
-## model 0. Free the returned node to tear the whole fixture down.
-static func make_map(tree: SceneTree, blob: PackedByteArray) -> Node3D:
+## A map node with `blob` mounted on it, added to `tree`, with one carrier for model 0.
+## Free the returned node to tear the whole fixture down.
+##
+## `kinematic` makes that carrier an AnimatableBody3D instead of a StaticBody3D, so a
+## test can MOVE the geometry — a door, a lift, a walking brush entity. The hull is the
+## same; what changes is that a mover can now be overtaken by it, which is a different
+## question from walking into a wall that stays put.
+static func make_map(tree: SceneTree, blob: PackedByteArray, kinematic := false) -> Node3D:
 	var map := Node3D.new()
 	map.set_meta("bsp_data", blob)
 	tree.get_root().add_child(map)
 
-	var world := StaticBody3D.new()
+	var world: PhysicsBody3D = AnimatableBody3D.new() if kinematic else StaticBody3D.new()
+	world.name = "World"
+	if world is AnimatableBody3D:
+		# Direct global_position writes are how a host engine's movers advance; leaving
+		# sync_to_physics on silently swallows them.
+		(world as AnimatableBody3D).sync_to_physics = false
 	world.collision_layer = 1
 	world.set_meta("bsp_model", 0)
 	world.set_meta("bsp_scale", S)

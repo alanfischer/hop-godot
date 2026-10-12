@@ -99,6 +99,13 @@ struct HopBodyData {
 	std::shared_ptr<hopbsp::map_data> bsp_map;
 	int bsp_checked = 0;  // 0 = not looked at yet, 1 = not a carrier, 2 = hull in use
 
+	// How this body is moving, in hop's own types, refreshed by _step from the velocities
+	// it derives just above. A BSP traceable built on this body reads it, and hands it to
+	// hull_push_out as the direction a mover buried in this body came from. Separate from
+	// linear_velocity/angular_velocity because those are Godot-typed and the traceable
+	// header is deliberately godot-free.
+	hopbsp::owner_motion<hop_scalar> hop_motion;
+
 	// Contact info from last step
 	struct ContactInfo {
 		Vector3 local_pos;

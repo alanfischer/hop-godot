@@ -536,6 +536,9 @@ std::unique_ptr<HopBspTraceable<hop_scalar>> HopPhysicsServer::try_build_bsp_hul
 	const float scale = (float)node->get_meta("bsp_scale");
 	const int blocking = (int)node->get_meta("bsp_blocking", hopbsp::BLOCK_SOLID);
 	if (!traceable->build(map, model, scalar_from_float<hop_scalar>(scale), blocking)) return nullptr;
+	// Depenetration direction: how this body is moving, plus the one slot that says a
+	// depenetration probe is what is asking (see hopbsp::hull_push_out).
+	traceable->set_depen_context(&body->hop_motion, &depen_hint);
 
 	// The resting gap _body_test_motion must leave, now that there is a hull trace to
 	// answer from. Max rather than assignment: a map and its brush entities each build
@@ -1382,6 +1385,13 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	float glen = gvec.length();
 	Vector3 up_dir = glen > 0.0f ? -gvec / glen : Vector3(0, 1, 0);
 
+	// Tell the BSP push-out that this is a depenetration, for the span of the recovery
+	// probes only. A buried mover's way OUT is the way it came IN, and which way that was
+	// cannot be read off the geometry — see `prefer` on hopbsp::hull_push_out, and the
+	// ww_golem cockpit case recorded there. Cleared below so the motion cast, the ground
+	// probe and every public query are answered exactly as they were before.
+	depen_hint.active = true;
+
 	const int MAX_RECOVER_ITERS = 4;
 	for (int i = 0; i < MAX_RECOVER_ITERS; ++i) {
 		Vector3 test_pos = p_from.origin + recover;
@@ -1456,6 +1466,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		recover += n * (depth + touch_eps);
 		if (depth > recover_depth) recover_depth = depth;
 	}
+	depen_hint.active = false;
 
 	// Enforce the resting gap (see `touch_eps`). Recovery cannot: it reports only REAL
 	// penetration, and a mover exactly on a plane is not penetrating anything.
@@ -2496,6 +2507,16 @@ void HopPhysicsServer::_step(float p_step) {
 		body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
 		body->hop_solid->set_angular_velocity(hop::vec3<hop_scalar>{});
 		body->sweep_prev_transform = body->transform;  // this step's target is the next one's start
+		// The same motion as a per-frame displacement, for the BSP push-out's direction:
+		// a mover buried in this body is pushed the way this body is going, and only
+		// deeper than this body could have reached in one frame (see hopbsp::owner_motion).
+		// Derived from the published velocities rather than a second pose diff so the two
+		// cannot disagree; last_step is the interval they were divided by.
+		const float mdt = last_step > 0.0f ? last_step : (1.0f / 60.0f);
+		body->hop_motion.linear_step = to_hop(body->linear_velocity * mdt);
+		body->hop_motion.angular_step = to_hop(body->angular_velocity * mdt);
+		body->hop_motion.origin = to_hop(body->transform.origin);
+		body->hop_motion.valid = true;
 	});
 
 	// Sync positions from hop to Godot

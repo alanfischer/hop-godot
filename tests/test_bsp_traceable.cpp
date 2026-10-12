@@ -880,6 +880,145 @@ static std::shared_ptr<hop::solid<T>> make_corpse_solid() {
 // is DESCENDED, not only at the crosspoint: a walk that reads both segment ends as
 // "in front of the floor plane" never splits, so the mover was waved through until
 // its centre was genuinely inside the brush — 0.5m of floor, for this body.
+// An exit pointing back through the surface the mover was swept through is not an exit.
+//
+// hull_push_out takes the shortest exit it can verify, and that rule inverts past the
+// midplane of anything thicker than the eject budget is wide: the near face goes out of
+// reach and the FAR face becomes the shortest answer. Both exits are real and the wrong
+// one is genuinely nearer, so the geometry at one instant cannot tell them apart. What
+// can is the model's own travel — a mover buried in a brush entity that is going
+// somewhere was overtaken by it, and came in through the face on the side it came from.
+// See against_the_sweep for how narrowly that evidence is trusted.
+static void test_push_out_will_not_exit_against_the_sweep() {
+	// A 16-unit-thick wall, the thickness of ww_golem's control brushes: 48 units of
+	// solid in hull 1 (GoldSrc x = -24..24), midplane at x = 0.
+	const double mins[3] = { -8, -4096, -4096 }, maxs[3] = { 8, 4096, 4096 };
+	auto t = load(make_box_map(mins, maxs));
+	auto s = make_box_solid(0.4, 0.9, 0.4);  // 32x32x72, centre origin -> hull 1, no offset
+
+	// GoldSrc x = +4: four units past the midplane, so +x is out in 20 units and -x in
+	// 28. Godot +x is GoldSrc -x, so the trace point is Godot x = -0.1.
+	const V buried = vec((T)(-4 * SCALE), 0, 0);
+
+	// No motion wired at all: the shortest exit, exactly as before.
+	hop::collision<T> blind = sweep(*t, s, buried, vec(0, 0, 0));
+	assert(blind.time == 0.0 && "a point inside solid must report an overlap");
+	assert(approx_v(blind.normal, -1, 0, 0) && "with no motion, the shortest exit wins");
+	assert(approx(blind.depth / SCALE, 20.0, 0.1));
+
+	hopbsp::owner_motion<T> motion;
+	motion.valid = true;
+	hopbsp::depen_hint<T> hint;
+	t->set_depen_context(&motion, &hint);
+	hint.active = true;
+
+	// The model is travelling GoldSrc -x (Godot +x) at a golem's pace, 0.8 units a frame.
+	// A mover inside it was therefore overtaken from its -x side and came in through the
+	// -x face, so the nearer +x exit would leave through the far side of the wall. Dropped
+	// from the search, and the 28-unit exit it came in by wins instead.
+	const T STEP = (T)(0.8 * SCALE);
+	motion.linear_step = vec(STEP, 0, 0);
+	hop::collision<T> back = sweep(*t, s, buried, vec(0, 0, 0));
+	assert(back.time == 0.0);
+	assert(approx_v(back.normal, 1, 0, 0) && "the way out is the way it came in");
+	assert(approx(back.depth / SCALE, 28.0, 0.1));
+
+	// Reverse the model and the nearer exit now agrees with the sweep, so it stands. This
+	// is the half of the rule that keeps a pusher working: the mover is ejected ahead of
+	// the surface overtaking it.
+	motion.linear_step = vec(-STEP, 0, 0);
+	hop::collision<T> agreeing = sweep(*t, s, buried, vec(0, 0, 0));
+	assert(approx_v(agreeing.normal, -1, 0, 0));
+	assert(approx(agreeing.depth / SCALE, 20.0, 0.1));
+
+	// A model standing still — every static brush, and a door between moves — has nothing
+	// to say, and must cost nothing.
+	motion.linear_step = V {};
+	hop::collision<T> still = sweep(*t, s, buried, vec(0, 0, 0));
+	assert(approx_v(still.normal, -1, 0, 0) && "a still model is no opinion");
+	assert(approx(still.depth / SCALE, 20.0, 0.1));
+
+	// Rotation counts as travel too, at the point the mover actually sits: with the mover
+	// offset along Godot +z from the model's origin, a turn about Godot +y carries it
+	// along Godot +x, which is GoldSrc -x — the same sweep, the same answer.
+	motion.angular_step = vec(0, STEP, 0);
+	motion.origin = vec(0, 0, (T)-1);
+	hop::collision<T> turned = sweep(*t, s, buried, vec(0, 0, 0));
+	assert(approx_v(turned.normal, 1, 0, 0) && "a turning model sweeps its surface too");
+	assert(approx(turned.depth / SCALE, 28.0, 0.1));
+	motion.angular_step = V {};
+	motion.origin = V {};
+
+	// A graze keeps its exit even pointing against the sweep. A mover leaning on a moving
+	// brush is a fraction of a unit inside it every frame, by exactly the travel that put
+	// it there, and the face it just crossed is the one to leave by. GoldSrc x = 23.5 is
+	// half a unit inside the +x face with the -x face 47.5 away, out of the budget's
+	// reach — so the near exit is the only one there is AND it points against the sweep.
+	// It must still be the answer, or every mover leaning on a moving brush entity stops
+	// being corrected at all.
+	const V grazing = vec((T)(-23.5 * SCALE), 0, 0);
+	motion.linear_step = vec(STEP, 0, 0);
+	hop::collision<T> graze = sweep(*t, s, grazing, vec(0, 0, 0));
+	assert(graze.time == 0.0);
+	assert(approx_v(graze.normal, -1, 0, 0) && "a graze keeps its near exit");
+	assert(approx(graze.depth / SCALE, 0.5, 0.1));
+
+	// Buried with nothing left: 4 units inside the +x face, which is refused, and 44 from
+	// the -x one, which overruns the budget. Report the overlap with no direction rather
+	// than the wrong one — "you are inside something and I cannot tell you which way out"
+	// is an answer the caller handles by creeping, and for a cockpit rider that means
+	// staying stuck inside the golem for a few frames instead of leaving through its back.
+	const V nowhere = vec((T)(-20 * SCALE), 0, 0);
+	hop::collision<T> vetoed = sweep(*t, s, nowhere, vec(0, 0, 0));
+	assert(vetoed.time == 0.0 && "still inside something");
+	assert(approx_v(vetoed.normal, 0, 0, 0) && "and no direction is better than the wrong one");
+	assert(vetoed.depth == T {});
+
+	// The same pose with the hint inactive — the state every query outside a depenetration
+	// probe is in — keeps the answer it always had.
+	hint.active = false;
+	hop::collision<T> unhinted = sweep(*t, s, nowhere, vec(0, 0, 0));
+	assert(approx_v(unhinted.normal, -1, 0, 0));
+	assert(approx(unhinted.depth / SCALE, 4.0, 0.1));
+
+	printf("  push_out_will_not_exit_against_the_sweep ok\n");
+}
+
+// The up axis keeps the shortest-exit rule whatever the model is doing, because there the
+// old rule is already right: a mover is nearly always a hair inside the surface it STANDS
+// on, and the short way out is up. A descending deck is receding from its rider rather
+// than running them over, so its motion is no evidence about how the rider got in — and
+// following it would push them down through the deck.
+static void test_push_out_ignores_the_models_motion_on_the_up_axis() {
+	// A 16-unit-thick floor: 88 units of solid in hull 1 (GoldSrc z = -44..44).
+	const double mins[3] = { -4096, -4096, -8 }, maxs[3] = { 4096, 4096, 8 };
+	auto t = load(make_box_map(mins, maxs));
+	auto s = make_box_solid(0.4, 0.9, 0.4);
+
+	// GoldSrc z = +4, i.e. Godot y = 0.1: 40 units up to open air, 48 down.
+	const V buried = vec(0, (T)(4 * SCALE), 0);
+	hopbsp::owner_motion<T> motion;
+	motion.valid = true;
+	hopbsp::depen_hint<T> hint;
+	hint.active = true;
+	t->set_depen_context(&motion, &hint);
+
+	// The deck is dropping away (Godot -y, GoldSrc -z). Honouring that would drop the
+	// upward candidate and push the mover 48 units DOWN through the floor.
+	motion.linear_step = vec(0, (T)(-0.8 * SCALE), 0);
+	hop::collision<T> c = sweep(*t, s, buried, vec(0, 0, 0));
+	assert(c.time == 0.0);
+	assert(approx_v(c.normal, 0, 1, 0) && "a mover in a floor is pushed up, whatever the floor is doing");
+	assert(approx(c.depth / SCALE, 40.0, 0.1));
+
+	// And rising, where it happens to agree, the answer is the same one.
+	motion.linear_step = vec(0, (T)(0.8 * SCALE), 0);
+	hop::collision<T> rising = sweep(*t, s, buried, vec(0, 0, 0));
+	assert(approx_v(rising.normal, 0, 1, 0));
+	assert(approx(rising.depth / SCALE, 40.0, 0.1));
+	printf("  push_out_ignores_the_models_motion_on_the_up_axis ok\n");
+}
+
 static void test_hull0_box_lands_on_the_floor() {
 	auto t = load(make_floor_map());
 	auto s = make_corpse_solid();
@@ -1424,6 +1563,8 @@ int main() {
 	test_inside_a_wall_cannot_travel_deeper();
 	test_deep_overlap_is_nudged_not_launched();
 	test_push_out_picks_a_direction_that_exits();
+	test_push_out_will_not_exit_against_the_sweep();
+	test_push_out_ignores_the_models_motion_on_the_up_axis();
 	test_hull0_box_lands_on_the_floor();
 	test_hull0_box_stops_at_its_own_width();
 	test_hull0_box_settles_instead_of_bouncing();

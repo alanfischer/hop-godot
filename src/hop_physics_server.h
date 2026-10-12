@@ -84,6 +84,16 @@ public:
 	// scale. If a host ever mixes scales that differ by orders of magnitude, this
 	// wants to become per-space.
 	double bsp_surface_clearance = 0.0;
+	// Set while a BSP depenetration probe is running, for the span of _body_test_motion's
+	// recovery loop and nowhere else. Every BSP traceable holds a pointer to this one slot
+	// (try_build_bsp_hull) and consults its own body's motion only when it is set, so that
+	// a buried mover is not pushed out through the far side of what it is buried in — see
+	// `prefer` on hopbsp::hull_push_out. A swept query, a ray and every public overlap
+	// test are answered exactly as they were before.
+	//
+	// Mutable because _body_test_motion is a const query, and single-slot because the
+	// physics step is single-threaded and the probe does not nest.
+	mutable hopbsp::depen_hint<hop_scalar> depen_hint;
 	// Auto-compute a dynamic body's principal inertia from its collision
 	// AABB + mass (so a RigidBody3D spins without the game setting inertia), unless
 	// the game set BODY_PARAM_INERTIA explicitly (custom_inertia).

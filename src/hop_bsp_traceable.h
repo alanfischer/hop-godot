@@ -651,6 +651,75 @@ inline double hull_inside_distance(const hull &h, int root, const double p[3],
 	return d > 0.0 ? d : 0.0;
 }
 
+// How far the body carrying a traceable moved over the last step, in world space.
+// Recorded for every kinematic body, which is what every brush mover is.
+//
+// It exists for one job: handing hull_push_out a `prefer` (see there). A mover buried in a
+// brush entity that is going somewhere came from the way that entity is heading — it
+// either failed to keep up with it or was run over by it, and both have the same answer.
+// A still entity says nothing and the old rule stands.
+//
+// A per-frame DISPLACEMENT rather than a velocity, because `prefer` needs a magnitude as
+// much as a direction: an overlap no deeper than the surface's own travel since the last
+// correction is this frame's graze, where the nearest exit is the right answer whichever
+// way it points, and anything deeper did not get there from one frame of this surface's
+// motion. The displacement is that scale; a velocity would need the step length to
+// recover it, which this layer has no business knowing.
+//
+// Not a pose pair, which cannot be read at all: a mover's transform write reaches the
+// server at the next flush, so the pose a query is answered from and the pose recorded at
+// the last step are the same instant, and their difference is structurally zero. The
+// displacement _step derives from that pair IS the difference, a frame late and nonzero.
+template <typename T>
+struct owner_motion {
+	bool valid = false;
+	hop::vec3<T> linear_step;   // world-space Δposition over the step
+	hop::vec3<T> angular_step;  // world-space Δrotation (axis·angle) over the step
+	hop::vec3<T> origin;        // the owner's origin, for Δrotation × r
+};
+
+// Set for the span of a depenetration probe and clear everywhere else, so a swept query,
+// a ray or a public overlap test is answered exactly as it was before. One instance,
+// owned by the server and pointed at by every traceable.
+template <typename T>
+struct depen_hint {
+	bool active = false;
+};
+
+// Is this push-out answer pointing back into the surface the mover was swept through?
+//
+// `prefer` is the model's own travel over the last frame at the mover's position. A mover
+// that ends up inside a moving brush entity got there by being overtaken by it, so it
+// entered through the face on the side that entity came from — and an exit pointing the
+// other way goes deeper into the model and out its far side. On ww_golem that is a cockpit
+// rider leaving through the back of the golem: the body's rear wall is 48 units thick in
+// hull 1 against a 32-unit hull, so from past its midplane the shortest verified exit is
+// the outside face, and it is both the nearest and completely wrong.
+//
+// Two things keep this narrow, because the evidence is weak:
+//
+//   * Only the LARGER horizontal component of `prefer` votes. A motion is dominated by one
+//     axis in practice, the other component is usually float dust, and letting dust vote
+//     refused poses that had a perfectly good answer. The up axis never votes at all: a
+//     mover is nearly always a hair inside the surface it STANDS on, where the short exit
+//     is up and up is right, while a deck bobbing downward is receding from its rider
+//     rather than overtaking them — the proxy is simply wrong there, half the time.
+//   * Only past the depth this model could have reached in one frame. Shallower than that,
+//     the overlap IS this frame's travel, the near face is the one just crossed, and the
+//     nearest exit is right whichever way it points. That is the ordinary graze every
+//     mover leaning on a moving brush has, every frame. (It assumes the recovery clears a
+//     graze each frame, which it does, being uncapped per iteration.)
+inline bool against_the_sweep(const double dir[3], double dist, const double *prefer) {
+	if (prefer == nullptr) return false;
+	const double ax = prefer[0] < 0 ? -prefer[0] : prefer[0];
+	const double ay = prefer[1] < 0 ? -prefer[1] : prefer[1];
+	const int axis = ax >= ay ? 0 : 1;
+	const double want = prefer[axis];
+	if (dir[axis] * want >= 0.0) return false;  // not pointing against the sweep
+	const double travel = want < 0 ? -want : want;
+	return dist > travel + STUCK_SLOP;
+}
+
 // The shortest push that actually gets `p` OUT of blocking contents (`normal`,
 // `depth`), searched along the six axes out to the mover's own `extent` on each.
 // Returns false if `p` isn't inside blocking contents.
@@ -687,12 +756,22 @@ inline double hull_inside_distance(const hull &h, int root, const double p[3],
 // surfaces belonging to neither, which is precisely what leaves a caller unable to
 // tell the floor it stands on from the wall pressing into it.
 //
+// `prefer`, when given, is how far this model carried the point `p` over the last frame,
+// in its own axes (see owner_motion). It never picks an exit of its own: it strikes out
+// candidates that point back through the surface the mover was swept through
+// (against_the_sweep, above), and the search answers from what is left — or, with nothing
+// left, says it cannot tell. Keeping it a filter rather than a ranking is deliberate. A
+// ranking was tried twice, and both times it moved answers at poses that were already
+// correct: a change of winner is also a change of depth, and the depth decides which
+// contact the caller's recovery loop resolves first and what the next of its four
+// iterations sees. A filter can only remove a wrong answer; it cannot promote a worse one.
+//
 // `in_solid`, when given, receives the contents test this opens with — the same
 // question callers otherwise ask again straight afterwards, at a full root-to-leaf
 // descent per traceable per trace.
 inline bool hull_push_out(const hull &h, int root, const double p[3], int blocking,
                           const double extent[3], double normal[3], double &depth,
-                          bool *in_solid = nullptr) {
+                          bool *in_solid = nullptr, const double *prefer = nullptr) {
 	const bool solid =
 		(blocking & blocking_bit(hull_point_contents_biased(h, root, p, -STUCK_SLOP))) != 0;
 	if (in_solid) *in_solid = solid;
@@ -717,6 +796,11 @@ inline bool hull_push_out(const hull &h, int root, const double p[3], int blocki
 			const double mag = dir[i] < 0 ? -dir[i] : dir[i];
 			if (mag * d > extent[i]) return;  // overruns the mover's own size on this axis
 		}
+		// Not a candidate at all, rather than a candidate that loses: refusing only the
+		// WINNER throws away every runner-up with it, and on ww_golem that left a rider
+		// 18 units into the rear wall with no correction from the control brush whose
+		// other three faces were all perfectly good exits.
+		if (against_the_sweep(dir, d, prefer)) return;
 		if (verified) {
 			if (!found || d < best) {
 				best = d;
@@ -751,7 +835,16 @@ inline bool hull_push_out(const hull &h, int root, const double p[3], int blocki
 		depth = best;
 		return true;
 	}
-	return hull_nearest_leaf_plane(h, root, p, blocking, normal, depth);
+	// The leaf plane is the last resort and gets the same filter: directionless already,
+	// it has no business being the one answer that may point out the far side.
+	double leaf_n[3], leaf_d = 0;
+	if (!hull_nearest_leaf_plane(h, root, p, blocking, leaf_n, leaf_d))
+		return false;
+	if (against_the_sweep(leaf_n, leaf_d, prefer))
+		return false;
+	normal[0] = leaf_n[0]; normal[1] = leaf_n[1]; normal[2] = leaf_n[2];
+	depth = leaf_d;
+	return true;
 }
 
 // One map's stripped BSP, owned once and shared by every traceable built from it.
@@ -794,6 +887,18 @@ class HopBspTraceable : public hop::traceable<T> {
 	using tr = hop::scalar_traits<T>;
 
 public:
+	// Hand this traceable what it needs to tell a wrong depenetration from a right one:
+	// `owner` is how its own body moved over the last step, `hint` the server's one slot
+	// saying a depenetration probe is what is asking. Both are owned elsewhere and outlive
+	// this traceable (the body owns the solid that owns the shape that owns this; the
+	// server owns the hint). Leaving them unset costs nothing and keeps every answer
+	// exactly what it was — see `prefer` on hopbsp::hull_push_out.
+	void set_depen_context(const hopbsp::owner_motion<T> *owner,
+	                       const hopbsp::depen_hint<T> *hint) {
+		owner_motion_ = owner;
+		depen_hint_ = hint;
+	}
+
 	// `scale` is the importer's GoldSrc-units → metres factor.
 	bool build(std::shared_ptr<hopbsp::map_data> map, int model_index, T scale,
 	           int blocking = hopbsp::BLOCK_SOLID) {
@@ -1069,10 +1174,33 @@ public:
 				extent[i] = basis.oriented ? 2.0 * wh[i] : box_maxs[i] - box_mins[i];
 		}
 
+		// How far this model carried the point the mover sits at over the last step, in the
+		// model's own frame and GoldSrc axes. That is the direction a buried mover was
+		// swept from, and the depth one frame of this surface can account for — the two
+		// things the push-out needs to recognise an exit that goes out the far side (see
+		// `prefer` on hull_push_out). Zero for a model standing still, which is every
+		// static brush and a stopped door, and there the shortest-exit rule stands alone.
+		double prefer[3];
+		const double *prefer_ptr = nullptr;
+		if (depen_hint_ != nullptr && depen_hint_->active &&
+		    owner_motion_ != nullptr && owner_motion_->valid) {
+			hop::vec3<T> arm, spin, point_step;
+			hop::sub(arm, seg.origin, owner_motion_->origin);
+			hop::cross(spin, owner_motion_->angular_step, arm);
+			hop::add(point_step, owner_motion_->linear_step, spin);
+			hop::vec3<T> local_step, ignored;
+			to_local(point_step, hop::vec3<T> {}, hop::vec3<T> {}, orientation, local_step, ignored);
+			godot_to_gs(local_step, prefer);
+			// A model that moved less than a trace keeps its endpoints off surfaces by has
+			// not moved: the sign of each component there is float noise, not a direction.
+			const double len2 = prefer[0] * prefer[0] + prefer[1] * prefer[1] + prefer[2] * prefer[2];
+			if (len2 > hopbsp::DIST_EPSILON * hopbsp::DIST_EPSILON) prefer_ptr = prefer;
+		}
+
 		double n[3], depth = 0;
 		bool start_in_solid = false;
 		const bool inside = hopbsp::hull_push_out(h, h.root, start, blocking_, extent, n, depth,
-		                                          &start_in_solid);
+		                                          &start_in_solid, prefer_ptr);
 
 		// hull_push_out answers "is there a way out of here", NOT "is the mover in
 		// solid" — it returns false both for open space and for a point buried where no
@@ -1293,6 +1421,9 @@ public:
 	}
 
 private:
+	// Set by set_depen_context; null unless the server wired them up.
+	const hopbsp::owner_motion<T> *owner_motion_ = nullptr;
+	const hopbsp::depen_hint<T> *depen_hint_ = nullptr;
 	// GoldSrc (Z-up, inches) ↔ Godot (Y-up, metres). The axis swap is its own
 	// inverse and has determinant +1, so directions use the same map both ways and
 	// normals need no special handling.

@@ -34,6 +34,10 @@ extends SceneTree
 ##            transform written to a node during _physics_process is otherwise queued
 ##            and flushed only after EVERY node's _physics_process has run, so a mover
 ##            that ticks before its rider is answered to the rider one step stale.
+##   TWEEN    1 = drive the wall with a TWEEN_PROCESS_PHYSICS Tween instead of writing its
+##            transform in the tick, which is how a host engine's doors, plats and trains
+##            usually move. A tween writes AFTER every _physics_process has run, so FLUSH
+##            cannot help it and the question is what that costs.
 ##   CARRY    1 = also move the mover by the wall's own displacement, as a swept move,
 ##            before it presses — the way a host engine carries a rider standing on a
 ##            moving brush. With it the wall and the mover travel together and the only
@@ -85,6 +89,7 @@ func _run() -> void:
 	var advance := _env("ADVANCE", 0.0)
 	var carry := OS.get_environment("CARRY") == "1"
 	var flush := OS.get_environment("FLUSH") == "1"
+	var tween_driven := OS.get_environment("TWEEN") == "1"
 
 	var blob: PackedByteArray
 	match fixture:
@@ -114,8 +119,9 @@ func _run() -> void:
 		fixture, mode, speed, step, margin, margin / S])
 	print("wall face x=%.2f (expanded, hull 1); feet start (%.2f, 0, %.2f)" % [
 		WALL_FACE, start_x, feet_z])
-	print("wall advance %.2f u/tick, carry %s, flush %s\n" % [
-		advance, "on" if carry else "off", "on" if flush else "off"])
+	print("wall advance %.2f u/tick (%s), carry %s, flush %s\n" % [
+		advance, "tween" if tween_driven else "written in the tick",
+		"on" if carry else "off", "on" if flush else "off"])
 
 	var probe := PhysicsTestMotionParameters3D.new()
 	probe.margin = margin
@@ -138,6 +144,15 @@ func _run() -> void:
 		var l: Vector3 = t.affine_inverse() * mover.global_position
 		return BspScene.to_gs(l)
 
+	var tween: Tween
+	if tween_driven and advance != 0.0:
+		# Same shape as a door: one tween toward a far target at a fixed speed.
+		tween = world.create_tween()
+		tween.set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)
+		tween.tween_property(world, "global_position",
+			world.global_position + BspScene.gs(advance * ticks, 0.0, 0.0),
+			float(ticks) / 60.0).set_trans(Tween.TRANS_LINEAR)
+
 	var driver := TickDriver.new()
 	get_root().add_child(driver)
 
@@ -147,14 +162,14 @@ func _run() -> void:
 		# The wall moves FIRST, as a host engine's entities do (they are added to the
 		# tree before the player, so Godot ticks them first). A mover that ticked first
 		# would read a stale wall, which is its own class of bug and not this one.
-		if advance != 0.0:
+		if advance != 0.0 and not tween_driven:
 			world.global_position += BspScene.gs(advance, 0.0, 0.0)
 			if flush:
 				world.force_update_transform()
-			if carry:
-				# What a rider standing on the moving brush is given: the wall's own
-				# displacement, as a collision-checked move.
-				mover.move_and_collide(BspScene.gs(advance, 0.0, 0.0))
+		if advance != 0.0 and carry:
+			# What a rider standing on the moving brush is given: the wall's own
+			# displacement, as a collision-checked move.
+			mover.move_and_collide(BspScene.gs(advance, 0.0, 0.0))
 
 		var before: Vector3 = local.call()
 

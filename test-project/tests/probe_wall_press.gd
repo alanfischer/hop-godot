@@ -8,9 +8,12 @@ extends SceneTree
 ## depenetration lands in full, the lift is free. What is left is a single step, and it
 ## needs no golem: a sweep into a wall, from just outside it, ending up inside it.
 ##
-## Nothing here moves but the mover, and the wall is static BSP geometry, so whatever
-## this prints belongs to _body_test_motion (its margin back-off, or its flush-start
-## retry) or to CharacterBody3D's slide loop on top of it — MODE says which.
+## What it measures, once the wall is allowed to move, is whether the NODE and the
+## PHYSICS SERVER hold the same pose when the rider sweeps — it prints both. A rider's
+## carry is measured off the node and its sweep is answered by the server, so penetration
+## appears exactly when the two disagree, which a mid-tick write without FLUSH produces
+## and a TWEEN does not. Written-and-flushed and tweened measure identically, down to the
+## one mover-step the rider is overlapped by at tick start (`pre-carry pen`).
 ##
 ##   godot --headless --path test-project -s res://tests/probe_wall_press.gd
 ##
@@ -166,6 +169,10 @@ func _run() -> void:
 			world.global_position += BspScene.gs(advance, 0.0, 0.0)
 			if flush:
 				world.force_update_transform()
+		# Where the mover stands BEFORE its carry: one mover step overlapped, whichever way
+		# the wall's transform was written. That overlap is what the tick's depenetration
+		# and floor probes are read at.
+		var pre_carry: float = WALL_FACE - local.call().x
 		if advance != 0.0 and carry:
 			# What a rider standing on the moving brush is given: the wall's own
 			# displacement, as a collision-checked move.
@@ -202,8 +209,8 @@ func _run() -> void:
 		var after: Vector3 = local.call()
 		var pen := WALL_FACE - after.x
 		worst = maxf(worst, pen)
-		print("t%3d  x %8.3f -> %8.3f  pen %7.3f  moved %7.3f (hop said %7.3f)  unsafe %.3f safe %.3f  depth %6.3f  served x %8.3f (pen %7.3f)" % [
-			tick, before.x, after.x, pen, after.x - before.x, says, unsafe, safe, depth,
+		print("t%3d  pre-carry pen %7.3f  x %8.3f -> %8.3f  pen %7.3f  moved %7.3f (hop said %7.3f)  unsafe %.3f safe %.3f  depth %6.3f  served x %8.3f (pen %7.3f)" % [
+			tick, pre_carry, before.x, after.x, pen, after.x - before.x, says, unsafe, safe, depth,
 			served_x, WALL_FACE - served_x])
 
 	print("\ndeepest resting penetration: %.3f units (%.2f margins)" % [

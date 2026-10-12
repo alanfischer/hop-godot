@@ -759,12 +759,17 @@ inline bool against_the_sweep(const double dir[3], double dist, const double *pr
 // `prefer`, when given, is how far this model carried the point `p` over the last frame,
 // in its own axes (see owner_motion). It never picks an exit of its own: it strikes out
 // candidates that point back through the surface the mover was swept through
-// (against_the_sweep, above), and the search answers from what is left — or, with nothing
-// left, says it cannot tell. Keeping it a filter rather than a ranking is deliberate. A
-// ranking was tried twice, and both times it moved answers at poses that were already
-// correct: a change of winner is also a change of depth, and the depth decides which
-// contact the caller's recovery loop resolves first and what the next of its four
-// iterations sees. A filter can only remove a wrong answer; it cannot promote a worse one.
+// (against_the_sweep, above), and the search answers from what is left — provided what is
+// left is no FARTHER than the candidate just refused — or says it cannot tell. Keeping it
+// a filter rather than a ranking is deliberate. A ranking was tried twice, and both times
+// it moved answers at poses that were already correct: a change of winner is also a change
+// of depth, and the depth decides which contact the caller's recovery loop resolves first
+// and what the next of its four iterations sees. A filter can only remove a wrong answer;
+// it cannot promote a worse one — and the distance bound is what holds it to that, because
+// a filter with no bound promotes by elimination. Measured on ww_golem: the 8-unit -x exit
+// out of the cockpit's rear wall is struck for pointing against the golem's stride, and
+// the 28-unit -y exit left standing is a launch clean out of the model's right flank, the
+// far-side exit this filter exists to prevent.
 //
 // `in_solid`, when given, receives the contents test this opens with — the same
 // question callers otherwise ask again straight afterwards, at a full root-to-leaf
@@ -788,6 +793,12 @@ inline bool hull_push_out(const hull &h, int root, const double p[3], int blocki
 	double loose_best = 0.0;
 	double loose_dir[3] = { 0, 0, 0 };
 	bool loose_found = false;
+	// The nearest candidate `prefer` refused, which bounds the whole answer: every
+	// surviving candidate farther than it is a BIGGER displacement than the one we just
+	// called wrong, and committing to it is the promotion a filter may not make (see
+	// `prefer`). Past that distance the honest answer is no direction at all.
+	double nearest_struck = 0.0;
+	bool struck_found = false;
 	auto consider = [&](const double dir[3], double limit) {
 		bool verified = false;
 		const double d = hull_inside_distance(h, root, p, dir, limit, blocking, &verified);
@@ -800,14 +811,30 @@ inline bool hull_push_out(const hull &h, int root, const double p[3], int blocki
 		// WINNER throws away every runner-up with it, and on ww_golem that left a rider
 		// 18 units into the rear wall with no correction from the control brush whose
 		// other three faces were all perfectly good exits.
-		if (against_the_sweep(dir, d, prefer)) return;
+		if (against_the_sweep(dir, d, prefer)) {
+			if (!struck_found || d < nearest_struck) {
+				nearest_struck = d;
+				struck_found = true;
+			}
+			return;
+		}
 		if (verified) {
 			if (!found || d < best) {
 				best = d;
 				best_dir[0] = dir[0]; best_dir[1] = dir[1]; best_dir[2] = dir[2];
 				found = true;
 			}
-		} else if (!loose_found || d < loose_best) {
+		} else if (d > STUCK_SLOP && (!loose_found || d < loose_best)) {
+			// Unconfirmed AND going nowhere is the phantom this whole search exists to
+			// dodge: a contents descent sends distance zero to the FRONT child, so the
+			// plane a mover is sitting ON reads as empty at its own height and a probe
+			// heading into it reports free air a hundredth of a unit away. It is
+			// unconfirmed precisely because the far end is still solid, and being the
+			// shortest it wins the unconfirmed pool over a real 14-unit exit — measured
+			// on the wall-on-floor fixture, where it hands back "down, into the floor
+			// you are standing on", the original golem-cockpit answer. A confirmed
+			// candidate at the same distance is a different thing (a mover a hair inside
+			// a wall, where zero push IS the answer) and still counts.
 			loose_best = d;
 			loose_dir[0] = dir[0]; loose_dir[1] = dir[1]; loose_dir[2] = dir[2];
 			loose_found = true;
@@ -828,6 +855,10 @@ inline bool hull_push_out(const hull &h, int root, const double p[3], int blocki
 		found = true;
 	}
 
+	// A refusal bounds every answer, not just its own direction (see `nearest_struck`).
+	if (found && struck_found && best > nearest_struck)
+		found = false;
+
 	if (found) {
 		normal[0] = best_dir[0];
 		normal[1] = best_dir[1];
@@ -840,7 +871,16 @@ inline bool hull_push_out(const hull &h, int root, const double p[3], int blocki
 	double leaf_n[3], leaf_d = 0;
 	if (!hull_nearest_leaf_plane(h, root, p, blocking, leaf_n, leaf_d))
 		return false;
+	// At distance nothing it is the seam a standing mover's trace point lives on, and
+	// pushing along it displaces the mover not at all — the caller reads the pair as
+	// "touching, nothing to depenetrate" and sweeps, which for a mover buried in a wall
+	// is the free pass through it. Getting here at all means no probe found an exit
+	// within budget, so the mover IS buried: say so, with no direction.
+	if (leaf_d <= STUCK_SLOP)
+		return false;
 	if (against_the_sweep(leaf_n, leaf_d, prefer))
+		return false;
+	if (struck_found && leaf_d > nearest_struck)
 		return false;
 	normal[0] = leaf_n[0]; normal[1] = leaf_n[1]; normal[2] = leaf_n[2];
 	depth = leaf_d;
@@ -1150,11 +1190,19 @@ public:
 		// testing the inflated hull would call a mover merely within `margin` of a
 		// wall stuck and stall it dead.
 		//
-		// The mover's own box size per axis. It bounds how far one query may eject a
-		// mover: past its own size a body is not overlapping a surface, it is buried,
-		// and the honest response is to walk it out over a few frames rather than
-		// launch it. hull_push_out searches within it; the cap below also covers the
-		// leaf-plane fallback, which has no such bound of its own.
+		// HALF the mover's own box size per axis. It bounds how far one query may eject a
+		// mover: past half its own size a body is more inside the surface than out of it,
+		// which is buried rather than overlapping, and the honest response is to walk it
+		// out over a few frames rather than launch it. hull_push_out searches within it;
+		// the cap below also covers the leaf-plane fallback, which has no such bound of
+		// its own.
+		//
+		// The full size was the first bound and it was too generous by exactly the factor
+		// that matters: a hull-1 mover is 32 units wide, so it admitted a 28-unit eject —
+		// and on ww_golem that is the whole width of the cockpit's rear wall, i.e. a rider
+		// fired out of the golem's flank. A push longer than the mover's half-width cannot
+		// be a surface it is leaning on; nothing it could be leaning on is that thick on
+		// its own side of the mover's centre.
 		//
 		// Being buried is reachable in play: CLIP brushes exist only in hulls 1..3, so
 		// a spot a player stands on quite happily under the trimesh colliders can be
@@ -1165,13 +1213,13 @@ public:
 		// all. Its own box is the honest bound there, and it is the box the trace is
 		// now centred on.
 		// A turned box reaches further along a hull axis than its own half-extent on
-		// that axis, so the budget is its world-aligned bound, not its local one.
+		// that axis, so the budget is its world-aligned half bound, not its local one.
 		double extent[3];
 		{
 			double wh[3];
 			hopbsp::box_world_half(half, basis, wh);
 			for (int i = 0; i < 3; ++i)
-				extent[i] = basis.oriented ? 2.0 * wh[i] : box_maxs[i] - box_mins[i];
+				extent[i] = basis.oriented ? wh[i] : (box_maxs[i] - box_mins[i]) * 0.5;
 		}
 
 		// How far this model carried the point the mover sits at over the last step, in the

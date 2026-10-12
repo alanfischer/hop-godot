@@ -1,6 +1,6 @@
 # hop-godot
 
-A Godot 4 GDExtension that integrates the [hop](extern/hop/) physics engine as a `PhysicsServer3D` backend. Once enabled, Godot's built-in physics nodes (`RigidBody3D`, `StaticBody3D`, `CharacterBody3D`, etc.) run on hop instead of GodotPhysics.
+A Godot 4 GDExtension that integrates the [hop](https://github.com/alanfischer/hop/) physics engine as a `PhysicsServer3D` backend. Once enabled, Godot's built-in physics nodes (`RigidBody3D`, `StaticBody3D`, `CharacterBody3D`, etc.) run on hop instead of GodotPhysics.
 
 ## Prerequisites
 

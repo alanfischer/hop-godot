@@ -984,6 +984,43 @@ static void test_push_out_will_not_exit_against_the_sweep() {
 	printf("  push_out_will_not_exit_against_the_sweep ok\n");
 }
 
+// What `depth` MEANS, against geometry whose expanded face is known by construction.
+//
+// Every misreading of a depth in play has come from checking it against one axis while the
+// governing surface was on another, so this pins the contract on a single-face fixture
+// where there is nothing else to confuse it: zero while the hull is genuinely clear, and
+// the true penetration less the stuck band plus the caller's margin once it is inside. In
+// particular a hull merely NEAR a wall must report nothing — a positive depth out there
+// would have the caller correcting a body that is not touching anything.
+static void test_reported_depth_is_the_true_penetration() {
+	// A slab filling x <= 0. In hull 1 its expanded face sits at GoldSrc x = +16, so a
+	// hull-1 trace point is free above that and inside below it.
+	const double mins[3] = { -4096, -4096, -4096 }, maxs[3] = { 0, 4096, 4096 };
+	auto t = load(make_box_map(mins, maxs));
+	auto s = make_box_solid(0.4, 0.9, 0.4);  // 32 x 32 x 72 -> hull 1, centre origin
+
+	for (double gx : { 20.0, 18.0, 17.0 }) {
+		hop::collision<T> c = sweep(*t, s, vec((T)(-gx * SCALE), 0, 0), vec(0, 0, 0), (T)0.01);
+		assert(c.depth == T {} && "a hull clear of the wall must report no depth");
+	}
+	// Exactly on the expanded face: not penetrating, so zero at zero margin, and one
+	// margin's worth for a caller that asked for a speculative shell.
+	assert(approx(sweep(*t, s, vec((T)(-16.0 * SCALE), 0, 0), vec(0, 0, 0), T {}).depth / SCALE,
+			0.0, 0.01));
+	assert(approx(sweep(*t, s, vec((T)(-16.0 * SCALE), 0, 0), vec(0, 0, 0), (T)0.01).depth / SCALE,
+			0.4, 0.01) && "0.01 m is 0.4 units at WizardWars' scale");
+	// Inside: the true penetration, less the band a resting body is deliberately left in,
+	// plus whatever margin the caller asked for.
+	for (double gx : { 15.0, 14.0, 12.0 }) {
+		const double pen = 16.0 - gx;
+		assert(approx(sweep(*t, s, vec((T)(-gx * SCALE), 0, 0), vec(0, 0, 0), T {}).depth / SCALE,
+				pen - hopbsp::STUCK_SLOP, 0.02));
+		assert(approx(sweep(*t, s, vec((T)(-gx * SCALE), 0, 0), vec(0, 0, 0), (T)0.01).depth / SCALE,
+				pen - hopbsp::STUCK_SLOP + 0.4, 0.02));
+	}
+	printf("  reported_depth_is_the_true_penetration ok\n");
+}
+
 // The up axis keeps the shortest-exit rule whatever the model is doing, because there the
 // old rule is already right: a mover is nearly always a hair inside the surface it STANDS
 // on, and the short way out is up. A descending deck is receding from its rider rather
@@ -1564,6 +1601,7 @@ int main() {
 	test_deep_overlap_is_nudged_not_launched();
 	test_push_out_picks_a_direction_that_exits();
 	test_push_out_will_not_exit_against_the_sweep();
+	test_reported_depth_is_the_true_penetration();
 	test_push_out_ignores_the_models_motion_on_the_up_axis();
 	test_hull0_box_lands_on_the_floor();
 	test_hull0_box_stops_at_its_own_width();

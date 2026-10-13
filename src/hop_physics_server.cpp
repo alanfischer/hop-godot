@@ -100,6 +100,18 @@ static void record_owner_motion(HopBodyData *body, const Transform3D &from,
 	body->hop_motion.angular_step = angular;
 }
 
+// How far a mover carried the point `at` over its last step: its own displacement plus the
+// rotation about its origin. The same quantity hopbsp::hull_push_out reads as `prefer`,
+// asked here by the one caller that has to ACT on it rather than filter with it.
+static Vector3 carrier_step_at(const HopBodyData *carrier, const Vector3 &at) {
+	if (carrier == nullptr || !carrier->hop_motion.valid) return Vector3();
+	if (carrier->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return Vector3();
+	const Vector3 origin = to_godot(carrier->hop_motion.origin);
+	const Vector3 linear = to_godot(carrier->hop_motion.linear_step);
+	const Vector3 angular = to_godot(carrier->hop_motion.angular_step);
+	return linear + angular.cross(at - origin);
+}
+
 // ============================================================
 // Shape API
 // ============================================================
@@ -1460,6 +1472,13 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	depen_hint.active = true;
 
 	const int MAX_RECOVER_ITERS = 4;
+	// The body this one is most deeply inside, over every recovery probe — the best
+	// available answer to "what is it buried in" if the recovery finds no way out (see
+	// the buried clause near the end). Deepest rather than last seen: with two movers
+	// overlapping one body, the one it is furthest inside is the one carrying it, and
+	// report order is arbitrary.
+	HopBodyData *buried_in = nullptr;
+	float buried_depth = -1.0f;
 	for (int i = 0; i < MAX_RECOVER_ITERS; ++i) {
 		Vector3 test_pos = p_from.origin + recover;
 		body->hop_solid->set_position(to_hop(test_pos));
@@ -1486,7 +1505,16 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		// margin of overshoot is what used to ping-pong a body between opposing faces.
 		float depth = to_godot_float(overlap.depth);
 		Vector3 n = to_godot(overlap.normal);
-		if (n == Vector3()) break;
+		if (n == Vector3()) {
+			// "You are inside something and I cannot tell you which way out." Measured,
+			// this report carries no collider of its own, which is why `buried_in` is
+			// tracked from every overlap above rather than read off here — but take it
+			// when it is there.
+			if (buried_in == nullptr)
+				buried_in = body_of(overlap.collider, overlap.collidee,
+				                    body->hop_solid.get());
+			break;
+		}
 		if (depth <= touch_eps) {
 			// Touching, not embedded: nothing to depenetrate, but it must not be left
 			// exactly ON the plane either (see `touch_eps`).
@@ -1502,10 +1530,21 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			// Breaking here made recovery a coin flip on report order. It still
 			// terminates — the next probe no longer overlaps the surface just cleared.
 			if (depth >= 0.0f) recover += n * (depth + touch_eps);
+			if (depth > buried_depth) {
+				if (HopBodyData *t = body_of(overlap.collider, overlap.collidee,
+				                            body->hop_solid.get())) {
+					buried_depth = depth;
+					buried_in = t;
+				}
+			}
 			continue;
 		}
 
 		HopBodyData *other = body_of(overlap.collider, overlap.collidee, body->hop_solid.get());
+		if (other != nullptr && depth > buried_depth) {
+			buried_depth = depth;
+			buried_in = other;
+		}
 		if (n.dot(up_dir) > 0.7f) {
 			if (depth > support_depth) {
 				support_depth = depth;
@@ -1745,11 +1784,33 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			// wall arrived and took them. Freeing it outright is the bug at the top of
 			// this clause — "I cannot see" read as "nothing is there".
 			//
-			// So let it move, but only by a margin. That is always enough to work
-			// itself free over a few frames, and never enough to cross a surface it
-			// cannot see. The recovery re-probes next frame from wherever it lands.
+			// There is one motion that needs no sweep to be safe: the motion the thing
+			// it is buried IN is making. A body moving WITH a solid has no motion
+			// relative to that solid, so it cannot be driven through any surface of it
+			// — the geometry it cannot see does not move past it. That is GoldSrc's
+			// answer too, and not a trace at all: SV_PushRotate adds the pusher's step
+			// to its riders by assignment and only asks afterwards whether they are
+			// stuck. On ww_golem it is the difference between a rider the walking golem
+			// carries and one it strides out from under.
+			//
+			// So the budget is how far this body's carrier took this point, measured
+			// along the direction asked for — never more than the caller requested, and
+			// never more than the carrier itself travelled that way. A request larger
+			// than the carrier's step is the carrier's share plus the body's own input,
+			// and only the carrier's share is covered by the argument above: the rest
+			// IS motion relative to the solid and stays unverified. That is what
+			// separates this from freeing the move outright, which measured as a rider
+			// walking clean through the cockpit's rear wall.
+			//
+			// With no carrier, or a carrier going nowhere, this falls back to the
+			// margin that was here before. Note that the margin alone never moved
+			// anything: step (3) below subtracts a whole margin from this same cap, so
+			// `safe` came out exactly zero and the "work itself free over a few frames"
+			// this clause used to promise never happened.
 			const float cap = std::max(margin, 1e-3f);
-			unsafe = std::min(1.0f, cap / motion_len);
+			const Vector3 step = carrier_step_at(buried_in, from_pos);
+			const float along = step.dot(p_motion) / motion_len;
+			unsafe = std::min(1.0f, std::max(cap, along) / motion_len);
 			probe_time = probe_len > 1e-6f
 				? std::min(1.0f, (unsafe * motion_len) / probe_len) : unsafe;
 		}

@@ -39,6 +39,81 @@ static void apply_contact_mode(HopBodyData *body) {
 			: hop::contact_mode::speculative);
 }
 
+// A placement is not a carry. Past these per-frame thresholds a kinematic body did not
+// travel, it was put somewhere — a respawn, a level load, a bone posed before a rig is
+// handed over — and treating that as motion imparts a one-frame spike to everything
+// touching it. 0.5 rad/frame is ~1800 deg/s, far above any real platform.
+static constexpr float KINEMATIC_TELEPORT_DIST2 = 10.0f * 10.0f;
+static constexpr float KINEMATIC_TELEPORT_ANGLE = 0.5f;
+
+// Did this pose pair place the body rather than move it? Both consumers — the recorded
+// step and the sweep that prescribes its velocity — have to answer this the same way, so
+// they ask here rather than each spelling out the two comparisons.
+static bool is_placement(const Vector3 &d, hop_scalar angle) {
+	return d.length_squared() > KINEMATIC_TELEPORT_DIST2 ||
+	       to_godot_float(angle) > KINEMATIC_TELEPORT_ANGLE;
+}
+
+// The world-frame rotation a body turned between two poses, as axis*angle — the
+// displacement, not a rate. Zero when it did not turn.
+//
+// The bases are compared BEFORE converting: to_hop_orientation orthonormalizes and
+// re-quaternionizes (four square roots each), so testing the hop matrices would pay eight
+// of them to discover there was nothing to do. Most movers only translate.
+static hop::vec3<hop_scalar> rotation_step(const Basis &from, const Basis &to,
+                                           hop_scalar *out_angle = nullptr) {
+	if (out_angle) *out_angle = hop_scalar {};
+	if (to == from) return hop::vec3<hop_scalar>{};
+	// dR = R_new * R_oldᵀ, then axis*angle off the quaternion.
+	hop::mat3<hop_scalar> old_RT, dR;
+	hop::transpose(old_RT, to_hop_orientation(from));
+	hop::mul(dR, to_hop_orientation(to), old_RT);
+	hop::quat<hop_scalar> dq;
+	hop::set_quat_from_mat3(dq, dR);
+	hop::vec3<hop_scalar> axis, step;
+	const hop_scalar angle = hop::get_axis_angle_from_quat(
+	    axis, dq, hop::scalar_traits<hop_scalar>::default_epsilon());
+	if (out_angle) *out_angle = angle;
+	hop::mul(step, axis, angle);
+	return step;
+}
+
+// Record how far a kinematic body moved over one step, from the two poses it moved
+// between — see hopbsp::owner_motion for what reads it.
+//
+// WHEN this is recorded is the whole point, and it is recorded where the new pose ARRIVES
+// (_body_set_state) rather than after the step. It is the same rule the solid's own
+// position already follows there, and for the same reason: a query that runs in the frame
+// a mover moved has to be answered against where that mover now is, and against the step
+// it just took. Recording after the step leaves every such query reading the PREVIOUS
+// frame's motion — benign while a mover holds its course, and sign-inverted the moment it
+// reverses. Measured on ww_golem: at the tick the stride's bob turns around, a rider in
+// the cockpit was told the deck was still falling at 0.83 a tick while it was in fact
+// rising at 0.83.
+//
+// The route this replaces went through the published velocities (linear_velocity * dt).
+// That was not the error it looks like — the velocity is itself the measured delta over
+// the same dt, so it round-tripped — but it put the recording a frame late, and it spent a
+// rate on the clock to get back a displacement that was already in hand. Both components
+// now come off the one transform pair, so the linear and angular halves cannot disagree.
+static void record_owner_motion(HopBodyData *body, const Transform3D &from,
+                                const Transform3D &to) {
+	body->hop_motion.origin = to_hop(to.origin);
+	body->hop_motion.valid = true;
+
+	const Vector3 d = to.origin - from.origin;
+	hop_scalar angle {};
+	const hop::vec3<hop_scalar> angular = rotation_step(from.basis, to.basis, &angle);
+
+	if (is_placement(d, angle)) {
+		body->hop_motion.linear_step = hop::vec3<hop_scalar>{};
+		body->hop_motion.angular_step = hop::vec3<hop_scalar>{};
+		return;
+	}
+	body->hop_motion.linear_step = to_hop(d);
+	body->hop_motion.angular_step = angular;
+}
+
 // ============================================================
 // Shape API
 // ============================================================
@@ -1044,6 +1119,14 @@ void HopPhysicsServer::_body_set_state(const RID &p_body, PhysicsServer3D::BodyS
 		case PhysicsServer3D::BODY_STATE_TRANSFORM: {
 			Transform3D old_transform = body->transform;
 			body->transform = p_value;
+			// The step this mover is taking, known the moment its new pose is. A rider
+			// querying later in this same frame has to be answered against it, not
+			// against last frame's (see record_owner_motion). Measured from the start of
+			// the pending sweep, so repeated sets in one frame stay relative to it.
+			// Only a body with a solid can carry anything, and only a kinematic one is
+			// read as a carrier, so nothing else pays for this.
+			if (body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC && body->hop_solid)
+				record_owner_motion(body, body->sweep_prev_transform, body->transform);
 			if (body->hop_solid) {
 				// Place the solid now, in every mode. A KINEMATIC body is still swept
 				// by _step rather than teleported — _step keeps the start point of the
@@ -1391,6 +1474,8 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	// ww_golem cockpit case recorded there. Cleared below so the motion cast, the ground
 	// probe and every public query are answered exactly as they were before.
 	depen_hint.active = true;
+	depen_hint.buried = false;
+	depen_hint.buried_step = hop::vec3<hop_scalar>{};
 
 	const int MAX_RECOVER_ITERS = 4;
 	for (int i = 0; i < MAX_RECOVER_ITERS; ++i) {
@@ -1419,7 +1504,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		// margin of overshoot is what used to ping-pong a body between opposing faces.
 		float depth = to_godot_float(overlap.depth);
 		Vector3 n = to_godot(overlap.normal);
-		if (n == Vector3()) break;
+		if (n == Vector3()) break;  // in solid with no way out; see the buried clause
 		if (depth <= touch_eps) {
 			// Touching, not embedded: nothing to depenetrate, but it must not be left
 			// exactly ON the plane either (see `touch_eps`).
@@ -1678,11 +1763,37 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			// wall arrived and took them. Freeing it outright is the bug at the top of
 			// this clause — "I cannot see" read as "nothing is there".
 			//
-			// So let it move, but only by a margin. That is always enough to work
-			// itself free over a few frames, and never enough to cross a surface it
-			// cannot see. The recovery re-probes next frame from wherever it lands.
+			// There is one motion that needs no sweep to be safe: the motion the thing
+			// it is buried IN is making. A body moving WITH a solid has no motion
+			// relative to that solid, so it cannot be driven through any surface of it
+			// — the geometry it cannot see does not move past it. That is GoldSrc's
+			// answer too, and not a trace at all: SV_PushRotate adds the pusher's step
+			// to its riders by assignment and only asks afterwards whether they are
+			// stuck. On ww_golem it is the difference between a rider the walking golem
+			// carries and one it strides out from under.
+			//
+			// So the budget is how far the thing that swallowed it took this point,
+			// measured along the direction asked for — never more than the caller
+			// requested, and never more than the carrier itself travelled that way. A
+			// request larger than the carrier's step is the carrier's share plus the
+			// body's own input, and only the carrier's share is covered by the argument
+			// above: the rest IS motion relative to the solid and stays unverified.
+			// That is what separates this from freeing the move outright, which measured
+			// as a rider walking clean through the cockpit's rear wall.
+			//
+			// The step is whatever the traceable reported when it answered "no way out"
+			// (see hopbsp::depen_hint) — the model that actually swallowed the point,
+			// exactly, rather than a guess reconstructed from the recovery contacts.
+			// With nothing reported, or a carrier going nowhere, this falls back to the
+			// margin that was here before. Note that the margin alone never moved
+			// anything: step (3) below subtracts a whole margin from this same cap, so
+			// `safe` came out exactly zero and the "work itself free over a few frames"
+			// this clause used to promise never happened.
 			const float cap = std::max(margin, 1e-3f);
-			unsafe = std::min(1.0f, cap / motion_len);
+			const Vector3 step =
+				depen_hint.buried ? to_godot(depen_hint.buried_step) : Vector3();
+			const float along = step.dot(p_motion) / motion_len;
+			unsafe = std::min(1.0f, std::max(cap, along) / motion_len);
 			probe_time = probe_len > 1e-6f
 				? std::min(1.0f, (unsafe * motion_len) / probe_len) : unsafe;
 		}
@@ -2405,9 +2516,6 @@ void HopPhysicsServer::_step(float p_step) {
 	{
 		float fdt = p_step > 0.0f ? p_step : (1.0f / 60.0f);
 		hop_scalar inv_dt = scalar_from_float<hop_scalar>(1.0f / fdt);
-		// Teleport threshold: if the requested delta exceeds 10 m treat as a
-		// discontinuous jump (respawn, level load, etc.) and snap instead.
-		const float teleport_dist2 = 10.0f * 10.0f;
 
 		body_owner.for_each([&](HopBodyData *body) {
 			if (!body->hop_solid || body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
@@ -2433,32 +2541,16 @@ void HopPhysicsServer::_step(float p_step) {
 			// (world-frame delta) → axis-angle → ω = axis·θ/dt. hop snapshots
 			// orientation per frame rather than integrating ω, so we also commit
 			// the new orientation here; the post-step snap-back zeroes ω again.
-			hop::mat3<hop_scalar> old_R = to_hop_orientation(body->sweep_prev_transform.basis);
 			hop::mat3<hop_scalar> new_R = to_hop_orientation(body->transform.basis);
-			hop::vec3<hop_scalar> omega;  // zero unless the body actually rotated
 			hop_scalar angle {};
-			if (new_R != old_R) {
-				// Most kinematic bodies only translate, so skip the quat / axis-angle
-				// (two sqrts) whenever the orientation is unchanged frame-to-frame.
-				hop::mat3<hop_scalar> old_RT;
-				hop::transpose(old_RT, old_R);
-				hop::mat3<hop_scalar> dR;
-				hop::mul(dR, new_R, old_RT);
-				hop::quat<hop_scalar> dq;
-				hop::set_quat_from_mat3(dq, dR);
-				hop::vec3<hop_scalar> axis;
-				angle = hop::get_axis_angle_from_quat(
-				    axis, dq, hop::scalar_traits<hop_scalar>::default_epsilon());
-				hop::mul(omega, axis, angle * inv_dt);
-			}
+			hop::vec3<hop_scalar> omega;  // zero unless the body actually rotated
+			hop::mul(omega, rotation_step(body->sweep_prev_transform.basis,
+			                              body->transform.basis, &angle), inv_dt);
 
-			// A rotation past this per-frame angle is a placement snap, not a smooth
-			// spin (0.5 rad/frame ≈ 1800°/s — far above any real platform), so it is
-			// treated as discontinuous like a large translation: it would otherwise
-			// impart a one-frame ω spike on the frame a body is placed pre-rotated.
-			const float angular_teleport = 0.5f;
-			bool jump = dx * dx + dy * dy + dz * dz > teleport_dist2 ||
-			            to_godot_float(angle) > angular_teleport;
+			// Snap instead of sweeping for a placement — same question, same answer as
+			// the recorded step (see is_placement).
+			bool jump = is_placement(body->transform.origin -
+			                         body->sweep_prev_transform.origin, angle);
 
 			// Orientation is committed every frame regardless (hop snapshots it and
 			// never integrates it); only position / velocity / ω differ by branch.
@@ -2506,17 +2598,19 @@ void HopPhysicsServer::_step(float p_step) {
 		body->hop_solid->set_position(to_hop(body->transform.origin));
 		body->hop_solid->set_velocity(hop::vec3<hop_scalar>{});
 		body->hop_solid->set_angular_velocity(hop::vec3<hop_scalar>{});
+		// _body_set_state recorded the step for every mover that pushed a transform this
+		// frame, from this same pair, so re-recording would recompute a bit-identical
+		// answer. The one case left is a mover that has STOPPED and will set no transform
+		// again: there the pair is equal, the step is zero by construction, and this is
+		// what zeroes it. Written out rather than re-derived so a stopped mover costs a
+		// transform compare instead of a quaternion.
+		if (body->transform == body->sweep_prev_transform) {
+			body->hop_motion.origin = to_hop(body->transform.origin);
+			body->hop_motion.linear_step = hop::vec3<hop_scalar>{};
+			body->hop_motion.angular_step = hop::vec3<hop_scalar>{};
+			body->hop_motion.valid = true;
+		}
 		body->sweep_prev_transform = body->transform;  // this step's target is the next one's start
-		// The same motion as a per-frame displacement, for the BSP push-out's direction:
-		// a mover buried in this body is pushed the way this body is going, and only
-		// deeper than this body could have reached in one frame (see hopbsp::owner_motion).
-		// Derived from the published velocities rather than a second pose diff so the two
-		// cannot disagree; last_step is the interval they were divided by.
-		const float mdt = last_step > 0.0f ? last_step : (1.0f / 60.0f);
-		body->hop_motion.linear_step = to_hop(body->linear_velocity * mdt);
-		body->hop_motion.angular_step = to_hop(body->angular_velocity * mdt);
-		body->hop_motion.origin = to_hop(body->transform.origin);
-		body->hop_motion.valid = true;
 	});
 
 	// Sync positions from hop to Godot

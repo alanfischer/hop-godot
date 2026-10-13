@@ -666,10 +666,15 @@ inline double hull_inside_distance(const hull &h, int root, const double p[3],
 // motion. The displacement is that scale; a velocity would need the step length to
 // recover it, which this layer has no business knowing.
 //
-// Not a pose pair, which cannot be read at all: a mover's transform write reaches the
-// server at the next flush, so the pose a query is answered from and the pose recorded at
-// the last step are the same instant, and their difference is structurally zero. The
-// displacement _step derives from that pair IS the difference, a frame late and nonzero.
+// Derived from a pose PAIR, and recorded where the new pose arrives rather than after the
+// step. An earlier note here argued the pair could not be read at all — that a mover's
+// transform write and the query that reads it are the same instant, so their difference is
+// structurally zero. That is not so: the write lands in _body_set_state, which runs during
+// _physics_process, and the pair there straddles the step the mover is taking right now.
+// Recording it after the step instead is what made the difference useless, because every
+// query in the next frame then read the PREVIOUS step — benign while a mover holds its
+// course and sign-inverted the moment it reverses. Measured on ww_golem at the tick the
+// stride's bob turns around: the deck rose 0.83 and this said it was falling 0.83.
 template <typename T>
 struct owner_motion {
 	bool valid = false;
@@ -681,9 +686,23 @@ struct owner_motion {
 // Set for the span of a depenetration probe and clear everywhere else, so a swept query,
 // a ray or a public overlap test is answered exactly as it was before. One instance,
 // owned by the server and pointed at by every traceable.
+//
+// It carries one answer back out, because the caller cannot recover it from the result:
+// a traceable that finds the queried point in solid with no way out knows WHICH model
+// swallowed it and how far that model just carried the point, and the normal/depth/time
+// channel has no room for either. Reporting it here keeps the one derivation — the same
+// `point_step` the push-out filters with below is the step the caller acts on, so a
+// filter and an actuator cannot drift apart. The result channel also cannot be trusted
+// to carry it: a directionless contact loses to any real one reported at the same time
+// (hop::merge_collision adopts the first and, when averaging, blends the zero away).
 template <typename T>
 struct depen_hint {
 	bool active = false;
+	// Written only by a traceable answering "in solid, no way out". World space, over the
+	// owner's last step, at the queried point. First writer wins: with two models each
+	// swallowing the point, either is a defensible carrier and report order is arbitrary.
+	bool buried = false;
+	hop::vec3<T> buried_step;
 };
 
 // Is this push-out answer pointing back into the surface the mover was swept through?
@@ -934,7 +953,7 @@ public:
 	// server owns the hint). Leaving them unset costs nothing and keeps every answer
 	// exactly what it was — see `prefer` on hopbsp::hull_push_out.
 	void set_depen_context(const hopbsp::owner_motion<T> *owner,
-	                       const hopbsp::depen_hint<T> *hint) {
+	                       hopbsp::depen_hint<T> *hint) {
 		owner_motion_ = owner;
 		depen_hint_ = hint;
 	}
@@ -1230,12 +1249,17 @@ public:
 		// static brush and a stopped door, and there the shortest-exit rule stands alone.
 		double prefer[3];
 		const double *prefer_ptr = nullptr;
+		// The same step in world space, kept for the buried report below: `prefer` is
+		// scaled and re-axed into the model's GoldSrc frame, which the caller cannot undo.
+		hop::vec3<T> point_step;
+		bool point_step_valid = false;
 		if (depen_hint_ != nullptr && depen_hint_->active &&
 		    owner_motion_ != nullptr && owner_motion_->valid) {
-			hop::vec3<T> arm, spin, point_step;
+			hop::vec3<T> arm, spin;
 			hop::sub(arm, seg.origin, owner_motion_->origin);
 			hop::cross(spin, owner_motion_->angular_step, arm);
 			hop::add(point_step, owner_motion_->linear_step, spin);
+			point_step_valid = true;
 			hop::vec3<T> local_step, ignored;
 			to_local(point_step, hop::vec3<T> {}, hop::vec3<T> {}, orientation, local_step, ignored);
 			godot_to_gs(local_step, prefer);
@@ -1270,6 +1294,19 @@ public:
 		const bool touching_only = inside && !zero_dir && depth <= hopbsp::STUCK_SLOP;
 
 		if ((point_solid && !touching_only) || zero_dir) {
+			// This model CONTAINS the queried point — not merely touches it, which
+			// `touching_only` has already taken out. So the step it just took at this
+			// point is a displacement the point can be given without any sweep: it moves
+			// with the solid, and no surface of that solid passes it. That is the only
+			// motion a caller who can verify nothing from in here can still grant, and
+			// the result channel has no room for it, so it goes on the hint (see
+			// depen_hint). Containment is the whole predicate — how DEEP it is inside, and
+			// whether the push-out happened to find a way out, are both beside the point.
+			if (point_solid && point_step_valid && depen_hint_ != nullptr &&
+			    !depen_hint_->buried) {
+				depen_hint_->buried = true;
+				depen_hint_->buried_step = point_step;
+			}
 			if (inside) {
 				double cap = 0;
 				for (int i = 0; i < 3; ++i)
@@ -1284,9 +1321,8 @@ public:
 				// In solid, with no way out that the push-out could find. Report the
 				// overlap with no direction and no depth: "you are inside something and
 				// I cannot tell you which way out" is a different answer from "nothing
-				// is there", and the caller has to be able to tell them apart. It reads
-				// the zero normal and creeps rather than committing to a step it has no
-				// information about.
+				// is there", and the caller has to be able to tell them apart.
+				//
 				n[0] = n[1] = n[2] = 0;
 				depth = 0;
 			} else {
@@ -1471,7 +1507,7 @@ public:
 private:
 	// Set by set_depen_context; null unless the server wired them up.
 	const hopbsp::owner_motion<T> *owner_motion_ = nullptr;
-	const hopbsp::depen_hint<T> *depen_hint_ = nullptr;
+	hopbsp::depen_hint<T> *depen_hint_ = nullptr;
 	// GoldSrc (Z-up, inches) ↔ Godot (Y-up, metres). The axis swap is its own
 	// inverse and has determinant +1, so directions use the same map both ways and
 	// normals need no special handling.

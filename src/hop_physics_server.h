@@ -47,6 +47,8 @@ public:
 
 	bool active = true;
 	bool flushing_queries = false;
+	// The last step's dt, for PhysicsDirectBodyState3D::get_step only. Nothing derives
+	// motion from a rate times this — see record_owner_motion.
 	float last_step = 1.0f / 60.0f;
 
 	// Helpers

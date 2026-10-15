@@ -2,6 +2,15 @@
 
 A Godot 4 GDExtension that integrates the [hop](https://github.com/alanfischer/hop/) physics engine as a `PhysicsServer3D` backend. Once enabled, Godot's built-in physics nodes (`RigidBody3D`, `StaticBody3D`, `CharacterBody3D`, etc.) run on hop instead of GodotPhysics.
 
+## Related projects
+
+Part of a set of Godot 4 libraries for GoldSrc-style games:
+
+- [goldsrc-godot](https://github.com/alanfischer/goldsrc-godot): BSP/MDL/SPR/WAD loading, PVS, hull data
+- **hop-godot**: hop physics as a `PhysicsServer3D` backend, with BSP hull traces
+- [pmove-godot](https://github.com/alanfischer/pmove-godot): GoldSrc player movement and client prediction
+- [goldnet-godot](https://github.com/alanfischer/goldnet-godot): snapshot replication behind Godot's `MultiplayerAPI`
+
 ## Prerequisites
 
 - Godot 4.1+

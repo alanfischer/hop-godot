@@ -147,3 +147,7 @@ Both exit non-zero on failure.
 
 Rigid body simulation, character movement, shape/ray queries, `body_test_motion`, and
 GoldSrc BSP hull collision work. Soft bodies and some joint types are stubbed out.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

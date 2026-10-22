@@ -714,6 +714,7 @@ void HopPhysicsServer::add_body_to_space(HopBodyData *body, HopSpaceData *space)
 		body->create_hop_solid();
 	}
 	body->sync_to_hop();
+	body->stepped = false;  // a new space's first step has not run yet (see _flush_queries)
 	rebuild_body_shapes(body);
 	space->simulator->add_solid(body->hop_solid);
 	// add_solid stamped the space default (speculative). The player (KINEMATIC
@@ -832,6 +833,8 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body) return;
 	const bool was_kinematic = body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC;
+	if (p_mode != body->mode)
+		body->stepped = false;  // e.g. an unfrozen item: its last stepped pose is stale
 	body->mode = p_mode;
 
 	// Becoming KINEMATIC: the first sweep starts from where the body is now, not from
@@ -2629,6 +2632,14 @@ void HopPhysicsServer::_flush_queries() {
 	body_owner.for_each([&](HopBodyData *body) {
 		if (!body->state_sync_callback.is_valid()) return;
 		if (body->is_static_or_kinematic() && body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
+		// A dynamic body that has not been stepped has nothing to report, and reporting it
+		// anyway is harmful. Godot runs this flush BEFORE it flushes queued node-transform
+		// notifications, so a body spawned between ticks — add_child, then position it, as a
+		// projectile fired from _input does — has its new pose still queued on the node while
+		// the server holds the pose it entered the tree with. Calling back here would write
+		// that stale pose onto the node and drop the queued one: the projectile restarts from
+		// the world origin. GodotPhysics only calls back bodies a step moved; so do we.
+		if (!body->is_static_or_kinematic() && !body->stepped) return;
 
 		if (!body->direct_state) {
 			body->direct_state = memnew(HopDirectBodyState);

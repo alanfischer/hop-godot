@@ -77,6 +77,10 @@ struct HopBodyData {
 	uint32_t user_flags = 0;
 
 	Callable state_sync_callback;
+	// Set by sync_from_hop: `transform` now holds a pose the simulation produced. Until a
+	// step has run, `transform` is only what the node last pushed, which can lag the node
+	// (see _flush_queries), so a dynamic body is not synced back before then.
+	bool stepped = false;
 	Callable force_integration_callback;
 	Variant force_integration_userdata;
 

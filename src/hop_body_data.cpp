@@ -91,6 +91,7 @@ void HopBodyData::sync_from_hop() {
 	if (!hop_solid) return;
 	if (is_static_or_kinematic()) return;
 
+	stepped = true;
 	transform.origin = to_godot(hop_solid->get_position());
 	linear_velocity = to_godot(hop_solid->get_velocity());
 	// A body that spins dynamically (inv_inertia != 0) has hop integrate

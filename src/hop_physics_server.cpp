@@ -717,9 +717,8 @@ void HopPhysicsServer::add_body_to_space(HopBodyData *body, HopSpaceData *space)
 	body->stepped = false;  // a new space's first step has not run yet (see _flush_queries)
 	rebuild_body_shapes(body);
 	space->simulator->add_solid(body->hop_solid);
-	// add_solid stamped the space default (speculative). The player (KINEMATIC
-	// CharacterBody3D) resolves via sweep-and-slide instead; dynamic/static bodies
-	// keep speculative. Re-applied here in case mode was set before the solid existed.
+	// The player (KINEMATIC CharacterBody3D) resolves via sweep-and-slide; dynamic/static
+	// bodies use speculative. Applied here in case mode was set before the solid existed.
 	apply_contact_mode(body);
 	space->bvh_manager.add_solid(body->hop_solid.get(),
 		body->mode == PhysicsServer3D::BODY_MODE_STATIC);

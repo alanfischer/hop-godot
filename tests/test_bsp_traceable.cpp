@@ -1624,7 +1624,7 @@ static void test_a_rod_on_a_bsp_floor_is_held_at_both_ends_and_sleeps() {
 }
 
 // Hang the box off the edge of the floor brush and the corners over thin air must NOT be
-// reported. This is the whole reason each corner is PROBED against the real hull rather
+// reported; the edge they hang from is. This is the whole reason each corner is PROBED against the real hull rather
 // than clipped to the contact plane: an infinite plane would hold an overhanging body up
 // on nothing and it would never tip.
 static void test_corners_over_a_ledge_are_not_reported() {
@@ -1640,12 +1640,18 @@ static void test_corners_over_a_ledge_are_not_reported() {
 	for (int i = 0; i < 20; ++i)
 		sim->update((T)(1.0 / 60.0));
 	int points = 0;
-	for (int k = 0; k < box->get_touch_count(); ++k)
-		points += box->get_touch(k).point_count;
+	for (int k = 0; k < box->get_touch_count(); ++k) {
+		const auto & touch = box->get_touch(k);
+		points += touch.point_count;
+		for (int p = 0; p < touch.point_count; ++p)
+			assert(touch.points[p].impact.x <= edge + (T)0.001 && "the corners hanging over the edge are not");
+	}
 	assert(points >= 1 && "the supported half is still in contact");
+	// With its weight over the floor, the ledge holds it: points at the edge, not just
+	// the two corners behind its centre of mass.
 	if (hop::max_manifold_points > 1)
-		assert(points <= 2 && "but the corners hanging over the edge are not");
-	printf("  test_corners_over_a_ledge_are_not_reported ok (%d points at the edge)\n", points);
+		assert(points >= 3 && "and the edge itself holds it");
+	printf("  test_corners_over_a_ledge_are_not_reported ok (%d points, none past the edge)\n", points);
 }
 
 int main() {

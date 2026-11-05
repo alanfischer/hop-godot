@@ -1,6 +1,7 @@
 #pragma once
 
 #include <hop/hop.h>
+#include <type_traits>
 #include <vector>
 
 #include "hop_triangle_collision.h"
@@ -41,7 +42,7 @@ public:
 			// Raw map_data height (along Y), scaled — exactly as Godot's
 			// HeightMapShape3D interprets it. Any "ground at gray 0.5" convention
 			// belongs in the terrain data / shape transform, not here.
-			T h = to_hop_scalar(heights[k]) * scale.y;
+			T h = from_float(heights[k]) * scale.y;
 			heights_[k] = h;
 			if (k == 0 || h < min_h_) min_h_ = h;
 			if (k == 0 || h > max_h_) max_h_ = h;
@@ -110,7 +111,7 @@ public:
 	                 const hop::mat3<T> & orientation,
 	                 const hop::segment<T> & seg, T margin) override {
 		static const hop::mat3<T> identity;
-		if (orientation != identity) {
+		if (orientation != identity || hoptri::turned_mover(s)) {
 			// Rotated grid: the shared driver handles the frame transform + mover
 			// spine reduction; we supply only the cell broadphase over the local AABB.
 			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin, seam_tol_,
@@ -181,6 +182,13 @@ private:
 	T min_h_ {}, max_h_ {};
 	// Seam tolerance for the non-capsule support-plane path (matches the trimesh).
 	T seam_tol_ = tr::from_int(1) / tr::from_int(100);
+
+	static T from_float(float f) {
+		if constexpr (std::is_floating_point_v<T>)
+			return T(f);
+		else
+			return T::from_float(f);
+	}
 
 	T height_at(int i, int j) const { return heights_[j * width_ + i]; }
 

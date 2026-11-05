@@ -41,3 +41,4 @@ function(add_hop_godot_bench name)
 endfunction()
 
 add_hop_godot_bench(bench_bsp_traceable)
+add_hop_godot_test(test_heightfield_traceable)

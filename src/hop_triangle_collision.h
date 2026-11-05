@@ -242,19 +242,47 @@ inline void recover_support_plane(hop::shape<T> * sh, const hop::vec3<T> & local
 	}
 }
 
-// Swept cast of a non-capsule shape against a triangle.
+// Time of impact of a support-plane sweep: the shape's centre `center` reaches the
+// triangle's plane (face normal `face_n` toward the centre, through `a`) pushed out by
+// the shape's extent `expand` and the query `margin`. An overlap of that inflated
+// surface is reported at time 0 with its depth, as conservative_advance does for the
+// capsule; otherwise only motion into the face hits. False when there is no hit, or
+// it would not beat what `result` already holds (earliest, then deepest).
+template <typename T>
+inline bool support_plane_toi(const hop::vec3<T> & face_n, T expand, const hop::vec3<T> & center,
+                              const hop::vec3<T> & motion, const hop::vec3<T> & a, T margin,
+                              const hop::collision<T> & result, T & t, T & depth) {
+	using tr = hop::scalar_traits<T>;
+	const T tol = tr::max_val(contact_eps<T>(), tr::from_milli(1));
+	T sep = hop::dot(face_n, center) - (hop::dot(face_n, a) + expand + margin);
+	if (sep < -tol) {
+		t = T {};
+		depth = -sep;
+		return result.time > T {} || depth > result.depth;
+	}
+	T denom = hop::dot(face_n, motion);
+	if (denom >= T {})
+		return false; // not moving into this (body-facing) surface
+	t = sep / -denom;
+	if (t < T {})
+		t = T {};
+	depth = T {};
+	return t <= tr::one() && t < result.time;
+}
+
+// Swept cast of a non-capsule shape against a triangle, against the surface inflated by
+// `margin` like the capsule sweep: a shape already inside that shell is reported at
+// time 0 with the overlap as depth, whichever way it moves, so the solver can push it
+// out. Without the depth a body that sank past the margin was never pushed back and
+// kept sinking, a little more each tick.
 template <typename T>
 inline void sweep_support_plane(hop::shape<T> * sh, const hop::vec3<T> & local_origin,
                                 const hop::segment<T> & seg, const hop::vec3<T> & a, const hop::vec3<T> & b,
-                                const hop::vec3<T> & c, const hop::vec3<T> & normal, T seam_tol,
+                                const hop::vec3<T> & c, const hop::vec3<T> & normal, T margin, T seam_tol,
                                 hop::collision<T> & result) {
-	using tr = hop::scalar_traits<T>;
 	hop::vec3<T> face_n = normal;
 	if (hop::dot(normal, local_origin) - hop::dot(normal, a) < T {})
 		hop::neg(face_n, normal);
-	T denom = hop::dot(face_n, seg.direction);
-	if (denom >= T {})
-		return; // not moving into this (body-facing) surface
 	hop::vec3<T> neg_fn;
 	hop::neg(neg_fn, face_n);
 	hop::vec3<T> sup;
@@ -262,24 +290,20 @@ inline void sweep_support_plane(hop::shape<T> * sh, const hop::vec3<T> & local_o
 	// local_position/local_rotation, and this extent is measured from the SOLID's
 	// origin. (The capsule arms below already compose local_position by hand.)
 	hop::support_in_solid(sup, *sh, neg_fn);
-	T expand = hop::dot(sup, neg_fn);
-	T plane_d = hop::dot(face_n, a);
-	T expanded_d = plane_d + expand;
-	T t = (expanded_d - hop::dot(face_n, local_origin)) / denom;
-	if (t > tr::one() || t >= result.time)
+	T t, depth;
+	if (!support_plane_toi(face_n, hop::dot(sup, neg_fn), local_origin, seg.direction, a, margin, result, t, depth))
 		return;
-	if (t < T {})
-		t = T {};
 	hop::vec3<T> hit;
 	hop::mul(hit, seg.direction, t);
 	hop::add(hit, local_origin);
 	hop::vec3<T> proj;
-	T offset = hop::dot(face_n, hit) - plane_d;
+	T offset = hop::dot(face_n, hit) - hop::dot(face_n, a);
 	hop::vec3<T> n_scaled;
 	hop::mul(n_scaled, face_n, offset);
 	hop::sub(proj, hit, n_scaled);
 	if (point_near_triangle(proj, a, b, c, seam_tol)) {
 		result.time = t;
+		result.depth = depth;
 		hop::mul(result.point, seg.direction, t);
 		hop::add(result.point, seg.origin);
 		result.normal = face_n;
@@ -367,7 +391,7 @@ inline void sweep_shape_vs_triangle(hop::shape<T> * sh, const hop::vec3<T> & loc
 			hop::add(result.impact, ct, off);
 		}
 	} else {
-		sweep_support_plane(sh, local_origin, seg, a, b, c, face_n, seam_tol, result);
+		sweep_support_plane(sh, local_origin, seg, a, b, c, face_n, margin, seam_tol, result);
 	}
 }
 
@@ -411,6 +435,26 @@ inline bool mover_world_capsule(hop::solid<T> * s, hop::shape<T> * sh, const hop
 		return true;
 	}
 	return false;
+}
+
+// True when a mover's shapes are turned, by its solid or within it, and every one is a
+// kind trace_solid_rotated carries (box, sphere, capsule). The unturned paths measure
+// a shape as if it were unturned, so an unturned target sends such a mover through
+// trace_solid_rotated with an identity frame. Otherwise a tilted box resting on a
+// slope was sized as an axis-aligned one: pushed out too far on one side, not at all
+// on the other.
+template <typename T>
+inline bool turned_mover(hop::solid<T> * s) {
+	static const hop::mat3<T> identity;
+	bool turned = s->get_orientation() != identity;
+	for (const auto & sh : s->get_shapes()) {
+		const auto type = sh->get_type();
+		if (type != hop::shape_type::box && type != hop::shape_type::sphere && type != hop::shape_type::capsule)
+			return false;
+		if (sh->get_local_rotation() != identity)
+			turned = true;
+	}
+	return turned;
 }
 
 // Per-(spine, triangle) swept/recover, all expressed in the target's LOCAL
@@ -498,7 +542,6 @@ inline void obb_local_vs_triangle(const hop::vec3<T> & center_l, const hop::vec3
                                   const hop::vec3<T> & a, const hop::vec3<T> & b, const hop::vec3<T> & c,
                                   const hop::vec3<T> & normal, hop::collision<T> & result,
                                   bool & found, T & best_depth) {
-	using tr = hop::scalar_traits<T>;
 	// Orient the face normal toward the body (double-sided, like Godot concave).
 	hop::vec3<T> face_n = normal;
 	if (hop::dot(normal, center_l) - hop::dot(normal, a) < T {})
@@ -537,15 +580,9 @@ inline void obb_local_vs_triangle(const hop::vec3<T> & center_l, const hop::vec3
 		return;
 	}
 
-	T denom = hop::dot(face_n, local_seg.direction);
-	if (denom >= T {})
-		return; // not moving into this (body-facing) surface
-	T expanded_d = plane_d + expand;
-	T t = (expanded_d - hop::dot(face_n, center_l)) / denom;
-	if (t > tr::one() || t >= result.time)
+	T t, depth;
+	if (!support_plane_toi(face_n, expand, center_l, local_seg.direction, a, margin, result, t, depth))
 		return;
-	if (t < T {})
-		t = T {};
 	hop::vec3<T> hit_center, off;
 	hop::mul(off, local_seg.direction, t);
 	hop::add(hit_center, center_l, off);
@@ -556,6 +593,7 @@ inline void obb_local_vs_triangle(const hop::vec3<T> & center_l, const hop::vec3
 	if (!point_near_triangle(proj, a, b, c, seam_tol))
 		return;
 	result.time = t;
+	result.depth = depth;
 	hop::mul(result.point, local_seg.direction, t);
 	hop::add(result.point, local_seg.origin);
 	result.normal = face_n;

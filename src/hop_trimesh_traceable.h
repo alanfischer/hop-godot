@@ -106,7 +106,7 @@ public:
 	                 const hop::mat3<T> & orientation,
 	                 const hop::segment<T> & seg, T margin) override {
 		static const hop::mat3<T> identity;
-		if (orientation != identity) {
+		if (orientation != identity || hoptri::turned_mover(s)) {
 			// Rotated mesh: the shared driver handles the frame transform + mover
 			// spine reduction; we supply only the BVH broadphase over the local AABB.
 			hoptri::trace_solid_rotated(result, s, position, orientation, seg, margin, seam_tol_,

@@ -57,14 +57,11 @@ original engine gave.
 ### How a body opts in
 
 goldsrc-godot's BSP importer stamps the metadata; hop reads it. Nothing else is needed —
-no per-body setup, no scene changes.
-
-| Where | Metadata | Meaning |
-|---|---|---|
-| Map scene root | `bsp_data` (`PackedByteArray`) | Stripped BSP30 blob — PLANES, NODES, CLIPNODES, LEAFS, MODELS, VISIBILITY. Rides once per map (it runs to megabytes); a body walks up its parents to find it. |
-| Each collision body | `bsp_model` (int) | Which BSP model's tree this body stands for (0 = worldspawn, 1+ = brush entities). |
-| Each collision body | `bsp_scale` (float) | Godot units per GoldSrc unit. **Required** — there is no default, because guessing it would silently trace the map at the wrong size. |
-| Each collision body | `bsp_blocking` (int, optional) | Bitmask over `-contents` of what stops a trace (`SOLID = -2` → bit 2). Defaults to `BLOCK_SOLID`. The sky body sets `CONTENTS_SKY` so sky blocks players on hulls 1–3 while staying passable on hull 0. |
+no per-body setup, no scene changes. The keys are specified in goldsrc-godot's
+[metadata contract](https://github.com/alanfischer/goldsrc-godot#metadata-contract): the
+stripped BSP as `bsp_data` on the map's root, and `bsp_model`, `bsp_scale` and the optional
+`bsp_blocking` on each collision body. hop walks up from a body to find the root's blob, and
+takes no default for `bsp_scale`.
 
 A body missing any of this falls back to its normal trimesh/convex shapes, which is also
 exactly what default Godot physics does with the same scene. The metadata is purely additive.

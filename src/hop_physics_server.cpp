@@ -1606,16 +1606,11 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 
 	// Don't blend normals across triangles for this query: a beveled normal at a
 	// triangle seam makes velocity.slide() over-cancel and the body catch on flat
-	// walls.  We want the crisp face normal so sliding stays smooth.
-	const hop::simulator_config<hop_scalar> saved_config = space->simulator->get_config();
-	hop::simulator_config<hop_scalar> crisp_config = saved_config;
-	crisp_config.average_normals = false;
-	space->simulator->set_config(crisp_config);
-
+	// walls.  We want the crisp face normal so sliding stays smooth.  The same holds for
+	// every trace below.
+	constexpr bool crisp_normals = false;
 	hop::collision<hop_scalar> result;
-	space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask);
-
-	space->simulator->set_config(saved_config);
+	space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask, crisp_normals);
 
 	// --- (2b) Ground probe: detect the floor the body is resting on, independent
 	// of the motion direction.  The motion-aligned cast above only sees the floor
@@ -1657,10 +1652,8 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			body->hop_solid->set_position(to_hop(gfrom));
 			hop::segment<hop_scalar> gseg;
 			gseg.set_start_end(to_hop(gfrom), to_hop(gfrom + down * probe_dist));
-			space->simulator->set_config(crisp_config);
 			hop::collision<hop_scalar> gres;
-			space->simulator->trace_solid(gres, body->hop_solid.get(), gseg, body->collision_mask);
-			space->simulator->set_config(saved_config);
+			space->simulator->trace_solid(gres, body->hop_solid.get(), gseg, body->collision_mask, crisp_normals);
 			if (to_godot_float(gres.time) < 1.0f) {
 				ground_hit = true;
 				ground_point = to_godot(gres.point);
@@ -1695,17 +1688,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	// discards every other hit for being no nearer, so the surface the motion actually
 	// drives into may never have been looked at. Instead make the question answerable —
 	// a sweep that BEGINS inside solid cannot answer, so step the start out first.
-	//
-	// The speculative margin is saved and cleared below for safety only; it is not what
-	// does the work. The public trace_solid query passes margin 0 by contract (manager.h
-	// — the band applies to the simulator's own discovery pass, not to queries), so
-	// there is no band here to switch off.
 	if (probe_time <= 1e-4f && motion_len > 1e-6f) {
-		hop::simulator_config<hop_scalar> retry_config = saved_config;
-		retry_config.speculative_margin = hop_scalar {};
-		retry_config.average_normals = false;
-		space->simulator->set_config(retry_config);
-
 		// Step the start out of what it is inside and ask again. A corner takes one
 		// iteration per surface, hence the loop; the displacement is a penetration depth
 		// (millimetres), so the fraction still describes the motion the caller asked
@@ -1728,7 +1711,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			at_rest.set_start_end(to_hop(origin), to_hop(origin));
 			hop::collision<hop_scalar> stuck;
 			space->simulator->trace_solid(stuck, body->hop_solid.get(), at_rest,
-			                              body->collision_mask);
+			                              body->collision_mask, crisp_normals);
 			const Vector3 rn = to_godot(stuck.normal);
 			const float rd = to_godot_float(stuck.depth);
 			if (rn == Vector3() || rd <= 0.0f) break;  // no way out to follow
@@ -1739,10 +1722,8 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			hop::segment<hop_scalar> seg2;
 			seg2.set_start_end(to_hop(origin), to_hop(origin + probe_motion));
 			space->simulator->trace_solid(retry, body->hop_solid.get(), seg2,
-			                              body->collision_mask);
+			                              body->collision_mask, crisp_normals);
 		}
-
-		space->simulator->set_config(saved_config);
 
 		float retry_time = std::min(to_godot_float(retry.time), 1.0f);
 

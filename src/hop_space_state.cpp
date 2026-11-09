@@ -89,6 +89,7 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 		int count = space->simulator->find_solids_in_aa_box(total, candidates.data(), (int)candidates.size(),
 			(int)p_collision_mask);
 
+		const auto & sim_config = space->simulator->get_config();
 		for (int i = 0; i < count; ++i) {
 			hop::solid<hop_scalar> *s = candidates[i];
 			if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
@@ -114,7 +115,7 @@ bool HopDirectSpaceState::_intersect_ray(const Vector3 &p_from, const Vector3 &p
 			// rather than about something crossed later. Inferring it from the time alone also
 			// caught an ordinary contact at fraction zero, which is a different thing.
 			if (!p_hit_from_inside && col.is_start_overlap()) continue;
-			hop::merge_collision(result, col, space->simulator->get_config().epsilon, space->simulator->get_config().average_normals);
+			hop::merge_collision(result, col, sim_config.epsilon, sim_config.average_normals);
 		}
 	}
 
@@ -410,6 +411,7 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 		hop::collision<hop_scalar> result;
 		result.reset();
 
+		const auto & sim_config = space->simulator->get_config();
 		for (int i = 0; i < count; ++i) {
 			hop::solid<hop_scalar> *s = candidates[i];
 			if (!s || !(s->get_collision_scope() & p_collision_mask)) continue;
@@ -420,7 +422,7 @@ bool HopDirectSpaceState::_cast_motion(const RID &p_shape_rid, const Transform3D
 			// Per candidate, not hoisted and part-reset -- see the ray loop above.
 			hop::collision<hop_scalar> col;
 			space->simulator->test_segment(col, seg, s);
-			hop::merge_collision(result, col, space->simulator->get_config().epsilon, space->simulator->get_config().average_normals);
+			hop::merge_collision(result, col, sim_config.epsilon, sim_config.average_normals);
 		}
 
 		float time_f = to_godot_float(result.time);

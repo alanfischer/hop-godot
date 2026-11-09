@@ -97,27 +97,21 @@ struct HopSpaceData {
 	}
 
 	HopSpaceData() {
+		hop::simulator_config<hop_scalar> config;
+		config.integrator = hop::integrator_type::improved;
+		// Every body takes the speculative solve unless it picks a mode itself.
+		config.default_contact_mode = hop::contact_mode::speculative;
+		// Rounded-vs-polytope narrowphase: accurate GJK, or the cheap inflate/AABB path.
+		// "physics/hop/accurate_narrowphase" (bool); absent => true.
+		// Angular substepping (continuous collision for fast, thin spinners such as a
+		// blade trap): "physics/hop/angular_substeps_max" (int); absent / 1 => off.
+		if (ProjectSettings *ps = ProjectSettings::get_singleton()) {
+			config.accurate_narrowphase = ps->get_setting("physics/hop/accurate_narrowphase", true);
+			config.angular_substeps_max = (int)ps->get_setting("physics/hop/angular_substeps_max", 1);
+		}
 		simulator = std::make_unique<hop::simulator<hop_scalar>>();
+		simulator->set_config(config);
 		simulator->set_manager(&bvh_manager);
 		apply_default_gravity();
-		simulator->set_integrator(hop::integrator_type::improved);
-		// Default every body to the speculative solve (matches the old global
-		// set_speculative_contacts(true); per-body overridable via set_contact_mode).
-		simulator->set_default_contact_mode(hop::contact_mode::speculative);
-		// Narrowphase accuracy for rounded-vs-polytope pairs: accurate GJK
-		// (default) vs the cheap inflate/AABB path. Pick via the project setting
-		// "physics/hop/accurate_narrowphase" (bool); absent => true.
-		bool accurate = true;
-		if (ProjectSettings *ps = ProjectSettings::get_singleton())
-			accurate = ps->get_setting("physics/hop/accurate_narrowphase", true);
-		simulator->set_accurate_narrowphase(accurate);
-		// Angular substepping (opt-in continuous collision for fast spinners): cap the
-		// number of fixed-orientation sub-traces per frame. "physics/hop/angular_substeps_max"
-		// (int); absent / 1 => off (single snapshot, bit-identical). Raise it for a scene
-		// with fast, thin spinners (a blade trap) that must not be stepped over angularly.
-		int substeps = 1;
-		if (ProjectSettings *ps = ProjectSettings::get_singleton())
-			substeps = (int)ps->get_setting("physics/hop/angular_substeps_max", 1);
-		simulator->set_angular_substeps_max(substeps);
 	}
 };

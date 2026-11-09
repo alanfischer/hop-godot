@@ -1310,7 +1310,9 @@ static std::shared_ptr<hop::simulator<T>> world_with_floor(
 	sim->set_gravity(vec(0, -20, 0));
 	// hop's own default is sweep_slide, which hop-godot gives KINEMATIC bodies only;
 	// anything dynamic resolves speculatively.
-	sim->set_default_contact_mode(hop::contact_mode::speculative);
+	auto config = sim->get_config();
+	config.default_contact_mode = hop::contact_mode::speculative;
+	sim->set_config(config);
 	auto tr = std::make_unique<HopBspTraceable<T>>();
 	assert(tr->build(blob.data(), blob.size(), 0, (T)SCALE, hopbsp::BLOCK_SOLID));
 	auto world = std::make_shared<hop::solid<T>>();

@@ -469,7 +469,9 @@ static void test_a_box_on_a_mesh_floor_gets_a_patch() {
 
 	hop::simulator<T> sim;
 	sim.set_gravity(vec(0, -20, 0));
-	sim.set_default_contact_mode(hop::contact_mode::speculative);
+	auto config = sim.get_config();
+	config.default_contact_mode = hop::contact_mode::speculative;
+	sim.set_config(config);
 	auto world = std::make_shared<hop::solid<T>>();
 	world->set_infinite_mass();
 	world->set_coefficient_of_gravity(T {});

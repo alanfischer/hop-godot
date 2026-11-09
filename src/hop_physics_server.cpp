@@ -1607,13 +1607,15 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	// Don't blend normals across triangles for this query: a beveled normal at a
 	// triangle seam makes velocity.slide() over-cancel and the body catch on flat
 	// walls.  We want the crisp face normal so sliding stays smooth.
-	bool saved_avg = space->simulator->get_average_normals();
-	space->simulator->set_average_normals(false);
+	const hop::simulator_config<hop_scalar> saved_config = space->simulator->get_config();
+	hop::simulator_config<hop_scalar> crisp_config = saved_config;
+	crisp_config.average_normals = false;
+	space->simulator->set_config(crisp_config);
 
 	hop::collision<hop_scalar> result;
 	space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask);
 
-	space->simulator->set_average_normals(saved_avg);
+	space->simulator->set_config(saved_config);
 
 	// --- (2b) Ground probe: detect the floor the body is resting on, independent
 	// of the motion direction.  The motion-aligned cast above only sees the floor
@@ -1655,10 +1657,10 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			body->hop_solid->set_position(to_hop(gfrom));
 			hop::segment<hop_scalar> gseg;
 			gseg.set_start_end(to_hop(gfrom), to_hop(gfrom + down * probe_dist));
-			space->simulator->set_average_normals(false);
+			space->simulator->set_config(crisp_config);
 			hop::collision<hop_scalar> gres;
 			space->simulator->trace_solid(gres, body->hop_solid.get(), gseg, body->collision_mask);
-			space->simulator->set_average_normals(saved_avg);
+			space->simulator->set_config(saved_config);
 			if (to_godot_float(gres.time) < 1.0f) {
 				ground_hit = true;
 				ground_point = to_godot(gres.point);
@@ -1699,10 +1701,10 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	// — the band applies to the simulator's own discovery pass, not to queries), so
 	// there is no band here to switch off.
 	if (probe_time <= 1e-4f && motion_len > 1e-6f) {
-		const hop_scalar saved_spec = space->simulator->get_speculative_margin();
-		const bool saved_avg2 = space->simulator->get_average_normals();
-		space->simulator->set_speculative_margin(hop_scalar {});
-		space->simulator->set_average_normals(false);
+		hop::simulator_config<hop_scalar> retry_config = saved_config;
+		retry_config.speculative_margin = hop_scalar {};
+		retry_config.average_normals = false;
+		space->simulator->set_config(retry_config);
 
 		// Step the start out of what it is inside and ask again. A corner takes one
 		// iteration per surface, hence the loop; the displacement is a penetration depth
@@ -1740,8 +1742,7 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 			                              body->collision_mask);
 		}
 
-		space->simulator->set_average_normals(saved_avg2);
-		space->simulator->set_speculative_margin(saved_spec);
+		space->simulator->set_config(saved_config);
 
 		float retry_time = std::min(to_godot_float(retry.time), 1.0f);
 

@@ -13,7 +13,7 @@ Part of a set of Godot 4 libraries for GoldSrc-style games:
 
 ## Prerequisites
 
-- Godot 4.1+
+- Godot 4.7+
 - CMake 3.22+
 - C++17 compiler
 - [Zig](https://ziglang.org/) — only for `build.sh`, which uses it as the cross-compiler
@@ -106,8 +106,7 @@ if server.has_method("set_bsp_hulls_enabled"):
 where the methods do not exist.
 
 In a networked game this flag has to agree on both ends — a client colliding against
-different geometry than the server mispredicts every step. WizardWars replicates it as
-the `bsp_hulls` server var (`/bsp_hulls on|off`, or `--bsp-hulls on|off` at launch).
+different geometry than the server mispredicts every step, so replicate it from the server.
 
 A body turned intangible the usual Godot way (disabling its `CollisionShape3D`s) is
 intangible under hulls too — the hull answers to the same switch, so a door that opens by

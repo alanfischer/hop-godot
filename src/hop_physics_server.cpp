@@ -637,9 +637,10 @@ std::unique_ptr<HopBspTraceable<hop_scalar>> HopPhysicsServer::try_build_bsp_hul
 // the bodies it describes — dynamic, and spherical in every enabled shape.
 //
 // hop averages the pair's coefficients and a floor contributes 0, so a contact sees
-// half of this. At this value a 20 cm stone rolling at 5 m/s runs ~5 m before it stops
-// and one at 18 m/s ~18 m: it comes to rest without looking braked.
-static constexpr float SPHERE_ROLLING_FRICTION = 0.02f;
+// half of this. At g 20 a 20 cm stone rolling at 5 m/s runs ~4 m before it stops and
+// one at 17.5 m/s ~20 m. Tuned before hop #113, when a warm start that kept summing
+// the normal impulse made the same budget brake ~20x harder; this keeps that feel.
+static constexpr float SPHERE_ROLLING_FRICTION = 0.56f;
 
 void HopPhysicsServer::apply_rolling_friction(HopBodyData *body) {
 	if (!body || !body->hop_solid) return;

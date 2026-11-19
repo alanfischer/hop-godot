@@ -89,16 +89,28 @@ inline T ray_triangle(const hop::segment<T> & seg, const hop::vec3<T> & v0,
 		eps = T(1e-7);
 	if (a > -eps && a < eps)
 		return tr::one();
+	// Edges and corners count as inside, with room for rounding: a ray along an edge shared by
+	// two triangles (a heightfield's grid line, a trimesh's seam) is tested against only one
+	// of them, and rounding could put it a hair outside that one.
+	T edge;
+	if constexpr (std::is_same_v<T, hop::fixed16>)
+		edge = hop::fixed16::from_raw(4);
+	else if constexpr (std::is_same_v<T, hop::fixed32>)
+		edge = hop::fixed32::from_raw(1LL << 12);
+	else if constexpr (std::is_same_v<T, float>)
+		edge = T(1e-5);
+	else
+		edge = T(1e-9);
 	T inv_a = tr::one() / a;
 	hop::vec3<T> s_vec;
 	hop::sub(s_vec, seg.origin, v0);
 	T u = hop::dot(s_vec, h) * inv_a;
-	if (u < zero || u > tr::one())
+	if (u < -edge || u > tr::one() + edge)
 		return tr::one();
 	hop::vec3<T> q;
 	hop::cross(q, s_vec, e1);
 	T v = hop::dot(seg.direction, q) * inv_a;
-	if (v < zero || (u + v) > tr::one())
+	if (v < -edge || (u + v) > tr::one() + edge)
 		return tr::one();
 	T time = hop::dot(e2, q) * inv_a;
 	if (time < zero || time > tr::one())

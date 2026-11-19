@@ -1,4 +1,4 @@
-// Bodies dropped on a HeightMapShape3D-style heightfield rest on it.
+// Bodies dropped on a HeightMapShape3D-style heightfield rest on it, and rays down onto it hit it.
 //
 // A box sweep used to report an overlap as a zero-depth touch, so once a box sank past
 // the contact margin nothing pushed it back and the manifold's corner probes, starting
@@ -98,6 +98,45 @@ static Drop drop(const Slope & s, bool turned, bool box, T hx, T hy, T hz, T yaw
 	return d;
 }
 
+// A ray straight down exactly on a grid line (or through a grid point) lies on the edge of the
+// cells either side. The DDA visits one of them, and rounding put the ray a hair outside the
+// triangle there: the ray fell through the ground. As a game sets one up: float, the grid turned
+// 180° about Y and lifted, heights stretched, rays from high above.
+template <typename S>
+static int vertical_ray_misses(bool turned) {
+	using W = hop::vec3<S>;
+	auto v = [](S x, S y, S z) { W w; w.x = x; w.y = y; w.z = z; return w; };
+	const int n = 129;
+	const S cell = S(0.4);
+	std::vector<float> h(n * n);
+	for (int k = 0; k < n * n; ++k)
+		h[k] = 0.4f * std::sin(0.37f * (float)(k % n)) * std::cos(0.23f * (float)(k / n));
+	auto f = std::make_unique<HopHeightfieldTraceable<S>>();
+	f->build(n, n, h.data(), v(cell, S(3.8), cell), W());
+	hop::simulator<S> sim;
+	auto ground = std::make_shared<hop::solid<S>>();
+	ground->set_infinite_mass();
+	ground->add_shape(std::make_shared<hop::shape<S>>(std::move(f)));
+	if (turned)
+		ground->set_orientation(hop::mat3<S>(-1, 0, 0, 0, 1, 0, 0, 0, -1));
+	ground->set_position(v(S(-0.000003), S(2.8), S(-0.000003)));
+	sim.add_solid(ground);
+	int misses = 0;
+	for (int i = -60; i <= 60; ++i)
+		for (int kind = 0; kind < 3; ++kind) {
+			// On a line of constant x, of constant z, or through a grid point.
+			S x = S(i) * cell + (kind == 1 ? S(0.137) : S(0));
+			S z = S(((i * 7) % 29 + 29) % 29 - 14) * cell + (kind == 0 ? S(0.071) : S(0));
+			hop::segment<S> seg;
+			seg.set_start_end(v(x, S(30), z), v(x, S(-50), z));
+			hop::collision<S> r;
+			sim.test_segment(r, seg, ground.get());
+			if (!(r.time < hop::scalar_traits<S>::one()))
+				++misses;
+		}
+	return misses;
+}
+
 int main() {
 	printf("test_heightfield_traceable:\n");
 	const Slope slopes[] = {{0, 0}, {0.36, 0}, {0, 0.36}, {0.2, 0.3}};
@@ -121,6 +160,13 @@ int main() {
 					++cases;
 				}
 	printf("  %d drops rest on the grid\n", cases);
+	for (bool turned : {false, true}) {
+		int f = vertical_ray_misses<float>(turned), d = vertical_ray_misses<double>(turned);
+		if (f || d)
+			printf("  FAIL turned=%d: vertical rays on grid lines fell through: %d float, %d double\n", turned, f, d);
+		assert(f == 0 && d == 0);
+	}
+	printf("  vertical rays on grid lines and points hit it\n");
 	printf("ALL PASSED\n");
 	return 0;
 }

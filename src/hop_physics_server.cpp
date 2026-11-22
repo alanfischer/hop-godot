@@ -1480,6 +1480,9 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	depen_hint.buried = false;
 	depen_hint.buried_step = hop::vec3<hop_scalar>{};
 
+	// Whether the very first probe found p_from clear, which is the whole answer to a
+	// zero-motion cast from there (see step 2).
+	bool start_clear = false;
 	const int MAX_RECOVER_ITERS = 4;
 	for (int i = 0; i < MAX_RECOVER_ITERS; ++i) {
 		Vector3 test_pos = p_from.origin + recover;
@@ -1492,7 +1495,10 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 		space->simulator->trace_solid(overlap, body->hop_solid.get(), probe, body->collision_mask);
 
 		// time >= 1 means no static overlap at this position.
-		if (to_godot_float(overlap.time) > 0.0f) break;
+		if (to_godot_float(overlap.time) > 0.0f) {
+			start_clear = i == 0 && to_godot_float(overlap.time) >= 1.0f;
+			break;
+		}
 
 		// `overlap.depth` is EXACT — no margin baked in. The public trace_solid query
 		// passes margin 0 down both of the simulator's paths, and this server never
@@ -1611,7 +1617,10 @@ bool HopPhysicsServer::_body_test_motion(const RID &p_body, const Transform3D &p
 	// every trace below.
 	constexpr bool crisp_normals = false;
 	hop::collision<hop_scalar> result;
-	space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask, crisp_normals);
+	// A zero-motion cast from a start the recovery probe already found clear is that
+	// same probe again (rest_info-style callers, such as a per-tick contact probe).
+	if (!(start_clear && recover == Vector3() && motion_len <= 1e-6f))
+		space->simulator->trace_solid(result, body->hop_solid.get(), seg, body->collision_mask, crisp_normals);
 
 	// --- (2b) Ground probe: detect the floor the body is resting on, independent
 	// of the motion direction.  The motion-aligned cast above only sees the floor
@@ -2572,6 +2581,8 @@ void HopPhysicsServer::_step(float p_step) {
 	space_owner.for_each([&](HopSpaceData *space) {
 		if (!space->active) return;
 		space->simulator->update(dt, 0x3FFFFFFF);
+		// No simulator steps the area tree, and queries only refit it.
+		space->area_bvh.pre_update(dt);
 	});
 
 	// After stepping, snap kinematic bodies back to the Godot-authoritative

@@ -171,6 +171,7 @@ static bool build_convex_solid_from_points(
 void HopShapeData::set_data(PhysicsServer3D::ShapeType p_type, const Variant &p_data) {
 	type = p_type;
 	data = p_data;
+	query_solid.reset();
 }
 
 std::shared_ptr<hop::shape<hop_scalar>> HopShapeData::make_hop_shape(const Transform3D &p_local_xform) {

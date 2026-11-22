@@ -15,16 +15,28 @@
 // geometry, rotation onto the solid — and having it in one place is what keeps a new
 // query entry point from being rotation-blind by default (all four of them had to be
 // fixed by hand once already). Null when the shape can't be built.
+//
+// The solid is the shape's cached one (HopShapeData::query_solid), so everything a
+// caller may set on it is reset here.
 static std::shared_ptr<hop::solid<hop_scalar>> make_query_solid(HopShapeData *sd,
                                                                 const Transform3D &p_transform) {
-	auto hs = sd->make_hop_shape(scale_only_xform(p_transform.basis));
-	if (!hs) return nullptr;
-	auto s = std::make_shared<hop::solid<hop_scalar>>();
-	s->set_infinite_mass();
+	Transform3D scale = scale_only_xform(p_transform.basis);
+	if (!sd->query_solid || !sd->query_scale.is_equal_approx(scale.basis)) {
+		sd->query_solid.reset();
+		auto hs = sd->make_hop_shape(scale);
+		if (!hs) return nullptr;
+		auto s = std::make_shared<hop::solid<hop_scalar>>();
+		s->set_infinite_mass();
+		s->add_shape(hs);
+		sd->query_solid = s;
+		sd->query_scale = scale.basis;
+	}
+	auto &s = sd->query_solid;
 	s->set_position(to_hop(p_transform.origin));
 	s->set_orientation(to_hop_orientation(p_transform.basis));
 	s->set_collision_scope(0);
-	s->add_shape(hs);
+	s->set_collide_with_scope(-1);
+	s->set_collision_filter(nullptr);
 	return s;
 }
 

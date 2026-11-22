@@ -32,4 +32,10 @@ struct HopShapeData {
 	// as the shape's static local_rotation, honored by the narrowphase) and the
 	// scale/origin baked here, since hop geometry has no orientation of its own.
 	std::shared_ptr<hop::shape<hop_scalar>> build_shape_geometry(const Basis &p_scale);
+
+	// The solid a space query poses this shape on, built once per scale rather than
+	// per query: a cylinder is a convex hull whose vertices are rederived from its
+	// planes for every new solid. Never in a simulator between queries.
+	std::shared_ptr<hop::solid<hop_scalar>> query_solid;
+	Basis query_scale;
 };

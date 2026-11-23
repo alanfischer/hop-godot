@@ -125,6 +125,23 @@ public:
 	std::vector<PendingMonitorExit> pending_monitor_exits;
 	void report_body_gone(HopBodyData *body);
 
+	// The old and new bounds of every body and area whose HopFlushPrint changed since the last
+	// flush (a freed one leaves its last bound here too), merged into a few clusters with the
+	// layers they carry: a player's hitboxes all move together and make one. An area none of
+	// these touch, and whose own print held, skips its overlap test.
+	struct FlushMoved {
+		uint64_t space;  // rid_key
+		hop::aa_box<hop_scalar> bound;
+		uint32_t layers = 0;
+	};
+	std::vector<FlushMoved> flush_moved_bodies;
+	std::vector<FlushMoved> flush_moved_areas;
+	static void note_moved(std::vector<FlushMoved> &moved, const HopFlushPrint &print, uint32_t layers);
+	static bool touches(const std::vector<FlushMoved> &moved, const HopAreaData *area);
+	static HopFlushPrint flush_print_of(const HopBodyData *body);
+	static HopFlushPrint flush_print_of(const HopAreaData *area);
+	void mark_changed_areas(bool commit);
+
 	// === Shape API ===
 	RID _world_boundary_shape_create() override;
 	RID _separation_ray_shape_create() override;

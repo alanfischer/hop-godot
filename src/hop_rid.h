@@ -2,55 +2,59 @@
 
 #include <godot_cpp/templates/rid_owner.hpp>
 
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace godot;
 
 // Wrapper around godot-cpp's RID_PtrOwner with for_each support.
+//
+// for_each runs several times per flush over every body and every area. Resolving each entry
+// through RIDs costs engine-interface calls apiece in godot-cpp (rid_from_int64, RID compare,
+// get_id), which across a few hundred entries was most of the flush. So the owner mirrors its own
+// entries in a table indexed by the RID's slot, walked in the allocator's own slot order.
 template <typename T>
 class HopRIDOwner : public RID_PtrOwner<T> {
-	// Snapshot buffer reused across calls. for_each runs several times per physics
-	// tick over every body and every area, so the obvious List<RID> snapshot cost a
-	// heap node per entry per call — with a few hundred areas that was the single
-	// largest allocator in the physics frame. A vector that keeps its capacity makes
-	// steady-state iteration allocation-free.
-	std::vector<RID> iter_buffer;
-	bool iterating = false;
+	struct Slot {
+		T *ptr = nullptr;
+		uint64_t made = 0;  // when the entry was made, against `made_count`
+	};
+	std::vector<Slot> slots;
+	uint64_t made_count = 0;
 
-	// Snapshot semantics matter: func() may free the entry it is handed (an area
-	// monitor callback that frees the node, say), so the RID list is captured up
-	// front and each entry re-resolved through get_or_null before use.
-	template <typename F>
-	void iterate(const RID *rids, uint32_t count, F &&func) {
-		for (uint32_t i = 0; i < count; i++) {
-			T *ptr = this->get_or_null(rids[i]);
-			if (ptr) {
-				func(ptr);
-			}
-		}
+	static uint32_t slot_of(const RID &r) {
+		static_assert(sizeof(RID) == sizeof(uint64_t), "a RID is its id");
+		uint64_t id;
+		std::memcpy(&id, &r, sizeof id);
+		return uint32_t(id & 0xFFFFFFFF);
 	}
 
 public:
-	// Iterate all owned entries
+	RID make_rid(T *p_ptr) {
+		RID rid = RID_PtrOwner<T>::make_rid(p_ptr);
+		const uint32_t slot = slot_of(rid);
+		if (slot >= slots.size()) slots.resize(slot + 1);
+		slots[slot] = { p_ptr, ++made_count };
+		return rid;
+	}
+
+	void free(const RID &p_rid) {
+		const uint32_t slot = slot_of(p_rid);
+		if (slot < slots.size() && slots[slot].ptr == this->get_or_null(p_rid)) slots[slot] = {};
+		RID_PtrOwner<T>::free(p_rid);
+	}
+
+	// Snapshot semantics, as when the RIDs were captured up front: func() may free entries (an
+	// area monitor callback that frees the node, say), which are then skipped, and entries made
+	// during the walk are not visited, even in a slot just freed.
 	template <typename F>
 	void for_each(F &&func) {
-		const uint32_t count = this->get_rid_count();
-		if (count == 0) return;
-		if (iterating) {
-			// Nested for_each on the same owner (a callback that iterates again):
-			// the shared buffer is live, so take a private snapshot for this level.
-			std::vector<RID> nested(count);
-			this->fill_owned_buffer(nested.data());
-			iterate(nested.data(), count, func);
-			return;
+		const uint64_t start = made_count;
+		const size_t count = slots.size();
+		for (size_t i = 0; i < count; i++) {
+			const Slot s = slots[i];
+			if (s.ptr && s.made <= start) func(s.ptr);
 		}
-		struct Guard {
-			bool &flag;
-			explicit Guard(bool &f) : flag(f) { flag = true; }
-			~Guard() { flag = false; }
-		} guard(iterating);
-		iter_buffer.resize(count);
-		this->fill_owned_buffer(iter_buffer.data());
-		iterate(iter_buffer.data(), count, func);
 	}
 };

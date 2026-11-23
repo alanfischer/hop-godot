@@ -11,6 +11,7 @@
 #include <set>
 #include "hop_bsp_traceable.h"
 #include "hop_conversions.h"
+#include "hop_flush_print.h"
 
 using namespace godot;
 
@@ -77,6 +78,14 @@ struct HopBodyData {
 	uint32_t user_flags = 0;
 
 	Callable state_sync_callback;
+	// What the last state-sync callback reported for a KINEMATIC body, so a mover that has not
+	// moved since is not called back (GodotPhysics only reports active bodies). Cleared when
+	// the listener or the mode changes, so a new one hears the current state once.
+	bool kinematic_reported = false;
+	Transform3D reported_transform;
+	Vector3 reported_linear_velocity;
+	Vector3 reported_angular_velocity;
+	HopFlushPrint flush_print;  // see HopFlushPrint
 	// Set by sync_from_hop: `transform` now holds a pose the simulation produced. Until a
 	// step has run, `transform` is only what the node last pushed, which can lag the node
 	// (see _flush_queries), so a dynamic body is not synced back before then.

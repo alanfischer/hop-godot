@@ -493,12 +493,16 @@ void HopPhysicsServer::report_body_gone(HopBodyData *body) {
 
 void HopPhysicsServer::_area_set_monitor_callback(const RID &p_area, const Callable &p_callback) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
-	if (area) area->monitor_callback = p_callback;
+	if (!area) return;
+	area->monitor_callback = p_callback;
+	area->has_monitor_callback = p_callback.is_valid();
 }
 
 void HopPhysicsServer::_area_set_area_monitor_callback(const RID &p_area, const Callable &p_callback) {
 	HopAreaData *area = area_owner.get_or_null(p_area);
-	if (area) area->area_monitor_callback = p_callback;
+	if (!area) return;
+	area->area_monitor_callback = p_callback;
+	area->has_area_monitor_callback = p_callback.is_valid();
 }
 
 // ============================================================
@@ -833,8 +837,10 @@ void HopPhysicsServer::_body_set_mode(const RID &p_body, PhysicsServer3D::BodyMo
 	HopBodyData *body = body_owner.get_or_null(p_body);
 	if (!body) return;
 	const bool was_kinematic = body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC;
-	if (p_mode != body->mode)
+	if (p_mode != body->mode) {
 		body->stepped = false;  // e.g. an unfrozen item: its last stepped pose is stale
+		body->kinematic_reported = false;
+	}
 	body->mode = p_mode;
 
 	// Becoming KINEMATIC: the first sweep starts from where the body is now, not from
@@ -1356,7 +1362,9 @@ bool HopPhysicsServer::_body_is_omitting_force_integration(const RID &p_body) co
 
 void HopPhysicsServer::_body_set_state_sync_callback(const RID &p_body, const Callable &p_callable) {
 	HopBodyData *body = body_owner.get_or_null(p_body);
-	if (body) body->state_sync_callback = p_callable;
+	if (!body) return;
+	body->state_sync_callback = p_callable;
+	body->kinematic_reported = false;
 }
 
 void HopPhysicsServer::_body_set_force_integration_callback(const RID &p_body, const Callable &p_callable, const Variant &p_userdata) {
@@ -2313,6 +2321,7 @@ void HopPhysicsServer::_free_rid(const RID &p_rid) {
 	} else if (body_owner.owns(p_rid)) {
 		HopBodyData *body = body_owner.get_or_null(p_rid);
 		report_body_gone(body);
+		note_moved(flush_moved_bodies, body->flush_print, uint32_t(body->flush_print.bits));
 		remove_body_from_space(body);
 		if (body->direct_state) {
 			body->direct_state->body = nullptr;
@@ -2324,6 +2333,8 @@ void HopPhysicsServer::_free_rid(const RID &p_rid) {
 		delete body;
 	} else if (area_owner.owns(p_rid)) {
 		HopAreaData *area = area_owner.get_or_null(p_rid);
+		if (area->flush_print.flags & HopFlushPrint::AREA_MONITORABLE)
+			note_moved(flush_moved_areas, area->flush_print, uint32_t(area->flush_print.bits >> 32));
 		remove_area_from_space(area);
 		area_owner.free(p_rid);
 		delete area;
@@ -2618,13 +2629,113 @@ void HopPhysicsServer::_step(float p_step) {
 void HopPhysicsServer::_sync() {
 }
 
+static void grow_box(hop::aa_box<hop_scalar> &box, hop_scalar by) {
+	box.mins.x -= by; box.mins.y -= by; box.mins.z -= by;
+	box.maxs.x += by; box.maxs.y += by; box.maxs.z += by;
+}
+
+static void merge_box(hop::aa_box<hop_scalar> &into, const hop::aa_box<hop_scalar> &b) {
+	into.mins.x = b.mins.x < into.mins.x ? b.mins.x : into.mins.x;
+	into.mins.y = b.mins.y < into.mins.y ? b.mins.y : into.mins.y;
+	into.mins.z = b.mins.z < into.mins.z ? b.mins.z : into.mins.z;
+	into.maxs.x = b.maxs.x > into.maxs.x ? b.maxs.x : into.maxs.x;
+	into.maxs.y = b.maxs.y > into.maxs.y ? b.maxs.y : into.maxs.y;
+	into.maxs.z = b.maxs.z > into.maxs.z ? b.maxs.z : into.maxs.z;
+}
+
+void HopPhysicsServer::note_moved(std::vector<FlushMoved> &moved, const HopFlushPrint &print, uint32_t layers) {
+	if (!print.valid || print.space == 0) return;
+	// Joins a cluster it comes within a metre of. Past the cap everything joins the first one in
+	// its space: coarser, never wrong.
+	constexpr size_t MAX_CLUSTERS = 32;
+	const hop_scalar near = to_hop_scalar(1.0f);
+	FlushMoved *fallback = nullptr;
+	for (FlushMoved &m : moved) {
+		if (m.space != print.space) continue;
+		if (!fallback) fallback = &m;
+		hop::aa_box<hop_scalar> grown = m.bound;
+		grow_box(grown, near);
+		if (hop::test_intersection(grown, print.bound)) {
+			merge_box(m.bound, print.bound);
+			m.layers |= layers;
+			return;
+		}
+	}
+	if (moved.size() >= MAX_CLUSTERS && fallback) {
+		merge_box(fallback->bound, print.bound);
+		fallback->layers |= layers;
+		return;
+	}
+	moved.push_back({ print.space, print.bound, layers });
+}
+
+bool HopPhysicsServer::touches(const std::vector<FlushMoved> &moved, const HopAreaData *area) {
+	if (moved.empty() || !area->hop_solid) return false;
+	// Grown past the broadphase's own epsilon: a false hit only costs the query it would have run.
+	hop::aa_box<hop_scalar> box = area->hop_solid->get_world_bound();
+	grow_box(box, to_hop_scalar(0.01f));
+	const uint64_t space = area->flush_print.space;
+	for (const FlushMoved &m : moved) {
+		if ((m.layers & area->collision_mask) && m.space == space
+				&& hop::test_intersection(box, m.bound))
+			return true;
+	}
+	return false;
+}
+
+HopFlushPrint HopPhysicsServer::flush_print_of(const HopBodyData *body) {
+	HopFlushPrint p;
+	p.valid = true;
+	p.space = rid_key(body->space_rid);
+	p.transform = body->transform;
+	if (body->hop_solid) p.bound = body->hop_solid->get_world_bound();
+	p.bits = body->collision_layer;
+	p.shapes = HopFlushPrint::fold_shapes(body->hop_solid.get());
+	return p;
+}
+
+HopFlushPrint HopPhysicsServer::flush_print_of(const HopAreaData *area) {
+	HopFlushPrint p;
+	p.valid = true;
+	p.space = rid_key(area->space_rid);
+	p.transform = area->transform;
+	if (area->hop_solid) p.bound = area->hop_solid->get_world_bound();
+	p.bits = uint64_t(area->collision_mask) | (uint64_t(area->collision_layer) << 32);
+	p.flags = (area->monitorable ? HopFlushPrint::AREA_MONITORABLE : 0u)
+		| (area->has_monitor_callback ? 2u : 0u) | (area->has_area_monitor_callback ? 4u : 0u);
+	p.shapes = HopFlushPrint::fold_shapes(area->hop_solid.get());
+	return p;
+}
+
+// Fingerprints every area and marks the ones whose print changed, noting their old and new
+// bounds for the area-to-area pass (only a monitorable area can be what a detector sees).
+// Uncommitted, the print stays as it was, so the next flush still sees the change.
+void HopPhysicsServer::mark_changed_areas(bool commit) {
+	area_owner.for_each([&](HopAreaData *area) {
+		HopFlushPrint now = flush_print_of(area);
+		if (now == area->flush_print) return;
+		const HopFlushPrint &was = area->flush_print;
+		if (was.flags & HopFlushPrint::AREA_MONITORABLE)
+			note_moved(flush_moved_areas, was, uint32_t(was.bits >> 32));
+		if (now.flags & HopFlushPrint::AREA_MONITORABLE)
+			note_moved(flush_moved_areas, now, area->collision_layer);
+		if (commit) area->flush_print = now;
+		area->flush_changed = true;
+	});
+}
+
 void HopPhysicsServer::_flush_queries() {
 	flushing_queries = true;
 
 	// Call state_sync_callback for all bodies that have one
 	body_owner.for_each([&](HopBodyData *body) {
+		if (body->mode == PhysicsServer3D::BODY_MODE_STATIC) return;
+		const bool kinematic = body->mode == PhysicsServer3D::BODY_MODE_KINEMATIC;
+		if (kinematic && body->kinematic_reported && body->transform == body->reported_transform
+				&& body->linear_velocity == body->reported_linear_velocity
+				&& body->angular_velocity == body->reported_angular_velocity)
+			return;
 		if (!body->state_sync_callback.is_valid()) return;
-		if (body->is_static_or_kinematic() && body->mode != PhysicsServer3D::BODY_MODE_KINEMATIC) return;
 		// A dynamic body that has not been stepped has nothing to report, and reporting it
 		// anyway is harmful. Godot runs this flush BEFORE it flushes queued node-transform
 		// notifications, so a body spawned between ticks — add_child, then position it, as a
@@ -2632,7 +2743,13 @@ void HopPhysicsServer::_flush_queries() {
 		// the server holds the pose it entered the tree with. Calling back here would write
 		// that stale pose onto the node and drop the queued one: the projectile restarts from
 		// the world origin. GodotPhysics only calls back bodies a step moved; so do we.
-		if (!body->is_static_or_kinematic() && !body->stepped) return;
+		if (!kinematic && !body->stepped) return;
+		if (kinematic) {
+			body->kinematic_reported = true;
+			body->reported_transform = body->transform;
+			body->reported_linear_velocity = body->linear_velocity;
+			body->reported_angular_velocity = body->angular_velocity;
+		}
 
 		if (!body->direct_state) {
 			body->direct_state = memnew(HopDirectBodyState);
@@ -2657,12 +2774,25 @@ void HopPhysicsServer::_flush_queries() {
 		}
 	}
 
+	// Fingerprinted after the callbacks above, which may have moved what they were handed.
+	body_owner.for_each([&](HopBodyData *body) {
+		HopFlushPrint now = flush_print_of(body);
+		if (now == body->flush_print) return;
+		note_moved(flush_moved_bodies, body->flush_print, uint32_t(body->flush_print.bits));
+		note_moved(flush_moved_bodies, now, body->collision_layer);
+		body->flush_print = now;
+	});
+	mark_changed_areas(true);
+
 	// Area monitoring: detect body enter/exit for areas with monitor callbacks
 	area_owner.for_each([&](HopAreaData *area) {
+		// Nothing about it or near it changed, so neither did what it overlaps.
+		if (!area->flush_changed && !touches(flush_moved_bodies, area)) return;
 		// Nothing to report and nobody to report to: the common case, kept cheap.
-		if (!area->monitor_callback.is_valid() && area->overlapping_bodies.empty()) return;
+		const bool has_callback = area->monitor_callback.is_valid();
+		if (!has_callback && area->overlapping_bodies.empty()) return;
 		HopSpaceData *space = area->space_rid.is_valid() ? space_owner.get_or_null(area->space_rid) : nullptr;
-		bool can_monitor = area->monitor_callback.is_valid() && space
+		bool can_monitor = has_callback && space
 			&& area->hop_solid && !area->hop_solid->get_shapes().empty();
 
 		// An area that stops monitoring — left its space, lost its callback, lost its shapes — still
@@ -2691,6 +2821,7 @@ void HopPhysicsServer::_flush_queries() {
 		auto &found = space->size_for_bodies(space->monitor_body_buffer);
 		int count = space->simulator->find_solids_in_aa_box(area_aabb, found.data(), (int)found.size(),
 			(int)area->collision_mask);
+		if (count == 0 && area->overlapping_bodies.empty()) return;  // most areas, most flushes
 
 		// Zero-length sweep of the area's own sensor solid, for the narrow-phase
 		// confirm below.
@@ -2734,7 +2865,8 @@ void HopPhysicsServer::_flush_queries() {
 			if (current_overlaps.find(id) == current_overlaps.end())
 				exited.push_back({ id, rid });
 		}
-		area->overlapping_bodies = current_overlaps;
+		area->overlapping_bodies.swap(current_overlaps);
+		if (entered.empty() && exited.empty()) return;
 
 		Callable cb = area->monitor_callback;
 		for (auto &[id, rid] : entered)
@@ -2743,11 +2875,17 @@ void HopPhysicsServer::_flush_queries() {
 			cb.call(PhysicsServer3D::AREA_BODY_REMOVED, rid, ObjectID(id), 0, 0);
 	});
 
+	// Again, for areas the body pass's callbacks moved. Left for the next flush to commit, so the
+	// body pass there tests them where they are now.
+	mark_changed_areas(false);
+
 	// Area-to-area monitoring: detect when areas (monitoring=true) overlap monitorable areas
 	area_owner.for_each([&](HopAreaData *detector) {
-		if (!detector->area_monitor_callback.is_valid() && detector->overlapping_areas.empty()) return;
+		if (!detector->flush_changed && !touches(flush_moved_areas, detector)) return;
+		const bool has_callback = detector->area_monitor_callback.is_valid();
+		if (!has_callback && detector->overlapping_areas.empty()) return;
 		HopSpaceData *space = detector->space_rid.is_valid() ? space_owner.get_or_null(detector->space_rid) : nullptr;
-		bool can_monitor = detector->area_monitor_callback.is_valid() && space
+		bool can_monitor = has_callback && space
 			&& detector->hop_solid && !detector->hop_solid->get_shapes().empty();
 
 		// Same debt as the body pass: a detector that stops monitoring owes an exit for every area
@@ -2775,6 +2913,7 @@ void HopPhysicsServer::_flush_queries() {
 		auto &cand = space->size_for_areas(space->monitor_area_buffer);
 		int n = space->area_bvh.find_solids_in_aa_box(det_aabb, cand.data(), (int)cand.size(),
 			(int)detector->collision_mask);
+		if (n == 0 && detector->overlapping_areas.empty()) return;
 
 		hop::segment<hop_scalar> zseg;
 		zseg.set_start_end(detector->hop_solid->get_position(), detector->hop_solid->get_position());
@@ -2802,7 +2941,8 @@ void HopPhysicsServer::_flush_queries() {
 			if (current_area_overlaps.find(id) == current_area_overlaps.end())
 				exited.push_back({ id, rid });
 		}
-		detector->overlapping_areas = current_area_overlaps;
+		detector->overlapping_areas.swap(current_area_overlaps);
+		if (entered.empty() && exited.empty()) return;
 
 		Callable cb = detector->area_monitor_callback;
 		for (auto &[id, rid] : entered)
@@ -2811,6 +2951,9 @@ void HopPhysicsServer::_flush_queries() {
 			cb.call(PhysicsServer3D::AREA_BODY_REMOVED, rid, ObjectID(id), 0, 0);
 	});
 
+	flush_moved_bodies.clear();
+	flush_moved_areas.clear();
+	area_owner.for_each([](HopAreaData *area) { area->flush_changed = false; });
 	flushing_queries = false;
 }
 

@@ -10,6 +10,7 @@
 #include <vector>
 #include <map>
 #include "hop_conversions.h"
+#include "hop_flush_print.h"
 
 using namespace godot;
 
@@ -56,6 +57,13 @@ struct HopAreaData {
 
 	Callable monitor_callback;
 	Callable area_monitor_callback;
+	// Kept by the two callback setters, so the flush can fingerprint an area without asking
+	// the engine whether each Callable is still valid.
+	bool has_monitor_callback = false;
+	bool has_area_monitor_callback = false;
+
+	HopFlushPrint flush_print;   // see HopFlushPrint
+	bool flush_changed = false;  // its print changed this flush: re-test it whatever moved
 
 	std::vector<HopAreaShapeEntry> shapes;
 
